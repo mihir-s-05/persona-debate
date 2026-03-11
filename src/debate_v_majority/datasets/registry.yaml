@@ -1,0 +1,32 @@
+datasets:
+  aime25:
+    module: debate_v_majority.datasets.aime25
+    source_dataset_id: math-ai/aime25
+    source_dataset_config: null
+    source_dataset_split: test
+    default_filename: test.jsonl
+  gpqa:
+    module: debate_v_majority.datasets.gpqa
+    source_dataset_id: Idavidrein/gpqa
+    source_dataset_config: gpqa_diamond
+    source_dataset_split: test
+    default_filename: test.jsonl
+  hle:
+    module: debate_v_majority.datasets.hle
+    source_dataset_id: skylenage/HLE-Verified
+    source_dataset_config: default
+    source_dataset_split: train
+    source_dataset_revision: 0bc83643672d4f68a5f89998617a639d85e7318b
+    default_filename: verified.jsonl
+    variant_filenames:
+      verified: verified.jsonl
+      revised: revised.jsonl
+      verified_full: verified_full.jsonl
+    family_field: domain_family
+    prompt_metadata_fields:
+      - source_variant
+      - source_dataset_config
+      - source_dataset_split
+      - source_dataset_revision
+      - answer_format_type
+      - domain_family

@@ -1,0 +1,76 @@
+# Final-Run Manifest Schema
+# -------------------------
+# A manifest locks all configuration for a final reported run.
+# The harness computes a SHA-256 hash of this file and embeds it
+# in every JSONL record's run_meta.manifest block.
+# --final_run enforces that runtime args match this manifest exactly;
+# any drift causes an immediate abort with a diff.
+
+schema_version: 1
+
+# --- Model ---
+model:
+  id: "gemini-3-flash"                # exact model ID passed to API
+  pinned_version: null                 # optional: e.g. "gemini-3-flash-preview-04-17"
+  temperature: 0.7
+  top_p: 1.0
+  max_output_tokens: 4096
+
+# --- Dataset ---
+dataset:
+  key: "gpqa_diamond"                  # registry key
+  repo: "Idavidrein/gpqa"             # HF repo (or local path)
+  config: "gpqa_diamond"
+  split: "train"
+  revision: null                       # pin HF dataset revision hash when available
+  id_field: "record_id"
+  subset: "all"                        # "all" | list of item UIDs | range spec
+  exclude_ids: null                    # path to blocklist YAML, or null
+
+# --- Strategy ---
+strategy:
+  mode: "debate"                       # "debate" | "single" | "majority"
+  n_agents: 5
+  n_rounds: 3
+
+# --- Personas ---
+personas:
+  enabled: true
+  axes_k: 3                           # number of diversity axes per question
+  axes_mode: "model"                   # "model" | "file"
+  axes_file: null                      # path if axes_mode == "file"
+  seed: 42
+  artifacts_dir: null                  # path to save persona artifacts; null = don't save
+  replay_from: null                    # path to replay saved artifacts; null = generate fresh
+
+# --- Judge ---
+judge:
+  model_id: "gemini-3-flash"           # judge uses same model family
+  persona_mode: "strict_neutral"       # "neutral" | "strict_neutral"
+  max_retries: 3
+
+# --- Parsing & Scoring ---
+parsing:
+  answer_extract_mode: "strict"        # "strict" first, then "recovery" on failure
+  max_extract_retries: 2
+
+# --- Engine / Retry ---
+engine:
+  max_retries: 5
+  retry_backoff_base_ms: 1000
+
+# --- Output ---
+output:
+  path: "results/gpqa_diamond_final.jsonl"
+  emit_display_block: true
+  emit_trace_level: "minimal"          # "minimal" | "full"
+
+# --- HLE-specific (ignored for non-HLE datasets) ---
+hle:
+  variant: null                        # "verified" | "revised" | "verified_full"
+  local_mirror: null                   # path to local JSONL/Parquet mirror
+
+# --- GPQA-specific (ignored for non-GPQA datasets) ---
+gpqa:
+  choice_shuffle: "deterministic"      # "deterministic" | "none"
+  choice_shuffle_seed: 42

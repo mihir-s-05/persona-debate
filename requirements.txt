@@ -1,0 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch
+vllm>=0.14
+transformers
+datasets
+tqdm
