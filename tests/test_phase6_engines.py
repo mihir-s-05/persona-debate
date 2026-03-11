@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from debate_v_majority.cli.main_impl import SubsetItem, run_debate, run_sampled
+from debate_v_majority.engines import gemini_api
 from debate_v_majority.engines import (
     BaseInferenceEngine,
     GeminiInferenceEngine,
@@ -69,6 +70,18 @@ def test_create_inference_engine_auto_routes_gemini(monkeypatch):
     engine = create_inference_engine(model_name="gemini-3-flash")
     assert isinstance(engine, GeminiInferenceEngine)
     assert engine.provider_name == "gemini"
+
+
+def test_gemini_inference_engine_prefers_dotenv_key_over_constructor_and_env(monkeypatch, tmp_path):
+    (tmp_path / ".env").write_text('GEMINI_API_KEY="dotenv-key"\n', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "env-key")
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-env-key")
+    gemini_api._dotenv_cache.clear()
+
+    engine = GeminiInferenceEngine(model_name="gemini-3-flash", api_key="constructor-key")
+
+    assert engine._api_key == "dotenv-key"
 
 
 def test_gemini_inference_engine_emits_typed_usage_and_provider_metadata():

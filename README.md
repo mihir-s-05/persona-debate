@@ -91,6 +91,8 @@ export GEMINI_API_KEY="your-key-here"
 export GOOGLE_API_KEY="your-key-here"
 ```
 
+If a local `.env` file contains `GEMINI_API_KEY=...`, that value takes precedence over both the constructor `api_key` argument and OS environment variables.
+
 ## Usage
 
 ```bash

@@ -21,6 +21,55 @@ GEMINI_CACHE_CONTROL_ROLE = "cache_control"
 GEMINI_DEFAULT_CACHE_TTL_SECONDS = 3600
 
 
+_dotenv_cache: dict[str, tuple[float, str | None]] = {}
+_DOTENV_CACHE_TTL = 30  # seconds
+
+
+def _dotenv_gemini_api_key(start_dir: str) -> str | None:
+    now = time.monotonic()
+    cached = _dotenv_cache.get(start_dir)
+    if cached is not None and (now - cached[0]) < _DOTENV_CACHE_TTL:
+        return cached[1]
+
+    result = _read_dotenv_gemini_key(start_dir)
+    _dotenv_cache[start_dir] = (now, result)
+    return result
+
+
+def _read_dotenv_gemini_key(start_dir: str) -> str | None:
+    current = Path(start_dir).resolve()
+    for directory in (current, *current.parents):
+        dotenv_path = directory / ".env"
+        if not dotenv_path.is_file():
+            continue
+        try:
+            for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export ") :].strip()
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key.strip() != "GEMINI_API_KEY":
+                    continue
+                parsed = value.strip()
+                if len(parsed) >= 2 and parsed[0] == parsed[-1] and parsed[0] in {"'", '"'}:
+                    parsed = parsed[1:-1]
+                return parsed or None
+        except OSError:
+            continue
+    return None
+
+
+def _resolve_gemini_api_key(api_key: str | None) -> str | None:
+    dotenv_key = _dotenv_gemini_api_key(str(Path.cwd()))
+    if dotenv_key:
+        return dotenv_key
+    return api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+
+
 def _usage_to_dict(usage: Any) -> dict[str, Any]:
     if usage is None:
         return {}
@@ -165,7 +214,7 @@ class GeminiInferenceEngine(BaseInferenceEngine):
         api_version: str | None = None,
     ) -> None:
         super().__init__(model_name=normalize_gemini_model_name(model_name), model_role=model_role)
-        self._api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        self._api_key = _resolve_gemini_api_key(api_key)
         self._api_version = api_version or os.environ.get("GOOGLE_GENAI_API_VERSION")
         self._max_model_len = int(max_model_len) if max_model_len is not None else GEMINI_DEFAULT_CONTEXT_LEN
         self._client = None
