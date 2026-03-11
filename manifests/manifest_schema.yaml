@@ -10,7 +10,7 @@ schema_version: 1
 
 # --- Model ---
 model:
-  id: "gemini-3-flash"                # exact model ID passed to API
+  id: "gemini-3-flash-preview"         # exact model ID passed to API
   pinned_version: null                 # optional: e.g. "gemini-3-flash-preview-04-17"
   temperature: 0.7
   top_p: 1.0
@@ -45,7 +45,7 @@ personas:
 
 # --- Judge ---
 judge:
-  model_id: "gemini-3-flash"           # judge uses same model family
+  model_id: "gemini-3-flash-preview"   # judge uses same model family
   persona_mode: "strict_neutral"       # "neutral" | "strict_neutral"
   max_retries: 3
 

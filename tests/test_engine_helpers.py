@@ -67,13 +67,13 @@ def test_create_inference_engine_routes_gemini(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("debate_v_majority.engines.gemini_api.GeminiInferenceEngine", _FakeGeminiEngine)
 
     engine = create_inference_engine(
-        model_name="gemini-3-flash",
+        model_name="gemini-3-flash-preview",
         max_model_len=8192,
     )
 
     assert isinstance(engine, _FakeGeminiEngine)
     assert created == {
-        "model_name": "gemini-3-flash",
+        "model_name": "gemini-3-flash-preview",
         "model_role": None,
         "api_key": None,
         "max_model_len": 8192,

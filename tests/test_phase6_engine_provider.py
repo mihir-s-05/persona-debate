@@ -52,7 +52,7 @@ class _LegacyTextEngine:
 
 
 class _TypedEngine:
-    def __init__(self, outputs_by_call: list[list[str]], *, model_name: str = "gemini-3-flash") -> None:
+    def __init__(self, outputs_by_call: list[list[str]], *, model_name: str = "gemini-3-flash-preview") -> None:
         self.outputs_by_call = list(outputs_by_call)
         self.model_name = model_name
         self.provider_name = "gemini"
@@ -102,13 +102,13 @@ class _TypedEngine:
 
 
 def test_infer_provider_name_prefers_explicit_and_detects_gemini_models():
-    assert infer_provider_name("gemini-3-flash") == "gemini"
+    assert infer_provider_name("gemini-3-flash-preview") == "gemini"
     with pytest.raises(ValueError, match="Gemini models only"):
         infer_provider_name("Qwen/Qwen3-8B")
 
 
 def test_create_inference_engine_routes_gemini_models():
-    engine = create_inference_engine(model_name="gemini-3-flash")
+    engine = create_inference_engine(model_name="gemini-3-flash-preview")
     assert isinstance(engine, GeminiInferenceEngine)
     assert engine.context_len_tokens == 1_048_576
 
@@ -135,7 +135,7 @@ def test_prompt_token_counter_uses_exact_tokenizer_counts(monkeypatch):
             return [0] * (len(messages) + 7)
 
     monkeypatch.setattr(PromptTokenCounter, "_get_tokenizer", lambda self: _FakeTokenizer())
-    counter = PromptTokenCounter("gemini-3-flash")
+    counter = PromptTokenCounter("gemini-3-flash-preview")
     count = counter.count_chat_tokens([{"role": "user", "content": "hello world"}])
     assert count == 8
 
@@ -158,7 +158,7 @@ def test_gemini_engine_generate_batch_results_extracts_usage_from_fake_client():
         text = "gemini-output"
         usage_metadata = _FakeUsage()
         response_id = "resp-1"
-        model_version = "gemini-3-flash-001"
+        model_version = "gemini-3-flash-preview-001"
         sdk_http_response = _FakeHTTPResponse()
 
     class _FakeModels:
@@ -169,7 +169,7 @@ def test_gemini_engine_generate_batch_results_extracts_usage_from_fake_client():
         def __init__(self):
             self.models = _FakeModels()
 
-    engine = GeminiInferenceEngine(model_name="gemini-3-flash")
+    engine = GeminiInferenceEngine(model_name="gemini-3-flash-preview")
     engine._client = _FakeClient()
     results = engine.generate_batch_results(
         [[{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}]],
@@ -194,7 +194,7 @@ def test_gemini_engine_count_prompt_tokens_uses_count_tokens_api():
         def __init__(self):
             self.models = _FakeModels()
 
-    engine = GeminiInferenceEngine(model_name="gemini-3-flash")
+    engine = GeminiInferenceEngine(model_name="gemini-3-flash-preview")
     engine._client = _FakeClient()
     assert engine.count_prompt_tokens(
         [{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}]
@@ -226,7 +226,7 @@ def test_gemini_engine_supports_structured_image_parts_from_local_file(tmp_path:
                 text="gemini-output",
                 usage_metadata=_FakeUsage(),
                 response_id="resp-structured-image",
-                model_version="gemini-3-flash-001",
+                model_version="gemini-3-flash-preview-001",
                 sdk_http_response=SimpleNamespace(
                     status_code=200,
                     url="https://example.invalid/generate",
@@ -234,7 +234,7 @@ def test_gemini_engine_supports_structured_image_parts_from_local_file(tmp_path:
                 ),
             )
 
-    engine = GeminiInferenceEngine(model_name="gemini-3-flash")
+    engine = GeminiInferenceEngine(model_name="gemini-3-flash-preview")
     engine._client = SimpleNamespace(models=_FakeModels())
     results = engine.generate_batch_results(
         [[
@@ -276,7 +276,7 @@ def test_gemini_engine_falls_back_to_text_when_image_is_unreachable(tmp_path: Pa
                 text="gemini-output",
                 usage_metadata=_FakeUsage(),
                 response_id="resp-structured-image-fallback",
-                model_version="gemini-3-flash-001",
+                model_version="gemini-3-flash-preview-001",
                 sdk_http_response=SimpleNamespace(
                     status_code=200,
                     url="https://example.invalid/generate",
@@ -284,7 +284,7 @@ def test_gemini_engine_falls_back_to_text_when_image_is_unreachable(tmp_path: Pa
                 ),
             )
 
-    engine = GeminiInferenceEngine(model_name="gemini-3-flash")
+    engine = GeminiInferenceEngine(model_name="gemini-3-flash-preview")
     engine._client = SimpleNamespace(models=_FakeModels())
     results = engine.generate_batch_results(
         [[
@@ -318,7 +318,7 @@ def test_gemini_engine_raises_when_remote_image_fetch_fails(monkeypatch):
 
     monkeypatch.setattr("debate_v_majority.engines.gemini_api._bytes_from_remote_ref", _boom)
 
-    engine = GeminiInferenceEngine(model_name="gemini-3-flash")
+    engine = GeminiInferenceEngine(model_name="gemini-3-flash-preview")
     engine._client = SimpleNamespace(models=_FakeModels())
 
     with pytest.raises(RuntimeError, match="Failed to fetch explicit image 'diagram'"):
@@ -399,8 +399,8 @@ def test_run_debate_hle_on_gemini_builds_multimodal_initial_prompt(tmp_path: Pat
         range_str=None,
         hle_variant="verified",
     )
-    debater_engine = _TypedEngine(outputs_by_call=[["Confidence: 0.8\n\\boxed{B}"]], model_name="gemini-3-flash")
-    judge_engine = _TypedEngine(outputs_by_call=[["\\boxed{B}"]], model_name="gemini-3-flash")
+    debater_engine = _TypedEngine(outputs_by_call=[["Confidence: 0.8\n\\boxed{B}"]], model_name="gemini-3-flash-preview")
+    judge_engine = _TypedEngine(outputs_by_call=[["\\boxed{B}"]], model_name="gemini-3-flash-preview")
 
     results = run_debate(
         dataset="hle",
@@ -446,8 +446,8 @@ def test_run_debate_emits_agent_and_judge_call_metadata(tmp_path: Path):
         ids=[0],
         range_str=None,
     )
-    debater_engine = _TypedEngine(outputs_by_call=[["\\boxed{2}", "\\boxed{2}"]], model_name="gemini-3-flash")
-    judge_engine = _TypedEngine(outputs_by_call=[["\\boxed{2}"]], model_name="gemini-3-flash")
+    debater_engine = _TypedEngine(outputs_by_call=[["\\boxed{2}", "\\boxed{2}"]], model_name="gemini-3-flash-preview")
+    judge_engine = _TypedEngine(outputs_by_call=[["\\boxed{2}"]], model_name="gemini-3-flash-preview")
 
     results = run_debate(
         dataset="aime25",
@@ -493,9 +493,9 @@ def test_run_debate_wraps_round2_gemini_requests_with_cache_control(tmp_path: Pa
             ["Reasoning one \\boxed{4}", "Reasoning two \\boxed{4}"],
             ["Updated one \\boxed{4}", "Updated two \\boxed{4}"],
         ],
-        model_name="gemini-3-flash",
+        model_name="gemini-3-flash-preview",
     )
-    judge_engine = _TypedEngine(outputs_by_call=[["\\boxed{4}"]], model_name="gemini-3-flash")
+    judge_engine = _TypedEngine(outputs_by_call=[["\\boxed{4}"]], model_name="gemini-3-flash-preview")
 
     results = run_debate(
         dataset="aime25",
@@ -560,7 +560,7 @@ def test_cli_main_honors_output_override_and_writes_phase7_logical_blocks(tmp_pa
     manifest_path = tmp_path / "manifest.json"
 
     class _FakeEngine:
-        model_name = "gemini-3-flash"
+        model_name = "gemini-3-flash-preview"
         provider_name = "gemini"
 
         def shutdown(self):
@@ -577,7 +577,7 @@ def test_cli_main_honors_output_override_and_writes_phase7_logical_blocks(tmp_pa
                 "dataset": "aime25",
                 "subset_size": 1,
                 "subset_seed": 123,
-                "model_name": "gemini-3-flash",
+                "model_name": "gemini-3-flash-preview",
                 "question": "What is 2+2?",
                 "raw_task": {"problem": "What is 2+2?"},
                 "item_uid": "aime25:0",
@@ -604,7 +604,7 @@ def test_cli_main_honors_output_override_and_writes_phase7_logical_blocks(tmp_pa
                 "--subset_ids",
                 "0",
                 "--model_name",
-                "gemini-3-flash",
+                "gemini-3-flash-preview",
                 "--output",
             str(custom_output),
             "--final_manifest",
@@ -638,9 +638,9 @@ def test_arg_parser_accepts_judge_runtime_and_cost_flags():
             "--dataset",
             "gpqa",
             "--model_name",
-            "gemini-3-flash",
+            "gemini-3-flash-preview",
             "--judge_runtime_model",
-            "gemini-3-flash",
+            "gemini-3-flash-preview",
             "--token_ledger_path",
             "out/token_ledger.jsonl",
             "--max_run_cost_usd",
@@ -649,7 +649,7 @@ def test_arg_parser_accepts_judge_runtime_and_cost_flags():
             "10.0",
         ]
     )
-    assert args.judge_runtime_model == "gemini-3-flash"
+    assert args.judge_runtime_model == "gemini-3-flash-preview"
     assert args.token_ledger_path == "out/token_ledger.jsonl"
     assert args.max_run_cost_usd == 1.5
     assert args.max_total_cost_usd == 10.0
@@ -723,16 +723,16 @@ def test_main_routes_provider_specific_engines_for_debate_and_persona_roles(tmp_
             "--mode",
             "debate",
             "--model_name",
-            "gemini-3-flash",
+            "gemini-3-flash-preview",
             "--judge_runtime_model",
-            "gemini-3-flash",
+            "gemini-3-flash-preview",
             "--use_personas",
             "--persona_backend",
             "llm",
             "--generator_model",
-            "gemini-3-flash",
+            "gemini-3-flash-preview",
             "--judge_generator_model",
-            "gemini-3-flash",
+            "gemini-3-flash-preview",
             "--subset_n",
             "1",
             "--n_rounds",
@@ -745,21 +745,21 @@ def test_main_routes_provider_specific_engines_for_debate_and_persona_roles(tmp_
 
     cli_main()
 
-    assert sampling_models == ["gemini-3-flash"]
+    assert sampling_models == ["gemini-3-flash-preview"]
     assert [(call["model_name"], call["model_role"]) for call in engine_calls] == [
-        ("gemini-3-flash", "debater"),
+        ("gemini-3-flash-preview", "debater"),
     ]
     assert all("gpus" not in call for call in engine_calls)
     assert all("gpu_memory_utilization" not in call for call in engine_calls)
     assert all("enable_yarn" not in call for call in engine_calls)
     assert all("enforce_eager" not in call for call in engine_calls)
-    assert run_debate_args["engine"].model_name == "gemini-3-flash"
-    assert run_debate_args["judge_engine"].model_name == "gemini-3-flash"
-    assert run_debate_args["persona_generator_engine"].model_name == "gemini-3-flash"
-    assert run_debate_args["persona_judge_engine"].model_name == "gemini-3-flash"
+    assert run_debate_args["engine"].model_name == "gemini-3-flash-preview"
+    assert run_debate_args["judge_engine"].model_name == "gemini-3-flash-preview"
+    assert run_debate_args["persona_generator_engine"].model_name == "gemini-3-flash-preview"
+    assert run_debate_args["persona_judge_engine"].model_name == "gemini-3-flash-preview"
     assert run_debate_args["persona_backend"] == "llm"
-    assert run_debate_args["generator_model"] == "gemini-3-flash"
-    assert run_debate_args["judge_generator_model"] == "gemini-3-flash"
+    assert run_debate_args["generator_model"] == "gemini-3-flash-preview"
+    assert run_debate_args["judge_generator_model"] == "gemini-3-flash-preview"
     assert len(written_paths) == 1
 
 
@@ -819,12 +819,12 @@ def test_main_auto_persona_backend_creates_llm_persona_engines(tmp_path, monkeyp
             "--mode",
             "debate",
             "--model_name",
-            "gemini-3-flash",
+            "gemini-3-flash-preview",
             "--use_personas",
             "--generator_model",
-            "gemini-3-flash",
+            "gemini-3-flash-preview",
             "--judge_generator_model",
-            "gemini-3-flash",
+            "gemini-3-flash-preview",
             "--subset_n",
             "1",
             "--n_rounds",
@@ -838,11 +838,11 @@ def test_main_auto_persona_backend_creates_llm_persona_engines(tmp_path, monkeyp
     cli_main()
 
     assert [(call["model_name"], call["model_role"]) for call in engine_calls] == [
-        ("gemini-3-flash", "debater"),
+        ("gemini-3-flash-preview", "debater"),
     ]
     assert run_debate_args["persona_backend"] == "llm"
-    assert run_debate_args["persona_generator_engine"].model_name == "gemini-3-flash"
-    assert run_debate_args["persona_judge_engine"].model_name == "gemini-3-flash"
+    assert run_debate_args["persona_generator_engine"].model_name == "gemini-3-flash-preview"
+    assert run_debate_args["persona_judge_engine"].model_name == "gemini-3-flash-preview"
     assert run_debate_args["persona_generator_engine"] is run_debate_args["persona_judge_engine"]
 
 
@@ -902,14 +902,14 @@ def test_main_reuses_generator_engine_for_judge_generation_when_effective_provid
             "--mode",
             "debate",
             "--model_name",
-            "gemini-3-flash",
+            "gemini-3-flash-preview",
             "--use_personas",
             "--persona_backend",
             "llm",
             "--generator_model",
-            "gemini-3-flash",
+            "gemini-3-flash-preview",
             "--judge_generator_model",
-            "gemini-3-flash",
+            "gemini-3-flash-preview",
             "--subset_n",
             "1",
             "--n_rounds",
@@ -923,7 +923,7 @@ def test_main_reuses_generator_engine_for_judge_generation_when_effective_provid
     cli_main()
 
     assert [(call["model_name"], call["model_role"]) for call in engine_calls] == [
-        ("gemini-3-flash", "debater"),
+        ("gemini-3-flash-preview", "debater"),
     ]
     assert all("gpus" not in call for call in engine_calls)
     assert all("gpu_memory_utilization" not in call for call in engine_calls)

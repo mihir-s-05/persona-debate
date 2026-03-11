@@ -469,7 +469,7 @@ def test_write_or_validate_final_manifest_rejects_mismatch(tmp_path: Path):
 
 def test_main_single_supports_one_output_and_final_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     class _FakeEngine:
-        model_name = "gemini-3-flash"
+        model_name = "gemini-3-flash-preview"
 
         def shutdown(self):
             return None
@@ -560,7 +560,7 @@ def test_main_single_supports_one_output_and_final_manifest(tmp_path: Path, monk
             "--mode",
             "single",
             "--model_name",
-            "gemini-3-flash",
+            "gemini-3-flash-preview",
             "--provider",
             "gemini",
             "--one",
@@ -604,7 +604,7 @@ def test_write_or_validate_final_manifest_rejects_mismatch_for_final_run(tmp_pat
     manifest_path = tmp_path / "manifest.json"
     cli_main_impl._write_or_validate_final_manifest(
         manifest_path=manifest_path,
-        manifest={"manifest_version": "phase7.final_manifest.v1", "locked_config": {"dataset": "aime25", "model": "gemini-3-flash"}},
+        manifest={"manifest_version": "phase7.final_manifest.v1", "locked_config": {"dataset": "aime25", "model": "gemini-3-flash-preview"}},
         final_run=False,
     )
 

@@ -75,7 +75,7 @@ def test_analyze_results_writes_metrics_only_outputs(tmp_path: Path):
                 "dataset": "gpqa",
                 "mode": "single",
                 "row_origin": "single_independent",
-                "model_name": "gemini-3-flash",
+                "model_name": "gemini-3-flash-preview",
                 "item_uid": "gpqa:item-0",
                 "dataset_revision": "test",
                 "orig_id": 1,
@@ -87,7 +87,7 @@ def test_analyze_results_writes_metrics_only_outputs(tmp_path: Path):
         ],
     )
 
-    ar.TARGET_MODEL_TAG = "gemini-3-flash"
+    ar.TARGET_MODEL_TAG = "gemini-3-flash-preview"
     ar.analyze(results_dir, out_dir)
 
     summary_path = out_dir / "summary.json"
@@ -116,7 +116,7 @@ def test_analyze_results_uses_row_schema_and_item_uid_for_phase2_comparisons(tmp
                 "mode": "majority",
                 "row_origin": "standalone_persona_majority",
                 "majority_origin": "standalone_persona",
-                "model_name": "gemini-3-flash",
+                "model_name": "gemini-3-flash-preview",
                 "item_uid": "gpqa:item-1",
                 "dataset_revision": "test",
                 "orig_id": 11,
@@ -148,7 +148,7 @@ def test_analyze_results_uses_row_schema_and_item_uid_for_phase2_comparisons(tmp
                 "mode": "majority",
                 "row_origin": "standalone_sampling_majority",
                 "majority_origin": "standalone_sampling",
-                "model_name": "gemini-3-flash",
+                "model_name": "gemini-3-flash-preview",
                 "item_uid": "gpqa:item-2",
                 "dataset_revision": "test",
                 "orig_id": 22,
@@ -179,7 +179,7 @@ def test_analyze_results_uses_row_schema_and_item_uid_for_phase2_comparisons(tmp
                 "dataset": "gpqa",
                 "mode": "debate",
                 "row_origin": "debate_judge",
-                "debater_model": "gemini-3-flash",
+                "debater_model": "gemini-3-flash-preview",
                 "item_uid": "gpqa:item-1",
                 "dataset_revision": "test",
                 "orig_id": 999,
@@ -201,7 +201,7 @@ def test_analyze_results_uses_row_schema_and_item_uid_for_phase2_comparisons(tmp
         ],
     )
 
-    ar.TARGET_MODEL_TAG = "gemini-3-flash"
+    ar.TARGET_MODEL_TAG = "gemini-3-flash-preview"
     ar.analyze(results_dir, out_dir)
 
     with open(out_dir / "summary.json", "r", encoding="utf-8") as f:
@@ -236,7 +236,7 @@ def test_analyze_results_emits_phase3_persona_fidelity_metrics(tmp_path: Path):
                 "dataset": "gpqa",
                 "mode": "debate",
                 "row_origin": "debate_judge",
-                "debater_model": "gemini-3-flash",
+                "debater_model": "gemini-3-flash-preview",
                 "item_uid": "gpqa:item-phase3",
                 "dataset_revision": "test",
                 "orig_id": 123,
@@ -319,7 +319,7 @@ def test_analyze_results_emits_phase3_persona_fidelity_metrics(tmp_path: Path):
         ],
     )
 
-    ar.TARGET_MODEL_TAG = "gemini-3-flash"
+    ar.TARGET_MODEL_TAG = "gemini-3-flash-preview"
     ar.analyze(results_dir, out_dir)
 
     with open(out_dir / "summary.json", "r", encoding="utf-8") as f:
@@ -391,7 +391,7 @@ def test_analyze_results_supports_hle_runs_via_registry_adapter(tmp_path: Path):
                 "mode": "majority",
                 "row_origin": "standalone_persona_majority",
                 "majority_origin": "standalone_persona",
-                "model_name": "gemini-3-flash",
+                "model_name": "gemini-3-flash-preview",
                 "item_uid": "hle:item-1",
                 "dataset_revision": "test",
                 "orig_id": 1,
@@ -415,7 +415,7 @@ def test_analyze_results_supports_hle_runs_via_registry_adapter(tmp_path: Path):
         ],
     )
 
-    ar.TARGET_MODEL_TAG = "gemini-3-flash"
+    ar.TARGET_MODEL_TAG = "gemini-3-flash-preview"
     ar.analyze(results_dir, out_dir)
 
     payload = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
@@ -438,7 +438,7 @@ def test_analyze_results_normalizes_legacy_debate_rows_from_agent_responses(tmp_
                 "dataset": "gpqa",
                 "mode": "debate",
                 "row_origin": "debate_judge",
-                "debater_model": "gemini-3-flash",
+                "debater_model": "gemini-3-flash-preview",
                 "item_uid": "gpqa:item-legacy-agent-responses",
                 "dataset_revision": "test",
                 "orig_id": 314,
@@ -477,7 +477,7 @@ def test_analyze_results_normalizes_legacy_debate_rows_from_agent_responses(tmp_
         ],
     )
 
-    ar.TARGET_MODEL_TAG = "gemini-3-flash"
+    ar.TARGET_MODEL_TAG = "gemini-3-flash-preview"
     ar.analyze(results_dir, out_dir)
 
     payload = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
@@ -504,7 +504,7 @@ def test_parse_run_meta_supports_legacy_and_phase2_rows():
         {
             "dataset": "gpqa",
             "mode": "single",
-                "model_name": "gemini-3-flash",
+                "model_name": "gemini-3-flash-preview",
             "orig_id": 5,
         },
     )
@@ -515,7 +515,7 @@ def test_parse_run_meta_supports_legacy_and_phase2_rows():
             "dataset": "gpqa",
             "mode": "single",
             "row_origin": "single_independent",
-            "model_name": "gemini-3-flash",
+            "model_name": "gemini-3-flash-preview",
             "item_uid": "gpqa:item-5",
             "orig_id": 50,
         },
@@ -530,7 +530,7 @@ def test_parse_run_meta_supports_legacy_and_phase2_rows():
             },
             "strategy": {"mode": "single", "n_samples": 1},
             "task": {"dataset": "gpqa", "item_uid": "gpqa:item-7"},
-            "model_name": "gemini-3-flash",
+            "model_name": "gemini-3-flash-preview",
         },
     )
     assert legacy_meta.mode == "single"
@@ -542,31 +542,31 @@ def test_parse_run_meta_supports_legacy_and_phase2_rows():
     assert phase7_meta.seed == 123
     include_legacy, legacy_model = ar.should_include_path(
         Path("legacy_single.jsonl"),
-        target_model_tag="gemini-3-flash",
-        first_row={"model_name": "gemini-3-flash"},
+        target_model_tag="gemini-3-flash-preview",
+        first_row={"model_name": "gemini-3-flash-preview"},
     )
     include_phase2, phase2_model = ar.should_include_path(
         Path("phase2_single.jsonl"),
-        target_model_tag="gemini-3-flash",
-        first_row={"model_name": "gemini-3-flash"},
+        target_model_tag="gemini-3-flash-preview",
+        first_row={"model_name": "gemini-3-flash-preview"},
     )
     assert include_legacy is True
-    assert legacy_model == "gemini-3-flash"
+    assert legacy_model == "gemini-3-flash-preview"
     assert include_phase2 is True
-    assert phase2_model == "gemini-3-flash"
+    assert phase2_model == "gemini-3-flash-preview"
 
 
 def test_analyze_results_defaults_to_gemini_target_model(monkeypatch):
     monkeypatch.delenv("TARGET_MODEL_TAG", raising=False)
     reloaded = importlib.reload(ar)
     try:
-        assert reloaded.TARGET_MODEL_TAG == "gemini-3-flash"
+        assert reloaded.TARGET_MODEL_TAG == "gemini-3-flash-preview"
         include, model = reloaded.should_include_path(
             Path("phase7_single.jsonl"),
             target_model_tag=reloaded.TARGET_MODEL_TAG,
-            first_row={"model_name": "gemini-3-flash"},
+            first_row={"model_name": "gemini-3-flash-preview"},
         )
         assert include is True
-        assert model == "gemini-3-flash"
+        assert model == "gemini-3-flash-preview"
     finally:
         importlib.reload(reloaded)

@@ -67,7 +67,7 @@ def test_create_inference_engine_auto_routes_gemini(monkeypatch):
         self._client = object()
 
     monkeypatch.setattr(GeminiInferenceEngine, "initialize", _fake_initialize)
-    engine = create_inference_engine(model_name="gemini-3-flash")
+    engine = create_inference_engine(model_name="gemini-3-flash-preview")
     assert isinstance(engine, GeminiInferenceEngine)
     assert engine.provider_name == "gemini"
 
@@ -79,7 +79,7 @@ def test_gemini_inference_engine_prefers_dotenv_key_over_constructor_and_env(mon
     monkeypatch.setenv("GOOGLE_API_KEY", "google-env-key")
     gemini_api._dotenv_cache.clear()
 
-    engine = GeminiInferenceEngine(model_name="gemini-3-flash", api_key="constructor-key")
+    engine = GeminiInferenceEngine(model_name="gemini-3-flash-preview", api_key="constructor-key")
 
     assert engine._api_key == "dotenv-key"
 
@@ -97,7 +97,7 @@ def test_gemini_inference_engine_emits_typed_usage_and_provider_metadata():
 
     class _FakeModels:
         def generate_content(self, *, model, contents, config):
-            assert model == "gemini-3-flash"
+            assert model == "gemini-3-flash-preview"
             assert config.max_output_tokens == 256
             assert config.system_instruction == "system policy"
             assert config.temperature == 1.0
@@ -122,7 +122,7 @@ def test_gemini_inference_engine_emits_typed_usage_and_provider_metadata():
                 ],
                 usage_metadata=_FakeUsage(),
                 response_id="resp-123",
-                model_version="gemini-3-flash-001",
+                model_version="gemini-3-flash-preview-001",
                 sdk_http_response=SimpleNamespace(
                     status_code=200,
                     url="https://example.test/generate",
@@ -130,7 +130,7 @@ def test_gemini_inference_engine_emits_typed_usage_and_provider_metadata():
                 ),
             )
 
-    engine = GeminiInferenceEngine(model_name="gemini-3-flash", api_key="test-key", max_model_len=16384)
+    engine = GeminiInferenceEngine(model_name="gemini-3-flash-preview", api_key="test-key", max_model_len=16384)
     engine._client = SimpleNamespace(models=_FakeModels())
     results = engine.generate_batch_results(
         [[{"role": "system", "content": "system policy"}, {"role": "user", "content": "hello"}]],
@@ -162,7 +162,7 @@ def test_gemini_inference_engine_raises_provider_error_with_default_token_budget
             assert config.max_output_tokens == 4096
             raise RuntimeError("provider unavailable")
 
-    engine = GeminiInferenceEngine(model_name="gemini-3-flash", api_key="test-key", max_model_len=16384)
+    engine = GeminiInferenceEngine(model_name="gemini-3-flash-preview", api_key="test-key", max_model_len=16384)
     engine._client = SimpleNamespace(models=_BoomModels())
     with pytest.raises(RuntimeError, match="Gemini API request failed.*provider unavailable"):
         engine.generate_batch_results(
@@ -220,7 +220,7 @@ def test_gemini_inference_engine_uses_explicit_cached_content_for_controlled_pre
                 text="updated answer",
                 usage_metadata=_FakeUsage(),
                 response_id="resp-cache-1",
-                model_version="gemini-3-flash-001",
+                model_version="gemini-3-flash-preview-001",
                 sdk_http_response=SimpleNamespace(
                     status_code=200,
                     url="https://example.test/generate",
@@ -230,7 +230,7 @@ def test_gemini_inference_engine_uses_explicit_cached_content_for_controlled_pre
 
     fake_caches = _FakeCaches()
     fake_models = _FakeModels()
-    engine = GeminiInferenceEngine(model_name="gemini-3-flash", api_key="test-key", max_model_len=16384)
+    engine = GeminiInferenceEngine(model_name="gemini-3-flash-preview", api_key="test-key", max_model_len=16384)
     engine._client = SimpleNamespace(models=fake_models, caches=fake_caches)
     contexts = [[
         {"role": "cache_control", "content": "", "cache_prefix_message_count": "3", "cache_display_name": "debate-prefix", "cache_ttl_seconds": "7200", "cache_scope": "debate_round_prefix"},
@@ -253,7 +253,7 @@ def test_gemini_inference_engine_uses_explicit_cached_content_for_controlled_pre
     assert result.usage["cached_content_token_count"] == 41
     assert len(fake_caches.created) == 1
     cache_model, cache_config = fake_caches.created[0]
-    assert cache_model == "models/gemini-3-flash"
+    assert cache_model == "models/gemini-3-flash-preview"
     assert cache_config.system_instruction == "system policy"
     assert cache_config.ttl == "7200s"
     assert cache_config.contents[0].role == "user"
@@ -294,14 +294,14 @@ def test_gemini_inference_engine_skips_explicit_cache_when_prefix_is_below_minim
             return SimpleNamespace(total_tokens=120)
 
         def generate_content(self, *, model, contents, config):
-            assert model == "gemini-3-flash"
+            assert model == "gemini-3-flash-preview"
             assert getattr(config, "cached_content", None) is None
             assert len(contents) == 3
             return SimpleNamespace(
                 text="uncached answer",
                 usage_metadata=_FakeUsage(),
                 response_id="resp-cache-skip",
-                model_version="gemini-3-flash-001",
+                model_version="gemini-3-flash-preview-001",
                 sdk_http_response=SimpleNamespace(
                     status_code=200,
                     url="https://example.test/generate",
@@ -309,7 +309,7 @@ def test_gemini_inference_engine_skips_explicit_cache_when_prefix_is_below_minim
                 ),
             )
 
-    engine = GeminiInferenceEngine(model_name="gemini-3-flash", api_key="test-key", max_model_len=16384)
+    engine = GeminiInferenceEngine(model_name="gemini-3-flash-preview", api_key="test-key", max_model_len=16384)
     engine._client = SimpleNamespace(models=_FakeModels(), caches=_FakeCaches())
     context = [[
         {"role": "cache_control", "content": "", "cache_prefix_message_count": "3", "cache_display_name": "debate-prefix", "cache_ttl_seconds": "3600", "cache_scope": "debate_round_prefix"},

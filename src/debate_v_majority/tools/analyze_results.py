@@ -48,7 +48,7 @@ from ._analysis.runmeta import RunMeta, RunSummary, load_adapters, parse_run_met
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RESULTS_DIR = REPO_ROOT / "results"
 DEFAULT_OUT_DIR = REPO_ROOT / "_autogen"
-TARGET_MODEL_TAG = os.environ.get("TARGET_MODEL_TAG", "gemini-3-flash")
+TARGET_MODEL_TAG = os.environ.get("TARGET_MODEL_TAG", "gemini-3-flash-preview")
 _FINDINGS_MD_SECTIONS = FINDINGS_MD_SECTIONS
 _now_iso = now_iso
 _mean = mean

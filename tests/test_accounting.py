@@ -25,7 +25,7 @@ def test_estimate_result_cost_for_gemini_3_flash_includes_cache_storage():
             "explicit_cache_ttl_seconds": 3600,
         },
         model_role="debater",
-        model_name="gemini-3-flash",
+        model_name="gemini-3-flash-preview",
         provider_name="gemini",
     )
     estimate = estimate_result_cost(result)
@@ -55,7 +55,7 @@ def test_cost_tracker_appends_rows_and_enforces_run_cap(tmp_path: Path):
         },
         provider_meta={"request_id": "req-1"},
         model_role="debater",
-        model_name="gemini-3-flash",
+        model_name="gemini-3-flash-preview",
         provider_name="gemini",
     )
     tracker.record_result(cheap_result)
@@ -75,7 +75,7 @@ def test_cost_tracker_appends_rows_and_enforces_run_cap(tmp_path: Path):
         },
         provider_meta={"request_id": "req-2"},
         model_role="judge",
-        model_name="gemini-3-flash",
+        model_name="gemini-3-flash-preview",
         provider_name="gemini",
     )
     with pytest.raises(SpendLimitExceeded):
@@ -101,7 +101,7 @@ def test_estimate_result_cost_raises_on_invalid_cache_metadata():
             "explicit_cache_ttl_seconds": 3600,
         },
         model_role="debater",
-        model_name="gemini-3-flash",
+        model_name="gemini-3-flash-preview",
         provider_name="gemini",
     )
     with pytest.raises(ValueError, match="explicit_cache_prefix_tokens='bad-prefix'"):
@@ -118,7 +118,7 @@ def test_estimate_result_cost_raises_on_invalid_usage_metadata():
         },
         provider_meta={},
         model_role="debater",
-        model_name="gemini-3-flash",
+        model_name="gemini-3-flash-preview",
         provider_name="gemini",
     )
     with pytest.raises(ValueError, match="Invalid usage metadata for prompt_token_count"):

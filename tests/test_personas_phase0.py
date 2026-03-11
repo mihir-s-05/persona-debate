@@ -47,7 +47,7 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class _FakeEngine:
-    model_name = "gemini-3-flash"
+    model_name = "gemini-3-flash-preview"
     provider_name = "fake-provider"
 
     def __init__(self) -> None:
@@ -419,8 +419,8 @@ def test_build_persona_artifact_llm_path():
         persona_seed=5,
         axis_mode="task",
         backend="llm",
-        generator_model="gemini-3-flash",
-        judge_generator_model="gemini-3-flash",
+        generator_model="gemini-3-flash-preview",
+        judge_generator_model="gemini-3-flash-preview",
     )
     engine = _FakeEngine()
     judge_card = build_judge_card(
@@ -429,11 +429,11 @@ def test_build_persona_artifact_llm_path():
         question=config.question,
         mode="task_family_generated",
         engine=engine,
-        generator_model="gemini-3-flash",
+        generator_model="gemini-3-flash-preview",
         backend="llm",
     )
     artifact = build_persona_artifact(config=config, judge_card=judge_card, generator_engine=engine)
-    assert artifact.generator_model == "gemini-3-flash"
+    assert artifact.generator_model == "gemini-3-flash-preview"
     assert artifact.axes.axes[0].axis_id == "llm_axis"
     assert artifact.axes.axes[0].source["call_metadata"]["provider_name"] == "fake-provider"
     assert artifact.axes.axes[0].source["call_metadata"]["model_role"] == "generator"
@@ -476,8 +476,8 @@ def test_hle_llm_persona_and_judge_generation_attach_question_images():
         persona_seed=5,
         axis_mode="task",
         backend="llm",
-        generator_model="gemini-3-flash",
-        judge_generator_model="gemini-3-flash",
+        generator_model="gemini-3-flash-preview",
+        judge_generator_model="gemini-3-flash-preview",
     )
     engine = _FakeEngine()
     judge_card = build_judge_card(
@@ -486,7 +486,7 @@ def test_hle_llm_persona_and_judge_generation_attach_question_images():
         question=question,
         mode="task_family_generated",
         engine=engine,
-        generator_model="gemini-3-flash",
+        generator_model="gemini-3-flash-preview",
         backend="llm",
     )
     artifact = build_persona_artifact(config=config, judge_card=judge_card, generator_engine=engine)
@@ -705,14 +705,14 @@ def test_expand_cards_retry_cap_raises_after_exhaustion(monkeypatch: pytest.Monk
 
 def test_arg_parser_accepts_judge_model_alias():
     parser = cli_main_impl._build_arg_parser()
-    args = parser.parse_args(["--dataset", "gpqa", "--mode", "personas", "--judge_model", "gemini-3-flash"])
-    assert args.judge_generator_model == "gemini-3-flash"
+    args = parser.parse_args(["--dataset", "gpqa", "--mode", "personas", "--judge_model", "gemini-3-flash-preview"])
+    assert args.judge_generator_model == "gemini-3-flash-preview"
 
 
 def test_arg_parser_accepts_debater_model_alias():
     parser = cli_main_impl._build_arg_parser()
-    args = parser.parse_args(["--dataset", "gpqa", "--mode", "single", "--debater_model", "gemini-3-flash"])
-    assert args.model_name == "gemini-3-flash"
+    args = parser.parse_args(["--dataset", "gpqa", "--mode", "single", "--debater_model", "gemini-3-flash-preview"])
+    assert args.model_name == "gemini-3-flash-preview"
 
 
 def test_persona_mode_main_generates_and_replays(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

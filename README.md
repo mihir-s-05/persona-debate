@@ -101,7 +101,7 @@ debate-v-majority \
   --dataset aime25 \
   --mode single,debate \
   --subset_n 5 \
-  --model_name gemini-3-flash
+  --model_name gemini-3-flash-preview
 
 # debate with personas on GPQA
 debate-v-majority \
@@ -113,14 +113,14 @@ debate-v-majority \
   --persona_save_artifacts \
   --persona_artifacts_dir artifacts/ \
   --judge_bank_dir judge_bank/ \
-  --model_name gemini-3-flash
+  --model_name gemini-3-flash-preview
 
 # majority vote on HLE-Verified
 debate-v-majority \
   --dataset hle \
   --mode majority \
   --majority_samples 5 \
-  --model_name gemini-3-flash
+  --model_name gemini-3-flash-preview
 
 # generate persona artifacts only (no inference)
 debate-v-majority \
@@ -134,7 +134,7 @@ debate-v-majority \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model_name` | `gemini-3-flash` | Model for debaters |
+| `--model_name` | `gemini-3-flash-preview` | Model for debaters |
 | `--dataset` | `aime25` | `aime25`, `gpqa`, or `hle` |
 | `--mode` | `single,debate` | Comma-separated modes to run |
 | `--n_agents` | `5` | Number of debate agents |

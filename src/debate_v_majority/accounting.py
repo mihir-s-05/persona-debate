@@ -30,7 +30,7 @@ class GeminiTextPricing:
 def _gemini_text_pricing(model_name: str, prompt_tokens: int | None) -> GeminiTextPricing | None:
     del prompt_tokens
     model = str(model_name or "").strip().lower()
-    if "gemini-3-flash" not in model:
+    if "gemini-3-flash-preview" not in model:
         return None
     return GeminiTextPricing(
         input_per_million_tokens_usd=0.50,

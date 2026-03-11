@@ -13,7 +13,7 @@ from typing import Any
 from .base import BaseInferenceEngine
 from .providers import infer_provider_name
 
-GEMINI_3_FLASH_MODEL = "gemini-3-flash"
+GEMINI_3_FLASH_MODEL = "gemini-3-flash-preview"
 
 
 @dataclass
