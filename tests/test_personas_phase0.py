@@ -20,6 +20,7 @@ from debate_v_majority.personas import (
     duplicate_diagnostics,
     default_judge_bank_dir,
     expand_cards,
+    generate_task_axes,
     get_fixed_axes,
     legacy_artifact_path,
     load_artifact,
@@ -27,6 +28,8 @@ from debate_v_majority.personas import (
     resolve_judge_family_assignment,
     sample_axis_points,
     save_artifact,
+    validate_descriptor,
+    validate_descriptor_against_task,
     validate_text_for_leakage,
 )
 from debate_v_majority.personas.prompt_templates import (
@@ -35,7 +38,15 @@ from debate_v_majority.personas.prompt_templates import (
     build_stage2_messages,
     build_task_axis_messages,
 )
-from debate_v_majority.personas.generator import MAX_GENERATION_RETRIES, _axis_interpretation, generate_descriptors
+from debate_v_majority.personas.generator import (
+    CARD_MAX_TOKENS,
+    DESCRIPTOR_MAX_TOKENS,
+    MAX_GENERATION_RETRIES,
+    _axis_interpretation,
+    _descriptor_context_texts,
+    generate_descriptors,
+)
+from debate_v_majority.personas.judge_generator import JUDGE_CARD_MAX_TOKENS
 from debate_v_majority.personas.schema import Axis, PersonaCard, PersonaDescriptor, ValidationResult
 
 
@@ -64,15 +75,18 @@ class _FakeEngine:
         )
         outputs = []
         for ctx in contexts:
-            prompt_content = ctx[-1]["content"]
-            if isinstance(prompt_content, list):
-                prompt = "\n".join(
-                    str(part.get("text") or "")
-                    for part in prompt_content
-                    if isinstance(part, dict) and str(part.get("type") or "text") == "text"
-                )
-            else:
-                prompt = prompt_content
+            prompt_parts = []
+            for msg in ctx:
+                mc = msg.get("content", "")
+                if isinstance(mc, list):
+                    prompt_parts.extend(
+                        str(part.get("text") or "")
+                        for part in mc
+                        if isinstance(part, dict) and str(part.get("type") or "text") == "text"
+                    )
+                else:
+                    prompt_parts.append(str(mc))
+            prompt = "\n".join(prompt_parts)
             if "Propose reasoning-relevant axes" in prompt:
                 outputs.append(
                     json.dumps(
@@ -194,6 +208,141 @@ def test_balanced_principle_option_axis_interpretation_is_grammatical():
 def test_validate_text_for_leakage_rejects_answer_like_content():
     result = validate_text_for_leakage("The likely answer is A, so choose option A.")
     assert result.status == "reject_hard"
+
+
+def test_validate_descriptor_allows_math_method_language():
+    descriptor = PersonaDescriptor(
+        persona_id="persona_1",
+        name="Structural Calculus Solver",
+        axis_values={"differentiation_methodology": 0.9},
+        axis_interpretation={"differentiation_methodology": "uses logarithmic differentiation and product rule checks"},
+        short_rule="use reciprocal-sum identities and verify with the product rule",
+        reasoning_summary="prefers theorem-level structural invariants over brute-force expansion",
+    )
+
+    result = validate_descriptor(descriptor)
+    assert result.status == "accept"
+
+
+def test_validate_descriptor_retries_task_specific_math_objects():
+    descriptor = PersonaDescriptor(
+        persona_id="persona_1",
+        name="Topological Shape Analyst",
+        axis_values={"bifurcation_analysis_style": 0.9},
+        axis_interpretation={"bifurcation_analysis_style": "tracks the number of local minima through root interleaving"},
+        short_rule="analyze the derivative's roots to count local minima",
+        reasoning_summary="uses the second derivative to locate bifurcation points and extrema boundaries",
+    )
+
+    result = validate_descriptor_against_task(
+        descriptor,
+        question="Let f(x)=((x-18)(x-72)(x-98)(x-k))/x. Find the sum of the three values of k.",
+        raw_task={"problem": "Let f(x)=((x-18)(x-72)(x-98)(x-k))/x. Find the sum of the three values of k."},
+        context_texts=[
+            "Uses root-interleaving and sign-change analysis to determine the number of extrema.",
+            "Employs discriminant analysis and the vanishing of the second derivative.",
+        ],
+    )
+    assert result.status == "retry"
+    assert result.reasons == ["repeats too many question-specific terms instead of describing reusable reasoning policy"]
+
+
+def test_validate_descriptor_against_task_allows_generic_reasoning_policy():
+    descriptor = PersonaDescriptor(
+        persona_id="persona_1",
+        name="Structural Calculus Solver",
+        axis_values={"differentiation_methodology": 0.9},
+        axis_interpretation={"differentiation_methodology": "prefers compact reformulation before brute-force algebra"},
+        short_rule="reformulate the objective into a simpler representation before expanding details",
+        reasoning_summary="prefers structural invariants, delayed commitment, and explicit verification of intermediate claims",
+    )
+
+    result = validate_descriptor_against_task(
+        descriptor,
+        question="Let f(x)=((x-18)(x-72)(x-98)(x-k))/x. Find the sum of the three values of k.",
+        raw_task={"problem": "Let f(x)=((x-18)(x-72)(x-98)(x-k))/x. Find the sum of the three values of k."},
+    )
+    assert result.status == "accept"
+
+
+def test_generate_task_axes_retries_after_parse_error():
+    class _AxisRetryEngine:
+        model_name = "fake-generator"
+        provider_name = "fake-provider"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_batch(self, contexts, batch_size=1, sampling_kwargs=None, progress_callback=None, model_role=None):
+            self.calls += 1
+            outputs = [
+                "not json"
+                if self.calls == 1
+                else json.dumps(
+                    {
+                        "axes": [
+                            {
+                                "axis_id": "llm_axis",
+                                "name": "LLM Axis",
+                                "low_desc": "low",
+                                "high_desc": "high",
+                                "notes": "note",
+                            }
+                        ]
+                    }
+                )
+            ]
+            if progress_callback is not None:
+                progress_callback(len(outputs))
+            return outputs
+
+    axes = generate_task_axes(
+        dataset="aime25",
+        question="What is 1+1?",
+        raw_task={"problem": "What is 1+1?"},
+        benchmark_family="competition_math",
+        count=1,
+        generator_model="fake-generator",
+        engine=_AxisRetryEngine(),
+        backend="llm",
+    )
+    assert len(axes) == 1
+    assert axes[0].axis_id == "llm_axis"
+
+
+def test_descriptor_generation_skips_task_overlap_context():
+    axis_selection = build_axis_selection(
+        mode="task",
+        question="Let f(x)=((x-18)(x-72)(x-98)(x-k))/x. Find the sum of the three values of k.",
+        dataset="aime25",
+        raw_task={"problem": "Let f(x)=((x-18)(x-72)(x-98)(x-k))/x. Find the sum of the three values of k."},
+        fixed_count=0,
+        task_count=1,
+        generator_model=None,
+        engine=None,
+        backend="heuristic",
+        axes_file=None,
+    )
+
+    assert _descriptor_context_texts(axis_selection) == []
+
+
+def test_validate_descriptor_against_task_allows_generic_domain_terms_without_task_context():
+    descriptor = PersonaDescriptor(
+        persona_id="persona_1",
+        name="Critical Point Checker",
+        axis_values={"verification": 0.9},
+        axis_interpretation={"verification": "verifies turning points before committing"},
+        short_rule="check candidate extrema carefully before updating the answer",
+        reasoning_summary="tracks critical points, sanity-checks edge cases, and revises only on explicit contradictions",
+    )
+
+    result = validate_descriptor_against_task(
+        descriptor,
+        question="Let f(x)=((x-18)(x-72)(x-98)(x-k))/x. Find the sum of the three values of k.",
+        raw_task={"problem": "Let f(x)=((x-18)(x-72)(x-98)(x-k))/x. Find the sum of the three values of k."},
+    )
+    assert result.status == "accept"
 
 
 def test_duplicate_diagnostics_flags_near_duplicates():
@@ -442,7 +591,9 @@ def test_build_persona_artifact_llm_path():
     assert artifact.judge_card.source["call_metadata"]["model_role"] == "judge_generator"
     assert artifact.cards[0].system_prompt.startswith("Generated operational system prompt")
     assert len(engine.calls) >= 4
-    assert all(call["sampling_kwargs"]["max_tokens"] == 4096 for call in engine.calls)
+    assert any(call["model_role"] == "generator" and call["sampling_kwargs"]["max_tokens"] == DESCRIPTOR_MAX_TOKENS for call in engine.calls)
+    assert any(call["model_role"] == "judge_generator" and call["sampling_kwargs"]["max_tokens"] == JUDGE_CARD_MAX_TOKENS for call in engine.calls)
+    assert any(call["model_role"] == "generator" and call["sampling_kwargs"]["max_tokens"] == CARD_MAX_TOKENS for call in engine.calls)
     assert all("temperature" not in call["sampling_kwargs"] for call in engine.calls)
 
 
@@ -495,9 +646,23 @@ def test_hle_llm_persona_and_judge_generation_attach_question_images():
     assert len(engine.calls) >= 4
     for call in engine.calls:
         user_message = call["contexts"][0][-1]
-        assert isinstance(user_message["content"], list)
-        assert user_message["content"][0]["type"] == "text"
-        assert any(part.get("type") == "image" for part in user_message["content"][1:])
+        prompt_text = user_message["content"] if isinstance(user_message["content"], str) else ""
+        if isinstance(user_message["content"], list):
+            prompt_text = "\n".join(
+                str(part.get("text") or "") for part in user_message["content"]
+                if isinstance(part, dict) and str(part.get("type") or "text") == "text"
+            )
+        is_axis_call = "Propose reasoning-relevant axes" in prompt_text
+        is_descriptor_call = "Generate the full persona population jointly" in prompt_text
+        is_card_call = "Expand each descriptor into a compact" in prompt_text
+        is_judge_call = "Generate a constrained judge card" in prompt_text
+        if is_axis_call or is_judge_call:
+            assert isinstance(user_message["content"], list)
+            assert user_message["content"][0]["type"] == "text"
+            assert any(part.get("type") == "image" for part in user_message["content"][1:])
+        else:
+            assert is_descriptor_call or is_card_call
+            assert isinstance(user_message["content"], str)
 
 
 def test_make_dataset_subset_populates_stable_identity(tmp_path: Path):
@@ -678,6 +843,240 @@ def test_generate_descriptors_retry_keeps_axes_and_sampled_points_stable(monkeyp
     assert meta["sampled_points"] == expected_points
 
 
+def test_generate_descriptors_retries_after_parse_error():
+    config = PersonaGenerationConfig(
+        dataset="aime25",
+        question="What is 1+1?",
+        raw_task={"problem": "What is 1+1?", "answer": "2"},
+        item_uid="aime25:h:retry-parse",
+        item_display_id=1,
+        dataset_revision="rev-test",
+        n_personas=2,
+        persona_seed=7,
+        axis_mode="fixed",
+        fixed_axis_count=1,
+        backend="llm",
+        generator_model="fake-generator",
+    )
+
+    class _ParseRetryEngine:
+        model_name = "fake-generator"
+        provider_name = "fake-provider"
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.contexts = []
+
+        def generate_batch(self, contexts, batch_size=1, sampling_kwargs=None, progress_callback=None, model_role=None):
+            self.calls += 1
+            self.contexts.append(contexts)
+            if self.calls == 1:
+                outputs = ["Persona 1: prose\nPersona 2: more prose"]
+            else:
+                outputs = [
+                    json.dumps(
+                        {
+                            "descriptors": [
+                                {
+                                    "persona_id": "persona_1",
+                                    "name": "Verifier",
+                                    "axis_interpretation": {"symbolic_vs_intuitive": "checks before committing"},
+                                    "short_rule": "verify before committing",
+                                    "reasoning_summary": "checks critical steps before updating",
+                                },
+                                {
+                                    "persona_id": "persona_2",
+                                    "name": "Pruner",
+                                    "axis_interpretation": {"symbolic_vs_intuitive": "moves fast but checks contradictions"},
+                                    "short_rule": "prune quickly and stress test",
+                                    "reasoning_summary": "moves fast but checks contradictions",
+                                },
+                            ]
+                        }
+                    )
+                ]
+            if progress_callback is not None:
+                progress_callback(len(outputs))
+            return outputs
+
+    engine = _ParseRetryEngine()
+    descriptors, meta = generate_descriptors(config=config, engine=engine)
+    assert len(descriptors) == 2
+    validations = meta["validator_metadata"]["descriptor_validations"]
+    assert validations[0]["kind"] == "descriptor"
+    assert validations[0]["attempt"] == 1
+    attempt_audits = meta["validator_metadata"]["attempt_audits"]
+    assert attempt_audits[0]["parse_error"] is not None
+    assert "Could not parse JSON object" in attempt_audits[0]["parse_error"]
+    retry_messages = engine.contexts[1][0]
+    assert [message["role"] for message in retry_messages] == ["system", "user", "user"]
+
+
+def test_build_judge_card_retries_after_parse_error():
+    class _JudgeRetryEngine:
+        model_name = "fake-judge-generator"
+        provider_name = "fake-provider"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_batch(self, contexts, batch_size=1, sampling_kwargs=None, progress_callback=None, model_role=None):
+            self.calls += 1
+            outputs = [
+                "judge prose"
+                if self.calls == 1
+                else json.dumps(
+                    {
+                        "judge_id": "judge_math",
+                        "judge_family": "math",
+                        "domain_scope": "competition_math",
+                        "evaluation_priorities": ["score transcript support"],
+                        "tie_break_policy": "prefer explicit support",
+                        "independent_resolve_policy": "limited_check_only",
+                        "answer_format_policy": "strict",
+                        "confidence_policy": "optional",
+                        "system_prompt": "Judge prompt",
+                    }
+                )
+            ]
+            if progress_callback is not None:
+                progress_callback(len(outputs))
+            return outputs
+
+    judge = build_judge_card(
+        dataset="aime25",
+        raw_task={"problem": "What is 1+1?", "answer": "2"},
+        question="What is 1+1?",
+        mode="task_family_generated",
+        engine=_JudgeRetryEngine(),
+        generator_model="fake-judge-generator",
+        backend="llm",
+    )
+    assert judge is not None
+    assert judge.judge_family == "math"
+
+
+def test_expand_cards_retries_after_parse_error():
+    descriptors = [
+        PersonaDescriptor(
+            persona_id="persona_1",
+            name="Verifier",
+            axis_values={"a": 0.1},
+            axis_interpretation={"a": "checks before committing"},
+            short_rule="verify before committing",
+            reasoning_summary="checks critical steps before updating",
+        ),
+        PersonaDescriptor(
+            persona_id="persona_2",
+            name="Pruner",
+            axis_values={"a": 0.9},
+            axis_interpretation={"a": "moves fast but checks contradictions"},
+            short_rule="prune quickly and stress test",
+            reasoning_summary="moves fast but checks contradictions",
+        ),
+    ]
+
+    class _CardParseRetryEngine:
+        model_name = "fake-generator"
+        provider_name = "fake-provider"
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.contexts = []
+
+        def generate_batch(self, contexts, batch_size=1, sampling_kwargs=None, progress_callback=None, model_role=None):
+            self.calls += 1
+            self.contexts.append(contexts)
+            if self.calls == 1:
+                outputs = ["```json\n{\n  \"persona_id\": \"persona_1\",\n  \"title\": \"Verifier\""]
+            else:
+                outputs = [
+                    json.dumps(
+                        {
+                            "persona_id": "persona_1" if self.calls in (2, 3) else "persona_2",
+                            "title": "Verifier" if self.calls in (2, 3) else "Pruner",
+                            "core_reasoning_strategy": "verify critical steps before updating"
+                            if self.calls in (2, 3)
+                            else "prune branches and stress test contradictions",
+                            "priorities": ["track constraints"] if self.calls in (2, 3) else ["prune weak branches"],
+                            "distrusts": ["unsupported leaps"] if self.calls in (2, 3) else ["decorative algebra"],
+                            "decomposition_style": "stepwise" if self.calls in (2, 3) else "branch-and-test",
+                            "revision_policy": "revise on evidence",
+                            "confidence_policy": "be explicit",
+                            "failure_mode_to_avoid": "avoid answer-first reasoning",
+                            "system_prompt": "Generated operational system prompt for verifier"
+                            if self.calls in (2, 3)
+                            else "Generated operational system prompt for pruner",
+                        }
+                    )
+                ]
+            if progress_callback is not None:
+                progress_callback(len(outputs))
+            return outputs
+
+    engine = _CardParseRetryEngine()
+    cards, meta = expand_cards(
+        descriptors,
+        question="What is 1+1?",
+        engine=engine,
+        backend="llm",
+    )
+    assert len(cards) == 2
+    validations = meta["card_validations"]
+    assert validations[0]["kind"] == "card"
+    assert validations[0]["attempt"] == 1
+    attempt_audits = meta["card_attempt_audits"]
+    assert attempt_audits[0]["parse_error"] is not None
+    assert "Could not parse JSON object" in attempt_audits[0]["parse_error"]
+    retry_messages = engine.contexts[2][0]
+    assert [message["role"] for message in retry_messages] == ["system", "user", "user"]
+
+
+def test_ensure_judge_bank_card_retries_after_parse_error(tmp_path: Path):
+    class _JudgeBankRetryEngine:
+        model_name = "fake-judge-generator"
+        provider_name = "fake-provider"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_batch(self, contexts, batch_size=1, sampling_kwargs=None, progress_callback=None, model_role=None):
+            self.calls += 1
+            outputs = [
+                "not json"
+                if self.calls == 1
+                else json.dumps(
+                    {
+                        "judge_id": "judge_bank_aime25_math",
+                        "judge_family": "math",
+                        "domain_scope": "competition_math",
+                        "evaluation_priorities": ["score transcript support"],
+                        "tie_break_policy": "prefer explicit support",
+                        "independent_resolve_policy": "limited_check_only",
+                        "answer_format_policy": "strict",
+                        "confidence_policy": "optional",
+                        "system_prompt": "Judge bank prompt",
+                    }
+                )
+            ]
+            if progress_callback is not None:
+                progress_callback(len(outputs))
+            return outputs
+
+    judge_card, artifact, path = ensure_judge_bank_card(
+        judge_bank_dir=default_judge_bank_dir(artifacts_dir=tmp_path),
+        dataset="aime25",
+        judge_family="math",
+        engine=_JudgeBankRetryEngine(),
+        generator_model="fake-judge-generator",
+        backend="llm",
+        refresh=True,
+    )
+    assert judge_card.judge_family == "math"
+    assert artifact.judge_card.judge_id == judge_card.judge_id
+    assert path.exists()
+
+
 def test_expand_cards_retry_cap_raises_after_exhaustion(monkeypatch: pytest.MonkeyPatch):
     descriptors = [
         PersonaDescriptor(
@@ -741,6 +1140,8 @@ def test_persona_mode_main_generates_and_replays(tmp_path: Path, monkeypatch: py
             "gpqa",
             "--mode",
             "personas",
+            "--persona_backend",
+            "heuristic",
             "--subset_ids",
             "0",
             "--out_dir",
@@ -769,6 +1170,8 @@ def test_persona_mode_main_generates_and_replays(tmp_path: Path, monkeypatch: py
             "gpqa",
             "--mode",
             "personas",
+            "--persona_backend",
+            "heuristic",
             "--subset_ids",
             "0",
             "--out_dir",
@@ -831,6 +1234,12 @@ def test_persona_generation_emits_benchmark_bank_judge_card(tmp_path: Path):
     assert row["validator_metadata"]["judge_bank"]["judge_bank_path"].endswith("math.json")
 
 
+def test_arg_parser_defaults_persona_backend_to_llm():
+    parser = cli_main_impl._build_arg_parser()
+    args = parser.parse_args(["--dataset", "gpqa", "--mode", "personas"])
+    assert args.persona_backend == "llm"
+
+
 def test_prompt_templates_emphasize_support_coverage_and_operational_behavior():
     axis_messages = build_task_axis_messages(
         dataset="gpqa",
@@ -845,7 +1254,6 @@ def test_prompt_templates_emphasize_support_coverage_and_operational_behavior():
     descriptor_messages = build_stage1_messages(
         dataset="gpqa",
         benchmark_family="science_multiple_choice",
-        question="Which option is correct?",
         axes=[{"axis_id": "a", "name": "Axis A", "low_desc": "low", "high_desc": "high"}],
         sampled_points=[{"a": 0.1}, {"a": 0.9}],
     )
@@ -853,6 +1261,11 @@ def test_prompt_templates_emphasize_support_coverage_and_operational_behavior():
     assert "hard anchors" in descriptor_user
     assert "near-duplicate safe personas" in descriptor_user
     assert "support coverage" in descriptor_user
+    assert "reusable across any item" in descriptor_user
+    assert "Question:" not in descriptor_user
+    assert "Allowed descriptor content" in descriptor_user
+    assert "Disallowed descriptor content" in descriptor_user
+    assert "Translate axis positions into general execution tendencies" in descriptor_user
 
     stage2_messages = build_stage2_messages(
         question="Which option is correct?",
@@ -867,6 +1280,12 @@ def test_prompt_templates_emphasize_support_coverage_and_operational_behavior():
     stage2_user = stage2_messages[-1]["content"]
     assert "operating rules" in stage2_user
     assert "visible in execution" in stage2_user
+    assert "Question:" not in stage2_user
+    assert "must not target any specific problem" in stage2_user
+    assert "compress it into a narrower policy vocabulary" in stage2_user
+    assert "Allowed card content" in stage2_user
+    assert "Disallowed card content" in stage2_user
+    assert "Example rewrite" in stage2_user
 
     judge_messages = build_judge_messages(
         dataset="gpqa",
@@ -877,3 +1296,5 @@ def test_prompt_templates_emphasize_support_coverage_and_operational_behavior():
     judge_user = judge_messages[-1]["content"]
     assert "transcript-grounded evidence" in judge_user
     assert "superficial consensus" in judge_user
+    assert "multi-agent compatible" in judge_user
+    assert "majority-vs-best-argument conflicts" in judge_user

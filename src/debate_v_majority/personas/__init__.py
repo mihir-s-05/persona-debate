@@ -8,7 +8,18 @@ from .artifacts import (
     save_artifact,
 )
 from .axes import FIXED_AXIS_BANK, build_axis_selection, generate_task_axes, get_fixed_axes, infer_benchmark_family
-from .generator import build_persona_artifact, expand_cards, generate_descriptors
+from .generator import (
+    build_card_messages,
+    build_descriptor_messages,
+    build_persona_artifact,
+    build_persona_validator_metadata,
+    expand_cards,
+    generate_descriptors,
+    generate_descriptors_from_state,
+    parse_card_result,
+    parse_descriptor_result,
+    prepare_descriptor_generation,
+)
 from .judge_generator import build_judge_card
 from .judge_bank import (
     AIME25_JUDGE_FAMILIES,
@@ -39,6 +50,7 @@ from .validators import (
     duplicate_diagnostics,
     validate_card,
     validate_descriptor,
+    validate_descriptor_against_task,
     validate_text_for_leakage,
 )
 
@@ -59,11 +71,18 @@ __all__ = [
     "build_judge_card",
     "default_gpqa_family_cache_path",
     "default_judge_bank_dir",
+    "build_card_messages",
+    "build_descriptor_messages",
     "build_persona_artifact",
+    "build_persona_validator_metadata",
     "dataset_revision_from_path",
     "duplicate_diagnostics",
     "expand_cards",
     "generate_descriptors",
+    "generate_descriptors_from_state",
+    "parse_card_result",
+    "parse_descriptor_result",
+    "prepare_descriptor_generation",
     "generate_task_axes",
     "get_fixed_axes",
     "infer_benchmark_family",
@@ -83,5 +102,6 @@ __all__ = [
     "save_artifact",
     "validate_card",
     "validate_descriptor",
+    "validate_descriptor_against_task",
     "validate_text_for_leakage",
 ]

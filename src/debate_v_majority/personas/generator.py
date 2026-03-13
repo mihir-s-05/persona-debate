@@ -22,11 +22,21 @@ from .schema import (
     PersonaCard,
     PersonaDescriptor,
     PersonaGenerationConfig,
+    ValidationResult,
 )
-from .validators import duplicate_diagnostics, validate_card, validate_descriptor
+from .validators import duplicate_diagnostics, validate_card, validate_descriptor, validate_descriptor_against_task
 
 
 MAX_GENERATION_RETRIES = 2
+DESCRIPTOR_MAX_TOKENS = 8192
+CARD_MAX_TOKENS = 8192
+
+
+class GenerationExhaustedError(ValueError):
+    def __init__(self, message: str, *, stage: str, metadata: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.metadata = metadata
 
 _LOW_STYLE = {
     "symbolic_vs_intuitive": "use explicit symbolic structure before relying on intuition",
@@ -132,35 +142,32 @@ def _heuristic_descriptors(*, config: PersonaGenerationConfig, axes: list[Axis],
     return descriptors
 
 
-def _llm_descriptors(
+def build_descriptor_messages(
     *,
     config: PersonaGenerationConfig,
     axis_selection: Any,
     points: list[dict[str, float]],
-    engine: Any,
-) -> tuple[list[PersonaDescriptor], dict[str, Any]]:
-    question_media = _question_media_for_task(dataset=config.dataset, raw_task=config.raw_task)
-    messages = build_stage1_messages(
+) -> list[dict[str, Any]]:
+    return build_stage1_messages(
         dataset=config.dataset,
         benchmark_family=axis_selection.benchmark_family or config.dataset,
-        question=config.question,
-        axes=[asdict(axis) for axis in axis_selection.axes],
+        axes=_descriptor_prompt_axes(axis_selection),
         sampled_points=points,
-        question_media=question_media,
     )
-    result = ensure_inference_results(
-        engine,
-        [messages],
-        batch_size=1,
-        sampling_kwargs={"max_tokens": 4096},
-        model_role="generator",
-    )[0]
-    payload = parse_json_payload(str(result.text))
+
+
+def parse_descriptor_result(
+    result_text: str,
+    *,
+    n_personas: int,
+    points: list[dict[str, float]],
+) -> list[PersonaDescriptor]:
+    payload = parse_json_payload(result_text)
     rows = payload.get("descriptors") or []
-    if len(rows) < config.n_personas:
+    if len(rows) < n_personas:
         raise ValueError(f"Stage-1 descriptor generation returned too few rows: {rows}")
     descriptors: list[PersonaDescriptor] = []
-    for idx, row in enumerate(rows[: config.n_personas]):
+    for idx, row in enumerate(rows[:n_personas]):
         point = points[idx]
         descriptors.append(
             PersonaDescriptor(
@@ -172,26 +179,103 @@ def _llm_descriptors(
                 reasoning_summary=str(row.get("reasoning_summary") or "apply a distinct operational reasoning policy"),
             )
         )
+    return descriptors
+
+
+def _llm_descriptors(
+    *,
+    config: PersonaGenerationConfig,
+    axis_selection: Any,
+    points: list[dict[str, float]],
+    engine: Any,
+) -> tuple[list[PersonaDescriptor], dict[str, Any]]:
+    messages = build_descriptor_messages(
+        config=config, axis_selection=axis_selection, points=points,
+    )
+    result = ensure_inference_results(
+        engine,
+        [messages],
+        batch_size=1,
+        sampling_kwargs={"max_tokens": DESCRIPTOR_MAX_TOKENS},
+        model_role="generator",
+    )[0]
+    descriptors = parse_descriptor_result(
+        str(result.text), n_personas=config.n_personas, points=points,
+    )
     return descriptors, inference_result_metadata(result)
 
 
-def _sum_token_counts(rows: list[dict[str, Any] | None]) -> dict[str, int]:
-    valid = [row for row in rows if row is not None]
+def _effective_backend(*, config: PersonaGenerationConfig, engine: Any | None) -> str:
+    return "llm" if config.backend == "llm" or (config.backend == "auto" and engine is not None) else "heuristic"
+
+
+def _descriptor_prompt_axis(axis: Any) -> dict[str, Any]:
+    axis_id = str(getattr(axis, "axis_id", "") or "")
+    name = str(getattr(axis, "name", "") or "")
+    kind = str(getattr(axis, "kind", "") or "")
+    if kind == "fixed":
+        return {
+            "axis_id": axis_id,
+            "name": name,
+            "kind": kind,
+            "low_desc": str(getattr(axis, "low_desc", "") or ""),
+            "high_desc": str(getattr(axis, "high_desc", "") or ""),
+            "notes": None if getattr(axis, "notes", None) is None else str(getattr(axis, "notes", "") or ""),
+        }
+
     return {
-        "n_calls": len(valid),
-        "input_tokens": sum(int((row.get("token_counts") or {}).get("input_tokens") or 0) for row in valid),
-        "output_tokens": sum(int((row.get("token_counts") or {}).get("output_tokens") or 0) for row in valid),
-        "total_tokens": sum(int((row.get("token_counts") or {}).get("total_tokens") or 0) for row in valid),
+        "axis_id": axis_id,
+        "name": name,
+        "kind": kind,
+        "low_desc": f"Low end of the '{name}' reasoning preference.",
+        "high_desc": f"High end of the '{name}' reasoning preference.",
+        "notes": (
+            "Interpret this axis abstractly from its name only. "
+            "Do not reuse task-specific objects, formulas, constants, or answer conditions."
+        ),
     }
 
 
-def generate_descriptors(
+def _descriptor_prompt_axes(axis_selection: Any) -> list[dict[str, Any]]:
+    return [_descriptor_prompt_axis(axis) for axis in getattr(axis_selection, "axes", []) or []]
+
+
+def _descriptor_context_texts(axis_selection: Any) -> list[str]:
+    # Descriptor generation is now benchmark-family-level and does not see the raw
+    # question. Revalidating against task-axis text or question summaries creates
+    # false positives on allowed shared vocabulary such as "differentiation" or
+    # "abstraction", so live descriptor generation intentionally skips contextual
+    # overlap checks beyond the base leakage validator.
+    _ = axis_selection
+    return []
+
+
+def _validate_descriptor_for_generation(
+    descriptor: PersonaDescriptor,
+    *,
+    config: PersonaGenerationConfig,
+    axis_selection: Any,
+    backend: str,
+) -> ValidationResult:
+    base = validate_descriptor(descriptor)
+    if base.status != "accept":
+        return base
+    if backend != "llm":
+        return base
+    return validate_descriptor_against_task(
+        descriptor,
+        question=None,
+        raw_task=None,
+        context_texts=_descriptor_context_texts(axis_selection),
+    )
+
+
+def prepare_descriptor_generation(
     *,
     config: PersonaGenerationConfig,
     engine: Any | None = None,
-) -> tuple[list[PersonaDescriptor], dict[str, Any]]:
-    last_meta: dict[str, Any] | None = None
-    backend = "llm" if config.backend == "llm" or (config.backend == "auto" and engine is not None) else "heuristic"
+) -> tuple[Any, list[dict[str, float]], str]:
+    backend = _effective_backend(config=config, engine=engine)
     axis_selection = build_axis_selection(
         mode=config.axis_mode,
         question=config.question,
@@ -210,21 +294,131 @@ def generate_descriptors(
         seed=config.persona_seed,
         method=config.sampling_method,
     )
+    return axis_selection, points, backend
+
+
+def _sum_token_counts(rows: list[dict[str, Any] | None]) -> dict[str, int]:
+    valid = [row for row in rows if row is not None]
+    return {
+        "n_calls": len(valid),
+        "input_tokens": sum(int((row.get("token_counts") or {}).get("input_tokens") or 0) for row in valid),
+        "output_tokens": sum(int((row.get("token_counts") or {}).get("output_tokens") or 0) for row in valid),
+        "total_tokens": sum(int((row.get("token_counts") or {}).get("total_tokens") or 0) for row in valid),
+    }
+
+
+def generate_descriptors(
+    *,
+    config: PersonaGenerationConfig,
+    engine: Any | None = None,
+) -> tuple[list[PersonaDescriptor], dict[str, Any]]:
+    axis_selection, points, _backend = prepare_descriptor_generation(
+        config=config,
+        engine=engine,
+    )
+    return generate_descriptors_from_state(
+        config=config,
+        axis_selection=axis_selection,
+        points=points,
+        engine=engine,
+    )
+
+
+def _build_descriptor_retry_feedback(
+    *,
+    parse_error: str | None,
+    validator_rows: list[dict[str, Any]],
+    duplicates: list[dict[str, float | int]],
+) -> str:
+    parts = ["Your previous response was not accepted. Issues found:"]
+    if parse_error:
+        parts.append(f"- JSON parse failure: {parse_error[:300]}")
+    for row in validator_rows:
+        if row.get("status") in ("retry", "reject_hard"):
+            pid = row.get("persona_id") or "unknown"
+            reasons = ", ".join(str(r) for r in row.get("reasons", []))
+            parts.append(f"- {pid}: {reasons}")
+    if duplicates:
+        for dupe in duplicates:
+            parts.append(
+                f"- personas {dupe['left']} and {dupe['right']} are too similar "
+                f"(Jaccard={dupe['similarity']})"
+            )
+    parts.append("")
+    parts.append("Regenerate all descriptors. Requirements:")
+    parts.append("- Describe reusable reasoning POLICY only (search order, verification timing, "
+                 "pruning strategy, revision triggers, evidence standards)")
+    parts.append("- No item-specific mathematical objects, equations, constants, or solve strategies")
+    parts.append("- Each persona must be operationally distinct from every other")
+    parts.append("- Return ONLY a valid JSON object—no prose, no markdown fencing, no explanation")
+    return "\n".join(parts)
+
+
+def generate_descriptors_from_state(
+    *,
+    config: PersonaGenerationConfig,
+    axis_selection: Any,
+    points: list[dict[str, float]],
+    engine: Any | None = None,
+) -> tuple[list[PersonaDescriptor], dict[str, Any]]:
+    last_meta: dict[str, Any] | None = None
+    backend = _effective_backend(config=config, engine=engine)
+    attempt_audits: list[dict[str, Any]] = []
+    retry_context: list[dict[str, Any]] | None = None
     for attempt in range(MAX_GENERATION_RETRIES + 1):
+        descriptor_messages: list[dict[str, Any]] | None = None
+        raw_result_text: str | None = None
+        parse_error: str | None = None
         if backend == "llm" and engine is not None:
-            descriptors, descriptor_call_meta = _llm_descriptors(
+            base_messages = build_descriptor_messages(
                 config=config,
                 axis_selection=axis_selection,
                 points=points,
-                engine=engine,
             )
+            if retry_context is not None:
+                descriptor_messages = base_messages + retry_context
+            else:
+                descriptor_messages = base_messages
+            result = ensure_inference_results(
+                engine,
+                [descriptor_messages],
+                batch_size=1,
+                sampling_kwargs={"max_tokens": DESCRIPTOR_MAX_TOKENS},
+                model_role="generator",
+            )[0]
+            raw_result_text = str(result.text)
+            descriptor_call_meta = inference_result_metadata(result)
+            try:
+                descriptors = parse_descriptor_result(
+                    raw_result_text,
+                    n_personas=config.n_personas,
+                    points=points,
+                )
+            except ValueError as exc:
+                parse_error = str(exc)
+                descriptors = []
         else:
             descriptors = _heuristic_descriptors(config=config, axes=axis_selection.axes, points=points)
             descriptor_call_meta = None
         validator_rows: list[dict[str, Any]] = []
-        has_retry = False
+        has_retry = parse_error is not None
+        if parse_error is not None:
+            validator_rows.append(
+                {
+                    "persona_id": None,
+                    "kind": "descriptor_parse",
+                    "status": "retry",
+                    "reasons": [parse_error],
+                    "attempt": attempt,
+                }
+            )
         for descriptor in descriptors:
-            validation = validate_descriptor(descriptor)
+            validation = _validate_descriptor_for_generation(
+                descriptor,
+                config=config,
+                axis_selection=axis_selection,
+                backend=backend,
+            )
             validator_rows.append(
                 {
                     "persona_id": descriptor.persona_id,
@@ -235,7 +429,7 @@ def generate_descriptors(
                 }
             )
             if validation.status == "reject_hard":
-                raise ValueError(f"Descriptor {descriptor.persona_id} rejected: {validation.reasons}")
+                has_retry = True
             if validation.status == "retry":
                 has_retry = True
         dupes = duplicate_diagnostics(d.reasoning_summary for d in descriptors)
@@ -245,7 +439,21 @@ def generate_descriptors(
             "descriptor_prompt_version": DESCRIPTOR_PROMPT_VERSION,
             "descriptor_backend": backend,
             "descriptor_call_metadata": descriptor_call_meta,
+            "descriptor_parse_error": parse_error,
         }
+        audit_validator_meta = dict(validator_meta)
+        attempt_audits.append(
+            {
+                "attempt": attempt,
+                "backend": backend,
+                "request_messages": descriptor_messages,
+                "raw_result_text": raw_result_text,
+                "parse_error": parse_error,
+                "descriptors": [asdict(descriptor) for descriptor in descriptors],
+                "validator_metadata": audit_validator_meta,
+            }
+        )
+        validator_meta["attempt_audits"] = [dict(audit) for audit in attempt_audits]
         last_meta = {
             "axis_selection": axis_selection,
             "sampled_points": points,
@@ -253,8 +461,30 @@ def generate_descriptors(
         }
         if not has_retry and not dupes:
             return descriptors, last_meta
+        if backend == "llm" and engine is not None:
+            retry_context = [
+                {
+                    "role": "user",
+                    "content": _build_descriptor_retry_feedback(
+                        parse_error=parse_error,
+                        validator_rows=validator_rows,
+                        duplicates=dupes,
+                    ),
+                },
+            ]
     assert last_meta is not None
-    raise ValueError(f"Descriptor generation exhausted retries: {last_meta['validator_metadata']}")
+    failure_metadata = {
+        **last_meta,
+        "validator_metadata": {
+            **last_meta["validator_metadata"],
+            "attempt_audits": [dict(audit) for audit in attempt_audits],
+        },
+    }
+    raise GenerationExhaustedError(
+        f"Descriptor generation exhausted retries: {failure_metadata['validator_metadata']}",
+        stage="descriptors",
+        metadata=failure_metadata,
+    )
 
 
 def _heuristic_card(descriptor: PersonaDescriptor) -> PersonaCard:
@@ -288,26 +518,25 @@ def _heuristic_card(descriptor: PersonaDescriptor) -> PersonaCard:
     )
 
 
-def _llm_card(
+def build_card_messages(
     *,
     descriptor: PersonaDescriptor,
     question: str,
     question_media: list[dict[str, Any]] | None,
-    engine: Any,
-) -> tuple[PersonaCard, dict[str, Any]]:
-    messages = build_stage2_messages(
+) -> list[dict[str, Any]]:
+    return build_stage2_messages(
         question=question,
         descriptor=asdict(descriptor),
         question_media=question_media,
     )
-    result = ensure_inference_results(
-        engine,
-        [messages],
-        batch_size=1,
-        sampling_kwargs={"max_tokens": 4096},
-        model_role="generator",
-    )[0]
-    payload = parse_json_payload(str(result.text))
+
+
+def parse_card_result(
+    result_text: str,
+    *,
+    descriptor: PersonaDescriptor,
+) -> PersonaCard:
+    payload = parse_json_payload(result_text)
     return PersonaCard(
         persona_id=str(payload.get("persona_id") or descriptor.persona_id),
         title=str(payload.get("title") or descriptor.name),
@@ -320,7 +549,56 @@ def _llm_card(
         failure_mode_to_avoid=str(payload.get("failure_mode_to_avoid") or "do not collapse into answer-first reasoning"),
         system_prompt=str(payload.get("system_prompt") or descriptor.reasoning_summary),
         card_version=CARD_PROMPT_VERSION,
-    ), inference_result_metadata(result)
+    )
+
+
+def _build_card_retry_feedback(
+    *,
+    parse_error: str | None,
+    validation: ValidationResult | dict[str, Any] | None,
+) -> str:
+    parts = ["Your previous card response was not accepted. Issues found:"]
+    if parse_error:
+        parts.append(f"- JSON parse failure: {parse_error[:300]}")
+    if isinstance(validation, dict):
+        status = validation.get("status")
+        reasons = validation.get("reasons", [])
+    elif validation is not None:
+        status = validation.status
+        reasons = validation.reasons
+    else:
+        status = None
+        reasons = []
+    if status in ("retry", "reject_hard"):
+        parts.append(f"- Validation: {', '.join(str(reason) for reason in reasons)}")
+    parts.append("")
+    parts.append("Regenerate this card. Requirements:")
+    parts.append("- Return ONLY a valid JSON object matching the requested schema")
+    parts.append("- No markdown fencing, no prose, no explanation")
+    parts.append("- Keep the card compact and operational")
+    parts.append("- Focus on reasoning policy, not biography or style")
+    return "\n".join(parts)
+
+
+def _llm_card(
+    *,
+    descriptor: PersonaDescriptor,
+    question: str,
+    question_media: list[dict[str, Any]] | None,
+    engine: Any,
+) -> tuple[PersonaCard, dict[str, Any]]:
+    messages = build_card_messages(
+        descriptor=descriptor, question=question, question_media=question_media,
+    )
+    result = ensure_inference_results(
+        engine,
+        [messages],
+        batch_size=1,
+        sampling_kwargs={"max_tokens": CARD_MAX_TOKENS},
+        model_role="generator",
+    )[0]
+    card = parse_card_result(str(result.text), descriptor=descriptor)
+    return card, inference_result_metadata(result)
 
 
 def _heuristic_card_distinctive(descriptor: PersonaDescriptor) -> PersonaCard:
@@ -404,37 +682,98 @@ def expand_cards(
 ) -> tuple[list[PersonaCard], dict[str, Any]]:
     last_meta: dict[str, Any] | None = None
     question_media = _question_media_for_task(dataset=dataset, raw_task=raw_task)
+    attempt_audits: list[dict[str, Any]] = []
     for attempt in range(MAX_GENERATION_RETRIES + 1):
         cards: list[PersonaCard] = []
         validator_rows: list[dict[str, Any]] = []
         call_metadata: list[dict[str, Any] | None] = []
         has_retry = False
         for descriptor in descriptors:
+            card_call_meta: dict[str, Any] | None = None
+            raw_result_text: str | None = None
+            parse_error: str | None = None
+            request_messages: list[dict[str, Any]] | None = None
+            validation: ValidationResult | None = None
             if backend == "llm" and engine is not None:
-                card, card_call_meta = _llm_card(
+                request_messages = build_card_messages(
                     descriptor=descriptor,
                     question=question,
                     question_media=question_media,
-                    engine=engine,
                 )
+                if attempt > 0:
+                    prev = next(
+                        (
+                            audit for audit in reversed(attempt_audits)
+                            if audit.get("persona_id") == descriptor.persona_id
+                        ),
+                        None,
+                    )
+                    request_messages = request_messages + [
+                        {
+                            "role": "user",
+                            "content": _build_card_retry_feedback(
+                                parse_error=None if prev is None else prev.get("parse_error"),
+                                validation=None if prev is None else prev.get("validation"),
+                            ),
+                        }
+                    ]
+                result = ensure_inference_results(
+                    engine,
+                    [request_messages],
+                    batch_size=1,
+                    sampling_kwargs={"max_tokens": CARD_MAX_TOKENS},
+                    model_role="generator",
+                )[0]
+                raw_result_text = str(result.text)
+                card_call_meta = inference_result_metadata(result)
+                try:
+                    card = parse_card_result(raw_result_text, descriptor=descriptor)
+                except ValueError as exc:
+                    parse_error = str(exc)
+                    card = None
             else:
                 card, card_call_meta = _heuristic_card(descriptor), None
-            validation = validate_card(card)
-            validator_rows.append(
+            if parse_error is not None:
+                validation = ValidationResult(status="retry", reasons=[parse_error])
+                validator_rows.append(
+                    {
+                        "persona_id": descriptor.persona_id,
+                        "kind": "card_parse",
+                        "status": "retry",
+                        "reasons": [parse_error],
+                        "attempt": attempt,
+                    }
+                )
+                has_retry = True
+            else:
+                assert card is not None
+                validation = validate_card(card)
+                validator_rows.append(
+                    {
+                        "persona_id": descriptor.persona_id,
+                        "kind": "card",
+                        "status": validation.status,
+                        "reasons": list(validation.reasons),
+                        "attempt": attempt,
+                    }
+                )
+                if validation.status == "reject_hard":
+                    raise ValueError(f"Card {card.persona_id} rejected: {validation.reasons}")
+                if validation.status == "retry":
+                    has_retry = True
+                cards.append(card)
+            call_metadata.append(card_call_meta)
+            attempt_audits.append(
                 {
-                    "persona_id": descriptor.persona_id,
-                    "kind": "card",
-                    "status": validation.status,
-                    "reasons": list(validation.reasons),
                     "attempt": attempt,
+                    "persona_id": descriptor.persona_id,
+                    "request_messages": request_messages,
+                    "raw_result_text": raw_result_text,
+                    "parse_error": parse_error,
+                    "validation": None if validation is None else asdict(validation),
+                    "card": None if parse_error is not None or card is None else asdict(card),
                 }
             )
-            if validation.status == "reject_hard":
-                raise ValueError(f"Card {card.persona_id} rejected: {validation.reasons}")
-            if validation.status == "retry":
-                has_retry = True
-            cards.append(card)
-            call_metadata.append(card_call_meta)
         dupes = duplicate_diagnostics(card.system_prompt for card in cards)
         if dupes:
             cards = _regenerate_duplicate_cards(
@@ -454,11 +793,16 @@ def expand_cards(
             "card_prompt_version": CARD_PROMPT_VERSION,
             "card_backend": backend,
             "card_call_metadata": call_metadata,
+            "card_attempt_audits": [dict(audit) for audit in attempt_audits],
         }
         if not has_retry and not dupes:
             return cards, last_meta
     assert last_meta is not None
-    raise ValueError(f"Card generation exhausted retries: {last_meta}")
+    raise GenerationExhaustedError(
+        f"Card generation exhausted retries: {last_meta}",
+        stage="cards",
+        metadata=last_meta,
+    )
 
 
 def build_persona_artifact(
@@ -471,7 +815,7 @@ def build_persona_artifact(
     descriptors = descriptor_output
     axis_selection = descriptor_meta["axis_selection"]
     sampled_points = descriptor_meta["sampled_points"]
-    backend = "llm" if config.backend == "llm" or (config.backend == "auto" and generator_engine is not None) else "heuristic"
+    backend = _effective_backend(config=config, engine=generator_engine)
     cards, card_meta = expand_cards(
         descriptors,
         dataset=config.dataset,
@@ -480,24 +824,13 @@ def build_persona_artifact(
         engine=generator_engine,
         backend=backend,
     )
-    validator_metadata: dict[str, Any] = {}
-    validator_metadata.update(descriptor_meta["validator_metadata"])
-    validator_metadata.update(card_meta)
-    validator_metadata["generator_backend"] = backend
-    if judge_card is not None:
-        validator_metadata["judge_card"] = asdict(judge_card)
-    axis_call_meta = None
-    for axis in axis_selection.axes:
-        axis_call_meta = axis.source.get("call_metadata")
-        if axis_call_meta is not None:
-            break
-    judge_call_meta = None if judge_card is None else judge_card.source.get("call_metadata")
-    validator_metadata["token_usage_summary"] = {
-        "axis_generation": _sum_token_counts([axis_call_meta]),
-        "descriptor_generation": _sum_token_counts([descriptor_meta["validator_metadata"].get("descriptor_call_metadata")]),
-        "card_generation": _sum_token_counts(cast(list[dict[str, Any] | None], card_meta.get("card_call_metadata") or [])),
-        "judge_generation": _sum_token_counts([judge_call_meta]),
-    }
+    validator_metadata = build_persona_validator_metadata(
+        axis_selection=axis_selection,
+        descriptor_validator_metadata=descriptor_meta["validator_metadata"],
+        card_metadata=card_meta,
+        backend=backend,
+        judge_card=judge_card,
+    )
     return PersonaArtifact(
         artifact_version=ARTIFACT_VERSION,
         dataset=config.dataset,
@@ -534,3 +867,36 @@ def build_persona_artifact(
         },
         validator_metadata=validator_metadata,
     )
+
+
+def build_persona_validator_metadata(
+    *,
+    axis_selection: Any,
+    descriptor_validator_metadata: dict[str, Any] | None,
+    card_metadata: dict[str, Any] | None,
+    backend: str,
+    judge_card: Any | None = None,
+) -> dict[str, Any]:
+    validator_metadata: dict[str, Any] = {}
+    validator_metadata.update(dict(descriptor_validator_metadata or {}))
+    validator_metadata.update(dict(card_metadata or {}))
+    validator_metadata["generator_backend"] = backend
+    if judge_card is not None:
+        validator_metadata["judge_card"] = asdict(judge_card)
+    axis_call_meta = None
+    for axis in axis_selection.axes:
+        axis_call_meta = axis.source.get("call_metadata")
+        if axis_call_meta is not None:
+            break
+    judge_call_meta = None if judge_card is None else judge_card.source.get("call_metadata")
+    validator_metadata["token_usage_summary"] = {
+        "axis_generation": _sum_token_counts([axis_call_meta]),
+        "descriptor_generation": _sum_token_counts(
+            [dict(descriptor_validator_metadata or {}).get("descriptor_call_metadata")]
+        ),
+        "card_generation": _sum_token_counts(
+            cast(list[dict[str, Any] | None], dict(card_metadata or {}).get("card_call_metadata") or [])
+        ),
+        "judge_generation": _sum_token_counts([judge_call_meta]),
+    }
+    return validator_metadata

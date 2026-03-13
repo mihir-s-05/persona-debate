@@ -17,6 +17,7 @@ from .prompt_templates import (
 from .schema import JudgeBankArtifact, JudgeCard
 
 JUDGE_BANK_ARTIFACT_VERSION = "judge_bank.v1"
+JUDGE_BANK_GENERATION_RETRIES = 2
 AIME25_JUDGE_FAMILIES = ("math",)
 GPQA_JUDGE_FAMILIES = ("biology", "chemistry", "physics")
 HLE_JUDGE_FAMILIES = (
@@ -41,6 +42,12 @@ class JudgeFamilyAssignment:
             "source": self.source,
             "details": dict(self.details),
         }
+
+
+class JudgeBankGenerationExhaustedError(ValueError):
+    def __init__(self, message: str, *, metadata: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.metadata = metadata
 
 
 def default_judge_bank_dir(*, artifacts_dir: Path) -> Path:
@@ -138,37 +145,62 @@ def _llm_benchmark_judge_card(
     generator_model: str | None,
     backend: str,
 ) -> JudgeCard:
-    result = ensure_inference_results(
-        engine,
-        [
-            build_judge_bank_messages(
-                dataset=dataset,
-                judge_family=judge_family,
-                family_description=_family_description(dataset, judge_family),
+    messages = build_judge_bank_messages(
+        dataset=dataset,
+        judge_family=judge_family,
+        family_description=_family_description(dataset, judge_family),
+    )
+    attempt_audits: list[dict[str, Any]] = []
+    for attempt in range(JUDGE_BANK_GENERATION_RETRIES + 1):
+        result = ensure_inference_results(
+            engine,
+            [messages],
+            batch_size=1,
+            sampling_kwargs={"max_tokens": 4096},
+            model_role="judge_generator",
+        )[0]
+        raw_result_text = str(result.text)
+        call_metadata = inference_result_metadata(result)
+        try:
+            payload = parse_json_payload(raw_result_text)
+        except ValueError as exc:
+            attempt_audits.append(
+                {
+                    "attempt": attempt,
+                    "request_messages": messages,
+                    "raw_result_text": raw_result_text,
+                    "parse_error": str(exc),
+                    "call_metadata": call_metadata,
+                }
             )
-        ],
-        batch_size=1,
-        sampling_kwargs={"max_tokens": 4096},
-        model_role="judge_generator",
-    )[0]
-    payload = parse_json_payload(str(result.text))
-    return JudgeCard(
-        judge_id=str(payload.get("judge_id") or f"judge_bank_{dataset}_{judge_family}"),
-        judge_family=str(payload.get("judge_family") or judge_family),
-        domain_scope=str(payload.get("domain_scope") or judge_family),
-        evaluation_priorities=[str(x) for x in payload.get("evaluation_priorities", [])],
-        tie_break_policy=str(payload.get("tie_break_policy") or "prefer clearer transcript-grounded support"),
-        independent_resolve_policy=str(payload.get("independent_resolve_policy") or "limited_check_only"),
-        answer_format_policy=str(payload.get("answer_format_policy") or "return one final answer in strict format"),
-        confidence_policy=str(payload.get("confidence_policy")) if payload.get("confidence_policy") is not None else None,
-        system_prompt=str(payload.get("system_prompt") or JUDGE_GUIDANCE),
-        card_version=JUDGE_PROMPT_VERSION,
-        source={
-            "backend": backend,
-            "generator_model": generator_model or "llm",
+            continue
+        return JudgeCard(
+            judge_id=str(payload.get("judge_id") or f"judge_bank_{dataset}_{judge_family}"),
+            judge_family=str(payload.get("judge_family") or judge_family),
+            domain_scope=str(payload.get("domain_scope") or judge_family),
+            evaluation_priorities=[str(x) for x in payload.get("evaluation_priorities", [])],
+            tie_break_policy=str(payload.get("tie_break_policy") or "prefer clearer transcript-grounded support"),
+            independent_resolve_policy=str(payload.get("independent_resolve_policy") or "limited_check_only"),
+            answer_format_policy=str(payload.get("answer_format_policy") or "return one final answer in strict format"),
+            confidence_policy=str(payload.get("confidence_policy")) if payload.get("confidence_policy") is not None else None,
+            system_prompt=str(payload.get("system_prompt") or JUDGE_GUIDANCE),
+            card_version=JUDGE_PROMPT_VERSION,
+            source={
+                "backend": backend,
+                "generator_model": generator_model or "llm",
+                "dataset": dataset,
+                "judge_family": judge_family,
+                "call_metadata": call_metadata,
+            },
+        )
+    raise JudgeBankGenerationExhaustedError(
+        f"Judge-bank generation exhausted retries for dataset={dataset} judge_family={judge_family}",
+        metadata={
             "dataset": dataset,
             "judge_family": judge_family,
-            "call_metadata": inference_result_metadata(result),
+            "judge_prompt_version": JUDGE_PROMPT_VERSION,
+            "judge_bank_prompt_version": JUDGE_BANK_PROMPT_VERSION,
+            "attempt_audits": attempt_audits,
         },
     )
 

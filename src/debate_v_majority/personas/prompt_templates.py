@@ -7,9 +7,9 @@ from typing import Any
 
 ARTIFACT_VERSION = "phase0.v1"
 AXIS_PROMPT_VERSION = "phase0.axes.v3"
-DESCRIPTOR_PROMPT_VERSION = "phase0.descriptors.v3"
-CARD_PROMPT_VERSION = "phase0.cards.v3"
-JUDGE_PROMPT_VERSION = "phase0.judge.v3"
+DESCRIPTOR_PROMPT_VERSION = "phase0.descriptors.v6"
+CARD_PROMPT_VERSION = "phase0.cards.v6"
+JUDGE_PROMPT_VERSION = "phase0.judge.v4"
 JUDGE_BANK_PROMPT_VERSION = "phase0.judge_bank.v1"
 
 STAGE1_GUIDANCE = (
@@ -19,7 +19,9 @@ STAGE1_GUIDANCE = (
     "how aggressively the persona prunes search. Each persona should imply a measurably different "
     "round-1 solution trajectory and a different revision policy under disagreement. Avoid collapsing "
     "multiple personas into the same safe middle strategy. Do not include likely answers, option hints, "
-    "problem-specific facts, theorem giveaways, or hidden solution trajectories that amount to solving the item."
+    "problem-specific facts, theorem giveaways, or hidden solution trajectories. "
+    "Descriptors must stay problem-agnostic and execution-policy-focused: describe search order, branch "
+    "management, verification timing, evidence preference, revision triggers, and confidence discipline."
 )
 
 STAGE2_GUIDANCE = (
@@ -34,7 +36,8 @@ JUDGE_GUIDANCE = (
     "The judge sees the full debate transcript and should act as a transcript-grounded selector. "
     "Select the answer with the strongest support in the transcript rather than running a fresh "
     "unconstrained solve. Use only limited independent checking to break close cases or catch obvious "
-    "transcript mistakes."
+    "transcript mistakes. The judge must handle any number of debaters or debate turns, not only a "
+    "two-participant exchange."
 )
 
 
@@ -135,10 +138,8 @@ def build_stage1_messages(
     *,
     dataset: str,
     benchmark_family: str,
-    question: str,
     axes: list[dict[str, Any]],
     sampled_points: list[dict[str, float]],
-    question_media: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     schema = {
         "descriptors": [
@@ -151,12 +152,11 @@ def build_stage1_messages(
             }
         ]
     }
-    image_note = "Relevant task images are attached with this prompt.\n\n" if question_media else ""
     user = (
         f"Dataset: {dataset}\n"
         f"Benchmark family: {benchmark_family}\n\n"
-        f"Question:\n{question}\n\n"
-        f"{image_note}"
+        "You are generating reasoning personas for this benchmark family.\n"
+        "Descriptors must be reusable across any item in this family—do not target a specific problem.\n\n"
         "Axes:\n"
         f"{json.dumps(axes, indent=2, ensure_ascii=False)}\n\n"
         "Persona slots and sampled positions:\n"
@@ -168,19 +168,37 @@ def build_stage1_messages(
         "most one near-center compromise persona if forced by the sampled points.\n"
         "If two personas would likely produce similar reasoning traces, sharpen them until their search "
         "policy, verification habit, likely failure mode, and recovery path are clearly different.\n"
+        "Translate axis positions into general execution tendencies, not domain-method templates. If an axis "
+        "name sounds method-specific, abstract it to the underlying policy rather than repeating the method "
+        "name.\n"
+        "Allowed descriptor content: how the persona generates candidates, what evidence it privileges, when "
+        "it prunes, when it verifies, when it revises, and what kinds of intermediate states it distrusts.\n"
+        "Disallowed descriptor content: named math techniques, object-type commitments, calculus-specific "
+        "framing, recurrence hunting, neighborhood search, graph-shape language, coordinate transforms, "
+        "small-case enumeration, or any other domain workflow template.\n"
+        "Good descriptor example: 'commits to a candidate path early, then stress-tests it with focused local "
+        "checks before widening the search.'\n"
+        "Good descriptor example: 'holds multiple hypotheses in parallel and only prunes after a concrete "
+        "contradiction appears.'\n"
+        "Bad descriptor example: 'start from small cases and derive a recurrence.'\n"
+        "Bad descriptor example: 'analyze the derivative roots to count local minima.'\n"
         f"{STAGE1_GUIDANCE}\n"
-        "Generate the full persona population jointly in one response. Return JSON only matching:\n"
+        "Generate the full persona population jointly in one response.\n"
+        "IMPORTANT: Return a single valid JSON object and nothing else—no prose, no markdown fencing, "
+        "no explanation. Schema:\n"
         f"{_json_schema_block(schema)}"
     )
     return [
         {
             "role": "system",
             "content": (
-                "You are generating a coordinated set of debater personas. "
-                "Plan the whole population jointly. They must be distinct, compact, and operationally useful."
+                "You are generating a coordinated set of debater personas for a benchmark family. "
+                "Plan the whole population jointly. They must be distinct, compact, operationally useful, "
+                "and reusable across different items in the family. "
+                "You will NOT be shown the specific problem—generate family-level reasoning policies only."
             ),
         },
-        {"role": "user", "content": _user_content_with_media(user, question_media=question_media)},
+        {"role": "user", "content": user},
     ]
 
 
@@ -202,10 +220,9 @@ def build_stage2_messages(
         "failure_mode_to_avoid": "Main failure mode",
         "system_prompt": "Compact operational system prompt",
     }
-    image_note = "Relevant task images are attached with this prompt.\n\n" if question_media else ""
     user = (
-        f"Question:\n{question}\n\n"
-        f"{image_note}"
+        "You are generating an operational card for a benchmark-family persona.\n"
+        "The card must stay reusable across different items and must not target any specific problem.\n\n"
         "Descriptor:\n"
         f"{json.dumps(descriptor, indent=2, ensure_ascii=False)}\n\n"
         "Write in terms of operating rules, not biography.\n"
@@ -213,6 +230,27 @@ def build_stage2_messages(
         "handles disagreement, and decides whether to revise.\n"
         "Differences should survive contact with the task and be visible in execution, not just sound "
         "different on paper.\n"
+        "Stay faithful to the descriptor, but compress it into a narrower policy vocabulary. Convert any "
+        "domain-flavored descriptor wording into the underlying execution rule.\n"
+        "Allowed card content: candidate-generation order, branch expansion vs pruning, verification cadence, "
+        "evidence thresholds, contradiction handling, revision triggers, and confidence gating.\n"
+        "Disallowed card content: named method families, object-type commitments, assumed formula forms, "
+        "small-case enumeration, recurrence search, neighborhood search, geometric pairings, coordinate "
+        "transforms, derivative-specific machinery, graph-shape stories, continuous optimization templates, "
+        "or any other hidden task structure.\n"
+        "If a descriptor phrase is method-shaped, rewrite it to the more general policy it implies.\n"
+        "Example rewrite: 'uses a continuous model' -> 'forms a coarse global approximation before verifying "
+        "locally'.\n"
+        "Example rewrite: 'starts from small cases' -> 'builds confidence from simple concrete probes before "
+        "generalizing'.\n"
+        "The card must describe portable reasoning behavior only. It must not speculate about what specific "
+        "object types, formulas, or latent patterns will appear in the problem.\n"
+        "Good card move: 'propose a global invariant early, then reject branches that violate it and only "
+        "switch strategies after an explicit contradiction.'\n"
+        "Bad card move: 'start with n=1,2,3', 'test nearby integers', 'look for geometric means', or any "
+        "other task template.\n"
+        "Do not mention item-specific equations, constants, answer choices, variable names, images, "
+        "or any solve plan for a particular question.\n"
         f"{STAGE2_GUIDANCE}\n"
         "Return JSON only matching:\n"
         f"{_json_schema_block(schema)}"
@@ -222,10 +260,12 @@ def build_stage2_messages(
             "role": "system",
             "content": (
                 "You are expanding a persona descriptor into a compact operational card. "
-                "The card must reliably induce a distinct reasoning policy while staying concise."
+                "The card must reliably induce a distinct reasoning policy while staying concise, "
+                "and remain reusable across different items in the benchmark family. "
+                "You will NOT be shown the specific problem."
             ),
         },
-        {"role": "user", "content": _user_content_with_media(user, question_media=question_media)},
+        {"role": "user", "content": user},
     ]
 
 
@@ -261,6 +301,11 @@ def build_judge_messages(
         "and coherent constraint tracking.\n"
         "The judge should discount unsupported confidence, verbosity, superficial consensus, and fresh "
         "reasoning that ignores the transcript.\n"
+        "The judge card must be multi-agent compatible. It should refer to debaters, agents, or answers in "
+        "the transcript rather than assuming exactly two participants.\n"
+        "It must specify how to handle: majority-vs-best-argument conflicts, partial convergence between "
+        "multiple agents, and cases where one agent provides the strongest support despite being in the "
+        "minority.\n"
         "Generate a constrained judge card. It may be conditioned on task family and question, but must not "
         "embed answer hints before transcript review. Return JSON only matching:\n"
         f"{_json_schema_block(schema)}"

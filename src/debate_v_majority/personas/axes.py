@@ -10,6 +10,8 @@ from .prompt_templates import AXIS_PROMPT_VERSION, build_task_axis_messages, par
 from .schema import Axis, AxisSelection
 from .validators import validate_text_for_leakage
 
+AXIS_GENERATION_RETRIES = 2
+
 
 FIXED_AXIS_BANK: list[Axis] = [
     Axis(
@@ -349,40 +351,44 @@ def generate_task_axes(
             count=count,
             question_media=question_media,
         )
-        result = ensure_inference_results(
-            engine,
-            [messages],
-            batch_size=1,
-            sampling_kwargs={"max_tokens": 4096},
-            model_role="generator",
-        )[0]
-        payload = parse_json_payload(str(result.text))
-        call_metadata = inference_result_metadata(result)
-        axes_payload = payload.get("axes") or []
-        if isinstance(axes_payload, list):
-            llm_axes = _normalize_llm_axes(
-                axes_payload=[dict(axis) for axis in axes_payload if isinstance(axis, dict)],
-                count=count,
-                benchmark_family=benchmark_family,
-                generator_model=generator_model,
-                backend=backend,
-                call_metadata=call_metadata,
-            )
-            if len(llm_axes) >= count:
-                return llm_axes[:count]
-            heuristic_axes = _heuristic_task_axes(
-                question=question,
-                benchmark_family=benchmark_family,
-                count=count + len(llm_axes),
-            )
-            seen_ids = {axis.axis_id for axis in llm_axes}
-            for axis in heuristic_axes:
-                if axis.axis_id in seen_ids:
-                    continue
-                llm_axes.append(axis)
-                seen_ids.add(axis.axis_id)
+        for _attempt in range(AXIS_GENERATION_RETRIES + 1):
+            result = ensure_inference_results(
+                engine,
+                [messages],
+                batch_size=1,
+                sampling_kwargs={"max_tokens": 4096},
+                model_role="generator",
+            )[0]
+            try:
+                payload = parse_json_payload(str(result.text))
+            except ValueError:
+                continue
+            call_metadata = inference_result_metadata(result)
+            axes_payload = payload.get("axes") or []
+            if isinstance(axes_payload, list):
+                llm_axes = _normalize_llm_axes(
+                    axes_payload=[dict(axis) for axis in axes_payload if isinstance(axis, dict)],
+                    count=count,
+                    benchmark_family=benchmark_family,
+                    generator_model=generator_model,
+                    backend=backend,
+                    call_metadata=call_metadata,
+                )
                 if len(llm_axes) >= count:
                     return llm_axes[:count]
+                heuristic_axes = _heuristic_task_axes(
+                    question=question,
+                    benchmark_family=benchmark_family,
+                    count=count + len(llm_axes),
+                )
+                seen_ids = {axis.axis_id for axis in llm_axes}
+                for axis in heuristic_axes:
+                    if axis.axis_id in seen_ids:
+                        continue
+                    llm_axes.append(axis)
+                    seen_ids.add(axis.axis_id)
+                    if len(llm_axes) >= count:
+                        return llm_axes[:count]
     return _heuristic_task_axes(question=question, benchmark_family=benchmark_family, count=count)
 
 

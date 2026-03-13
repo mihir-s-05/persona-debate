@@ -55,6 +55,8 @@ Thumbs.db
 _paper*.txt
 _autogen/
 data/
+out/
+results/
 
 # Jupyter
 .ipynb_checkpoints/

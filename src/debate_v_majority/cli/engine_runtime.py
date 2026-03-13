@@ -198,30 +198,69 @@ def _build_gemini_debate_cache_context(
     round_idx: int,
     persona_id: str | None = None,
 ) -> list[dict[str, str]]:
+    return _build_gemini_explicit_cache_context(
+        messages=messages,
+        prefix_count=max(0, len(messages) - 1),
+        display_name_parts=[
+            "debate",
+            str(dataset),
+            str(item_uid),
+            *( [str(persona_id)] if persona_id else [] ),
+            f"agent{agent_idx}",
+            f"round{round_idx + 1}",
+        ],
+        cache_scope="debate_round_prefix",
+    )
+
+
+def _build_gemini_explicit_cache_context(
+    *,
+    messages: list[dict[str, str]],
+    prefix_count: int,
+    display_name_parts: list[str],
+    cache_scope: str,
+) -> list[dict[str, str]]:
     if len(messages) < 2:
         return messages
-    if str(messages[-1].get("role") or "").strip().lower() != "user":
+    if prefix_count <= 0:
         return messages
-    cache_name_parts = [
-        "debate",
-        str(dataset),
-        str(item_uid),
-        f"agent{agent_idx}",
-        f"round{round_idx + 1}",
-    ]
-    if persona_id:
-        cache_name_parts.insert(3, str(persona_id))
+    normalized_prefix_count = max(0, min(int(prefix_count), len(messages)))
+    if normalized_prefix_count <= 0:
+        return messages
     return [
         {
             "role": "cache_control",
             "content": "",
-            "cache_prefix_message_count": str(len(messages) - 1),
-            "cache_display_name": "-".join(cache_name_parts),
+            "cache_prefix_message_count": str(normalized_prefix_count),
+            "cache_display_name": "-".join(str(part) for part in display_name_parts if str(part).strip()),
             "cache_ttl_seconds": str(_gemini_explicit_cache_ttl_seconds()),
-            "cache_scope": "debate_round_prefix",
+            "cache_scope": str(cache_scope),
         },
         *messages,
     ]
+
+
+def _build_gemini_judge_cache_context(
+    *,
+    messages: list[dict[str, str]],
+    dataset: str,
+    item_uid: str,
+    round_idx: int,
+    phase: str,
+) -> list[dict[str, str]]:
+    prefix_count = len(messages) - (1 if phase == "raw" else 2)
+    return _build_gemini_explicit_cache_context(
+        messages=messages,
+        prefix_count=prefix_count,
+        display_name_parts=[
+            "judge",
+            str(dataset),
+            str(item_uid),
+            f"round{round_idx + 1}",
+            str(phase),
+        ],
+        cache_scope="judge_round_prefix",
+    )
 
 
 def _persona_summaries(artifact: PersonaArtifact | None) -> list[dict[str, Any]] | None:
@@ -262,6 +301,8 @@ def _judge_summary(artifact: PersonaArtifact | None) -> dict[str, Any] | None:
 
 __all__ = [
     "_build_gemini_debate_cache_context",
+    "_build_gemini_explicit_cache_context",
+    "_build_gemini_judge_cache_context",
     "_create_role_engine",
     "_default_judge_max_tokens",
     "_default_token_ledger_path",

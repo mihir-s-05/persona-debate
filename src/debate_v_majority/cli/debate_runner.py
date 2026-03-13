@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from .. import DatasetName
 from ..engines import InferenceEngine, ensure_inference_results, infer_native_context_len
-from ..personas import PersonaArtifact
+from ..personas import JudgeCard, PersonaArtifact
 from ..shared import PrevJudgeInfo, PromptTokenCounter
 from .dataset_eval import (
     _build_initial_user_message,
@@ -18,6 +18,7 @@ from .dataset_eval import (
     _parse_question_answer,
 )
 from .engine_runtime import (
+    _build_gemini_judge_cache_context,
     _build_gemini_debate_cache_context,
     _default_judge_max_tokens,
     _engine_backend_name,
@@ -47,7 +48,211 @@ from .response_parsing import (
     _judge_trace_mode_enabled,
     _render_agent_round_outputs_for_judge,
 )
+from .stage_state import (
+    append_stage_entry,
+    load_latest_stage_entry_of_type,
+    make_stage_entry,
+    path_setting,
+    subset_item_resume_signature,
+)
 from .subset import SubsetItem
+
+
+DEBATE_DEFAULT_MAX_OUTPUT_TOKENS = 32768
+
+
+class _DebateStopped(Exception):
+    """Raised internally when debate_stop_after triggers an early exit."""
+
+    def __init__(self, results_by_round: dict[int, list[dict[str, Any]]]):
+        self.results_by_round = results_by_round
+
+
+def _parse_debate_stage_name(stage_name: str) -> tuple[int, bool] | None:
+    if not stage_name.startswith("round_"):
+        return None
+    suffix = stage_name[len("round_") :]
+    is_judged = suffix.endswith("_judge")
+    if is_judged:
+        suffix = suffix[: -len("_judge")]
+    try:
+        return int(suffix), is_judged
+    except ValueError:
+        return None
+
+
+def _serialise_prev_judge(prev: PrevJudgeInfo | None) -> dict[str, Any] | None:
+    if prev is None:
+        return None
+    return {
+        "start_round": int(prev.start_round),
+        "end_round": int(prev.end_round),
+        "parsed_answer": str(prev.parsed_answer),
+        "raw_output": str(prev.raw_output),
+    }
+
+
+def _deserialise_prev_judge(data: dict[str, Any] | None) -> PrevJudgeInfo | None:
+    if not data:
+        return None
+    return PrevJudgeInfo(
+        start_round=int(data["start_round"]),
+        end_round=int(data["end_round"]),
+        parsed_answer=str(data["parsed_answer"]),
+        raw_output=str(data["raw_output"]),
+    )
+
+
+def _build_initial_agent_contexts(
+    *,
+    dataset: DatasetName,
+    parsed_items: list[tuple[SubsetItem, str, Any, dict[str, Any]]],
+    engine: InferenceEngine,
+    persona_artifacts: list[PersonaArtifact | None],
+    n_agents: int,
+) -> list[list[list[dict[str, Any]]]]:
+    return [
+        [
+            [
+                *(
+                    [{"role": "system", "content": persona_artifacts[q_idx].cards[agent_idx].system_prompt}]
+                    if persona_artifacts[q_idx] is not None
+                    else []
+                ),
+                _build_initial_user_message(
+                    dataset=dataset,
+                    question=question,
+                    raw_task=raw_task,
+                    engine=engine,
+                ),
+            ]
+            for agent_idx in range(n_agents)
+        ]
+        for q_idx, (_item, question, _gt_answer, raw_task) in enumerate(parsed_items)
+    ]
+
+
+def _build_agent_debate_message(
+    *,
+    dataset: DatasetName,
+    previous_round_outputs: list[dict[str, Any]],
+    agent_idx: int,
+    persona_artifact: PersonaArtifact | None,
+) -> dict[str, Any]:
+    other_answers = [
+        _format_debate_share_entry(previous_round_outputs[idx])
+        for idx in range(len(previous_round_outputs))
+        if idx != agent_idx
+    ]
+    debate_msg = _construct_debate_message(dataset, other_answers)
+    if persona_artifact is None or agent_idx >= len(persona_artifact.cards):
+        return debate_msg
+    card = persona_artifact.cards[agent_idx]
+    return {
+        **debate_msg,
+        "content": (
+            f"[Reminder: You are reasoning as {card.title}. "
+            f"Strategy: {card.core_reasoning_strategy}]\n\n"
+            + debate_msg["content"]
+        ),
+    }
+
+
+def _debate_persona_settings(
+    *,
+    use_personas: bool,
+    runtime_judge_persona_enabled: bool,
+    persona_seed: int,
+    persona_axis_mode: str,
+    persona_fixed_axis_count: int,
+    persona_task_axis_count: int,
+    persona_sampling_method: str,
+    persona_judge_mode: str,
+    persona_backend: str,
+    generator_model: str | None,
+    judge_generator_model: str | None,
+    persona_axes_file: Path | None,
+    judge_bank_dir: Path | None,
+    judge_bank_refresh: bool,
+    gpqa_family_cache_path: Path | None,
+) -> dict[str, Any]:
+    return {
+        "use_personas": bool(use_personas),
+        "runtime_judge_persona_enabled": bool(runtime_judge_persona_enabled),
+        "persona_seed": int(persona_seed),
+        "persona_axis_mode": str(persona_axis_mode),
+        "persona_fixed_axis_count": int(persona_fixed_axis_count),
+        "persona_task_axis_count": int(persona_task_axis_count),
+        "persona_sampling_method": str(persona_sampling_method),
+        "persona_judge_mode": str(persona_judge_mode),
+        "persona_backend": str(persona_backend),
+        "generator_model": generator_model,
+        "judge_generator_model": judge_generator_model,
+        "persona_axes_file": path_setting(persona_axes_file),
+        "judge_bank_dir": path_setting(judge_bank_dir),
+        "judge_bank_refresh": bool(judge_bank_refresh),
+        "gpqa_family_cache_path": path_setting(gpqa_family_cache_path),
+    }
+
+
+def _debate_runtime_settings(
+    *,
+    engine: InferenceEngine,
+    judge_engine: InferenceEngine,
+    judge_block_size: int | None,
+    judge_sampling_kwargs: dict[str, Any] | None,
+    judge_strict_final_only: bool,
+    judge_recovery_parse_enabled: bool,
+    judge_trace_mode: str,
+    public_rationale_max_tokens: int,
+) -> dict[str, Any]:
+    return {
+        "debater_model": getattr(engine, "model_name", None),
+        "debater_backend": _engine_backend_name(engine),
+        "judge_model": getattr(judge_engine, "model_name", None),
+        "judge_backend": _engine_backend_name(judge_engine),
+        "judge_block_size": None if judge_block_size is None else int(judge_block_size),
+        "judge_sampling_kwargs": dict(judge_sampling_kwargs or {}),
+        "judge_strict_final_only": bool(judge_strict_final_only),
+        "judge_recovery_parse_enabled": bool(judge_recovery_parse_enabled),
+        "judge_trace_mode": str(judge_trace_mode),
+        "public_rationale_max_tokens": int(public_rationale_max_tokens),
+    }
+
+
+def _validate_resume_runtime_settings(
+    *,
+    resume_state: dict[str, Any],
+    current_settings: dict[str, Any],
+) -> None:
+    saved_settings = resume_state.get("runtime_settings")
+    if not isinstance(saved_settings, dict) or dict(saved_settings) != current_settings:
+        raise ValueError("Debate state runtime settings mismatch")
+
+
+def _normalise_judge_rounds(judge_rounds: list[int]) -> list[int]:
+    return sorted({int(round_num) for round_num in judge_rounds})
+
+
+def _validate_resume_persona_settings(
+    *,
+    resume_state: dict[str, Any],
+    current_settings: dict[str, Any],
+) -> None:
+    saved_settings = resume_state.get("persona_settings")
+    if not isinstance(saved_settings, dict) or dict(saved_settings) != current_settings:
+        raise ValueError("Debate state persona settings mismatch")
+
+
+def _require_resume_list_length(
+    values: list[Any],
+    *,
+    expected: int,
+    field_name: str,
+) -> list[Any]:
+    if len(values) != expected:
+        raise ValueError(f"Debate state {field_name} length mismatch")
+    return values
 
 
 def run_debate(
@@ -86,101 +291,217 @@ def run_debate(
     gpqa_family_cache_path: Path | None = None,
     public_rationale_max_tokens: int = 96,
     enable_runtime_judge_persona: bool | None = None,
+    persona_artifacts_by_item: dict[str, PersonaArtifact] | None = None,
     progress_file: TextIO = sys.stdout,
+    debate_stop_after: str | None = None,
+    stage_state_file: Path | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
+    judge_rounds = _normalise_judge_rounds(judge_rounds)
     debate_update_rounds = max(0, int(n_rounds))
     total_answer_rounds = debate_update_rounds + 1
     runtime_judge_persona_enabled = bool(use_personas) if enable_runtime_judge_persona is None else bool(enable_runtime_judge_persona)
+    effective_judge_engine = judge_engine or engine
+    current_persona_settings = _debate_persona_settings(
+        use_personas=bool(use_personas),
+        runtime_judge_persona_enabled=runtime_judge_persona_enabled,
+        persona_seed=persona_seed,
+        persona_axis_mode=persona_axis_mode,
+        persona_fixed_axis_count=persona_fixed_axis_count,
+        persona_task_axis_count=persona_task_axis_count,
+        persona_sampling_method=persona_sampling_method,
+        persona_judge_mode=persona_judge_mode,
+        persona_backend=persona_backend,
+        generator_model=generator_model,
+        judge_generator_model=judge_generator_model,
+        persona_axes_file=persona_axes_file,
+        judge_bank_dir=judge_bank_dir,
+        judge_bank_refresh=judge_bank_refresh,
+        gpqa_family_cache_path=gpqa_family_cache_path,
+    )
+    current_runtime_settings = _debate_runtime_settings(
+        engine=engine,
+        judge_engine=effective_judge_engine,
+        judge_block_size=judge_block_size,
+        judge_sampling_kwargs=judge_sampling_kwargs,
+        judge_strict_final_only=judge_strict_final_only,
+        judge_recovery_parse_enabled=judge_recovery_parse_enabled,
+        judge_trace_mode=judge_trace_mode,
+        public_rationale_max_tokens=public_rationale_max_tokens,
+    )
     parsed_items: list[tuple[SubsetItem, str, Any, dict[str, Any]]] = []
-    persona_artifacts: list[PersonaArtifact | None] = []
-    persona_artifact_paths: list[Path | None] = []
-    runtime_judge_cards: list[Any | None] = []
-    runtime_judge_bank_meta: list[dict[str, Any] | None] = []
     for item in items:
         question, gt_answer, raw_task = _parse_question_answer(dataset, item.raw_task)
         parsed_items.append((item, question, gt_answer, raw_task))
-        runtime_judge_card = None
-        runtime_judge_meta = None
-        if use_personas:
-            if artifacts_dir is None:
-                raise ValueError("artifacts_dir is required when use_personas=True")
-            artifact, artifact_path = _resolve_persona_artifact(
-                dataset=dataset,
-                item=item,
-                question=question,
-                raw_task=raw_task,
-                artifacts_dir=artifacts_dir,
-                n_personas=n_agents,
-                persona_seed=persona_seed,
-                axis_mode=persona_axis_mode,
-                fixed_axis_count=persona_fixed_axis_count,
-                task_axis_count=persona_task_axis_count,
-                sampling_method=persona_sampling_method,
-                judge_persona_mode=persona_judge_mode,
-                backend=persona_backend,
-                generator_model=generator_model,
-                judge_generator_model=judge_generator_model,
-                generator_engine=persona_generator_engine,
-                judge_engine=persona_judge_engine or judge_engine or engine,
-                axes_file=persona_axes_file,
-                judge_bank_dir=judge_bank_dir,
-                judge_bank_refresh=judge_bank_refresh,
-                gpqa_family_cache_path=gpqa_family_cache_path,
-                save_artifact=persona_save_artifacts,
-                replay=persona_replay,
+    expected_persona_artifacts = None
+    if persona_artifacts_by_item is not None:
+        expected_persona_artifacts = [
+            None if not bool(use_personas) else (
+                persona_artifacts_by_item[item.item_uid].to_dict()
+                if item.item_uid in persona_artifacts_by_item
+                else None
             )
-            persona_artifacts.append(artifact)
-            persona_artifact_paths.append(artifact_path)
-            runtime_judge_card = artifact.judge_card
-            validator_meta = artifact.validator_metadata.get("judge_bank")
-            if isinstance(validator_meta, dict):
-                runtime_judge_meta = validator_meta
-        else:
-            persona_artifacts.append(None)
-            persona_artifact_paths.append(None)
-        if runtime_judge_persona_enabled and (runtime_judge_card is None or (persona_judge_mode == "benchmark_family_bank" and runtime_judge_meta is None)):
-            runtime_judge_card, runtime_judge_meta = _resolve_runtime_judge_card(
-                dataset=dataset,
-                item=item,
-                question=question,
-                raw_task=raw_task,
-                persona_artifacts_dir=artifacts_dir or Path.cwd() / "persona_artifacts",
-                judge_bank_dir=judge_bank_dir,
-                judge_bank_refresh=judge_bank_refresh,
-                gpqa_family_cache_path=gpqa_family_cache_path,
-                judge_persona_mode=persona_judge_mode,
-                persona_backend=persona_backend,
-                judge_generator_model=judge_generator_model,
-                judge_engine=persona_judge_engine or judge_engine or engine,
-            )
-        runtime_judge_cards.append(runtime_judge_card)
-        runtime_judge_bank_meta.append(runtime_judge_meta)
+            for item, _question, _gt_answer, _raw_task in parsed_items
+        ]
 
-    all_contexts: list[list[list[dict[str, Any]]]] = [
-        [
-            [
-                *(
-                    [{"role": "system", "content": persona_artifacts[q_idx].cards[agent_idx].system_prompt}]
-                    if persona_artifacts[q_idx] is not None
-                    else []
-                ),
-                _build_initial_user_message(
+    resume_entry = None if stage_state_file is None or not stage_state_file.exists() else load_latest_stage_entry_of_type(stage_state_file, "debate")
+    if resume_entry is not None and expected_persona_artifacts is not None:
+        saved_persona_artifacts = (resume_entry.debate_data or {}).get("persona_artifacts")
+        if list(saved_persona_artifacts or []) != expected_persona_artifacts:
+            resume_entry = None
+    resume_state: dict[str, Any] = {}
+    if resume_entry is not None:
+        saved_items = [subset_item_resume_signature(row) for row in resume_entry.items]
+        current_items = [
+            subset_item_resume_signature(item)
+            for item, _question, _gt_answer, _raw_task in parsed_items
+        ]
+        if resume_entry.dataset != str(dataset):
+            raise ValueError(
+                f"Debate state dataset mismatch: {resume_entry.dataset} != {dataset}"
+            )
+        if saved_items != current_items:
+            raise ValueError("Debate state items do not match the requested subset")
+        debate_meta = dict(resume_entry.debate_data or {})
+        resume_n_agents = debate_meta.get("n_agents")
+        resume_n_rounds = debate_meta.get("n_rounds")
+        if resume_n_agents is not None and int(resume_n_agents) != int(n_agents):
+            raise ValueError(f"Debate state n_agents mismatch: {resume_n_agents} != {n_agents}")
+        if resume_n_rounds is not None and int(resume_n_rounds) != int(n_rounds):
+            raise ValueError(f"Debate state n_rounds mismatch: {resume_n_rounds} != {n_rounds}")
+        resume_judge_rounds = debate_meta.get("judge_rounds")
+        if not isinstance(resume_judge_rounds, list):
+            raise ValueError("Debate state missing judge_rounds")
+        if [int(round_num) for round_num in resume_judge_rounds] != judge_rounds:
+            raise ValueError(
+                f"Debate state judge_rounds mismatch: {resume_judge_rounds} != {judge_rounds}"
+            )
+        resume_state = debate_meta
+        _validate_resume_persona_settings(
+            resume_state=resume_state,
+            current_settings=current_persona_settings,
+        )
+        _validate_resume_runtime_settings(
+            resume_state=resume_state,
+            current_settings=current_runtime_settings,
+        )
+
+    if not resume_state:
+        persona_artifacts = []
+        persona_artifact_paths = []
+        runtime_judge_cards = []
+        runtime_judge_bank_meta = []
+        for item, question, _gt_answer, raw_task in parsed_items:
+            runtime_judge_card = None
+            runtime_judge_meta = None
+            if use_personas:
+                if artifacts_dir is None:
+                    raise ValueError("artifacts_dir is required when use_personas=True")
+                artifact = None if persona_artifacts_by_item is None else persona_artifacts_by_item.get(item.item_uid)
+                artifact_path = None
+                if artifact is None:
+                    artifact, artifact_path = _resolve_persona_artifact(
+                        dataset=dataset,
+                        item=item,
+                        question=question,
+                        raw_task=raw_task,
+                        artifacts_dir=artifacts_dir,
+                        n_personas=n_agents,
+                        persona_seed=persona_seed,
+                        axis_mode=persona_axis_mode,
+                        fixed_axis_count=persona_fixed_axis_count,
+                        task_axis_count=persona_task_axis_count,
+                        sampling_method=persona_sampling_method,
+                        judge_persona_mode=persona_judge_mode,
+                        backend=persona_backend,
+                        generator_model=generator_model,
+                        judge_generator_model=judge_generator_model,
+                        generator_engine=persona_generator_engine,
+                        judge_engine=persona_judge_engine or judge_engine or engine,
+                        axes_file=persona_axes_file,
+                        judge_bank_dir=judge_bank_dir,
+                        judge_bank_refresh=judge_bank_refresh,
+                        gpqa_family_cache_path=gpqa_family_cache_path,
+                        save_artifact=persona_save_artifacts,
+                        replay=persona_replay,
+                    )
+                elif len(artifact.cards) != int(n_agents):
+                    raise ValueError(
+                        f"Precomputed persona artifact for {item.item_uid!r} has {len(artifact.cards)} cards; expected {n_agents}"
+                    )
+                persona_artifacts.append(artifact)
+                persona_artifact_paths.append(artifact_path)
+                runtime_judge_card = artifact.judge_card
+                validator_meta = artifact.validator_metadata.get("judge_bank")
+                if isinstance(validator_meta, dict):
+                    runtime_judge_meta = validator_meta
+            else:
+                persona_artifacts.append(None)
+                persona_artifact_paths.append(None)
+            if runtime_judge_persona_enabled and (runtime_judge_card is None or (persona_judge_mode == "benchmark_family_bank" and runtime_judge_meta is None)):
+                runtime_judge_card, runtime_judge_meta = _resolve_runtime_judge_card(
                     dataset=dataset,
+                    item=item,
                     question=question,
                     raw_task=raw_task,
-                    engine=engine,
-                ),
-            ]
-            for agent_idx in range(n_agents)
-        ]
-        for q_idx, (_item, question, _gt_answer, raw_task) in enumerate(parsed_items)
-    ]
+                    persona_artifacts_dir=artifacts_dir or Path.cwd() / "persona_artifacts",
+                    judge_bank_dir=judge_bank_dir,
+                    judge_bank_refresh=judge_bank_refresh,
+                    gpqa_family_cache_path=gpqa_family_cache_path,
+                    judge_persona_mode=persona_judge_mode,
+                    persona_backend=persona_backend,
+                    judge_generator_model=judge_generator_model,
+                    judge_engine=persona_judge_engine or judge_engine or engine,
+                )
+            runtime_judge_cards.append(runtime_judge_card)
+            runtime_judge_bank_meta.append(runtime_judge_meta)
+    else:
+        persona_artifacts = _require_resume_list_length(
+            [
+                PersonaArtifact.from_dict(data) if data is not None else None
+                for data in resume_state.get("persona_artifacts") or []
+            ],
+            expected=len(parsed_items),
+            field_name="persona_artifacts",
+        )
+        persona_artifact_paths = _require_resume_list_length(
+            [
+                None if path is None else Path(str(path))
+                for path in resume_state.get("persona_artifact_paths") or []
+            ],
+            expected=len(parsed_items),
+            field_name="persona_artifact_paths",
+        )
+        runtime_judge_cards = _require_resume_list_length(
+            [
+                JudgeCard.from_dict(data)
+                if data is not None else None
+                for data in resume_state.get("runtime_judge_cards") or []
+            ],
+            expected=len(parsed_items),
+            field_name="runtime_judge_cards",
+        )
+        runtime_judge_bank_meta = _require_resume_list_length(
+            [
+                dict(meta) if isinstance(meta, dict) else None
+                for meta in resume_state.get("runtime_judge_bank_meta") or []
+            ],
+            expected=len(parsed_items),
+            field_name="runtime_judge_bank_meta",
+        )
+
+    all_contexts = _build_initial_agent_contexts(
+        dataset=dataset,
+        parsed_items=parsed_items,
+        engine=engine,
+        persona_artifacts=persona_artifacts,
+        n_agents=n_agents,
+    )
     agent_round_outputs_by_q: list[list[list[dict[str, Any]]]] = [
         [[] for _ in range(n_agents)]
         for _ in parsed_items
     ]
 
-    judge_engine = judge_engine or engine
+    judge_engine = effective_judge_engine
     debater_token_counter = None
     debater_count_fn = getattr(engine, "count_prompt_tokens", None)
     base_count_fn = getattr(InferenceEngine, "count_prompt_tokens", None)
@@ -190,106 +511,202 @@ def run_debate(
     judge_count_fn = getattr(judge_engine, "count_prompt_tokens", None)
     if not callable(judge_count_fn) or getattr(judge_count_fn, "__func__", None) is base_count_fn:
         judge_token_counter = PromptTokenCounter(getattr(judge_engine, "model_name", engine.model_name))
-    prev_judge_by_q: list[PrevJudgeInfo | None] = [None for _ in parsed_items]
-    results_by_round: dict[int, list[dict[str, Any]]] = {r: [] for r in judge_rounds}
-    round1_majority_by_q: list[dict[str, Any] | None] = [None for _ in parsed_items]
+    prev_judge_by_q = (
+        _require_resume_list_length(
+            [
+                _deserialise_prev_judge(data)
+                for data in resume_state.get("prev_judge_by_q") or []
+            ],
+            expected=len(parsed_items),
+            field_name="prev_judge_by_q",
+        )
+        if resume_state
+        else [None for _ in parsed_items]
+    )
+    results_by_round: dict[int, list[dict[str, Any]]] = {
+        r: list(rows)
+        for r, rows in (
+            {
+                int(k): list(v)
+                for k, v in dict(resume_state.get("results_by_round") or {}).items()
+            }.items()
+        )
+        if r in judge_rounds
+    }
+    for round_num in judge_rounds:
+        results_by_round.setdefault(round_num, [])
+    round1_majority_by_q = (
+        _require_resume_list_length(
+            list(resume_state.get("round1_majority_by_q") or []),
+            expected=len(parsed_items),
+            field_name="round1_majority_by_q",
+        )
+        if resume_state
+        else [None for _ in parsed_items]
+    )
+
+    if resume_state:
+        restored_contexts = resume_state.get("all_contexts")
+        restored_outputs = resume_state.get("agent_round_outputs_by_q")
+        if not isinstance(restored_outputs, list) or len(restored_outputs) != len(parsed_items):
+            raise ValueError("Debate state agent_round_outputs_by_q mismatch")
+        agent_round_outputs_by_q = [
+            [
+                [dict(round_output) for round_output in agent_outputs]
+                for agent_outputs in item_outputs
+            ]
+            for item_outputs in restored_outputs
+        ]
+        if not isinstance(restored_contexts, list) or len(restored_contexts) != len(parsed_items):
+            raise ValueError("Debate state all_contexts mismatch")
+        all_contexts = [
+            [
+                [dict(message) for message in agent_context]
+                for agent_context in item_contexts
+            ]
+            for item_contexts in restored_contexts
+        ]
+
+    start_round_idx = 0
+    pending_judge_round: int | None = None
+    if resume_entry is not None:
+        parsed_stage = _parse_debate_stage_name(resume_entry.completed_stage)
+        if parsed_stage is not None:
+            completed_round, completed_judge = parsed_stage
+            if completed_judge:
+                start_round_idx = completed_round + 1
+            elif completed_round in judge_rounds:
+                start_round_idx = completed_round
+                pending_judge_round = completed_round
+            else:
+                start_round_idx = completed_round + 1
+
+    def _append_state(completed_stage: str) -> None:
+        if stage_state_file is None:
+            return
+        _debate_append_state(
+            stage_state_file=stage_state_file,
+            completed_stage=completed_stage,
+            dataset=str(dataset),
+            items=items,
+            all_contexts=all_contexts,
+            agent_round_outputs_by_q=agent_round_outputs_by_q,
+            results_by_round=results_by_round,
+            prev_judge_by_q=prev_judge_by_q,
+            round1_majority_by_q=round1_majority_by_q,
+            persona_artifacts=persona_artifacts,
+            persona_artifact_paths=persona_artifact_paths,
+            runtime_judge_cards=runtime_judge_cards,
+            runtime_judge_bank_meta=runtime_judge_bank_meta,
+            persona_settings=current_persona_settings,
+            runtime_settings=current_runtime_settings,
+            n_agents=n_agents,
+            n_rounds=n_rounds,
+            judge_rounds=judge_rounds,
+        )
 
     for round_idx in tqdm(
-        range(total_answer_rounds),
+        range(start_round_idx, total_answer_rounds),
         desc="answer rounds",
-        total=total_answer_rounds,
+        total=max(0, total_answer_rounds - start_round_idx),
         file=progress_file,
     ):
-        if round_idx > 0:
+        skip_debater = pending_judge_round == round_idx
+        if round_idx > 0 and not skip_debater:
             for q_idx in range(len(parsed_items)):
                 agent_contexts = all_contexts[q_idx]
                 previous_round_outputs = [agent_round_outputs_by_q[q_idx][agent_idx][-1] for agent_idx in range(n_agents)]
                 for agent_idx, agent_ctx in enumerate(agent_contexts):
-                    other_answers = [
-                        _format_debate_share_entry(previous_round_outputs[j])
-                        for j in range(n_agents)
-                        if j != agent_idx
-                    ]
-                    debate_msg = _construct_debate_message(dataset, other_answers)
-                    persona_artifact = persona_artifacts[q_idx]
-                    if persona_artifact is not None and agent_idx < len(persona_artifact.cards):
-                        card = persona_artifact.cards[agent_idx]
-                        debate_msg = dict(debate_msg)
-                        debate_msg["content"] = (
-                            f"[Reminder: You are reasoning as {card.title}. "
-                            f"Strategy: {card.core_reasoning_strategy}]\n\n"
-                            + debate_msg["content"]
-                        )
-                    agent_ctx.append(debate_msg)
-
-        flat_contexts = [
-            all_contexts[q_idx][agent_idx]
-            for q_idx in range(len(parsed_items))
-            for agent_idx in range(n_agents)
-        ]
-        flat_request_contexts = flat_contexts
-        if round_idx > 0 and _provider_is_gemini(_engine_backend_name(engine)):
-            flat_request_contexts = []
-            for q_idx in range(len(parsed_items)):
-                artifact = persona_artifacts[q_idx]
-                for agent_idx in range(n_agents):
-                    persona_id = None
-                    if artifact is not None and agent_idx < len(artifact.cards):
-                        persona_id = artifact.cards[agent_idx].persona_id
-                    flat_request_contexts.append(
-                        _build_gemini_debate_cache_context(
-                            messages=all_contexts[q_idx][agent_idx],
+                    agent_ctx.append(
+                        _build_agent_debate_message(
                             dataset=dataset,
-                            item_uid=parsed_items[q_idx][0].item_uid,
+                            previous_round_outputs=previous_round_outputs,
                             agent_idx=agent_idx,
-                            round_idx=round_idx,
-                            persona_id=persona_id,
+                            persona_artifact=persona_artifacts[q_idx],
                         )
                     )
 
-        round_pbar = tqdm(
-            total=len(flat_request_contexts),
-            desc=f"round {round_idx + 1}",
-            unit="call",
-            leave=False,
-            file=progress_file,
-        )
-        debater_sampling_kwargs: dict[str, Any] | None = None
-        if _judge_trace_mode_enabled(judge_trace_mode) == "visible_plus_thought_summary" and _provider_is_gemini(_engine_backend_name(engine)):
-            debater_sampling_kwargs = {"include_thought_summaries": True}
-        try:
-            flat_results = ensure_inference_results(
-                engine,
-                flat_request_contexts,
-                batch_size=batch_size,
-                sampling_kwargs=debater_sampling_kwargs,
-                progress_callback=round_pbar.update,
-                model_role="debater",
-            )
-        finally:
-            round_pbar.close()
-        flat_completions = [result.text for result in flat_results]
-
-        for q_idx in range(len(parsed_items)):
-            for agent_idx in range(n_agents):
-                flat_idx = q_idx * n_agents + agent_idx
-                raw_completion = str(flat_completions[flat_idx])
-                all_contexts[q_idx][agent_idx].append({"role": "assistant", "content": raw_completion})
-                round_output = _build_round_output(
-                    dataset=dataset,
-                    raw_response=raw_completion,
-                    raw_task=parsed_items[q_idx][3],
-                    gt_answer=parsed_items[q_idx][2],
-                    public_rationale_max_tokens=public_rationale_max_tokens,
-                    inference_result=flat_results[flat_idx],
-                    request_messages=flat_request_contexts[flat_idx],
-                    request_engine=engine,
-                    prompt_token_counter=debater_token_counter,
-                )
-                agent_round_outputs_by_q[q_idx][agent_idx].append(round_output)
-
         current_round_num = round_idx + 1
         current_debate_round = max(0, current_round_num - 1)
+        if not skip_debater:
+            flat_contexts = [
+                all_contexts[q_idx][agent_idx]
+                for q_idx in range(len(parsed_items))
+                for agent_idx in range(n_agents)
+            ]
+            flat_request_contexts = flat_contexts
+            if round_idx > 0 and _provider_is_gemini(_engine_backend_name(engine)):
+                flat_request_contexts = []
+                for q_idx in range(len(parsed_items)):
+                    artifact = persona_artifacts[q_idx]
+                    for agent_idx in range(n_agents):
+                        persona_id = None
+                        if artifact is not None and agent_idx < len(artifact.cards):
+                            persona_id = artifact.cards[agent_idx].persona_id
+                        flat_request_contexts.append(
+                            _build_gemini_debate_cache_context(
+                                messages=all_contexts[q_idx][agent_idx],
+                                dataset=dataset,
+                                item_uid=parsed_items[q_idx][0].item_uid,
+                                agent_idx=agent_idx,
+                                round_idx=round_idx,
+                                persona_id=persona_id,
+                            )
+                        )
+
+            round_pbar = tqdm(
+                total=len(flat_request_contexts),
+                desc=f"round {round_idx + 1}",
+                unit="call",
+                leave=False,
+                file=progress_file,
+            )
+            debater_sampling_kwargs: dict[str, Any] | None = None
+            if _judge_trace_mode_enabled(judge_trace_mode) == "visible_plus_thought_summary" and _provider_is_gemini(_engine_backend_name(engine)):
+                debater_sampling_kwargs = {"include_thought_summaries": True}
+            if debater_sampling_kwargs is None:
+                debater_sampling_kwargs = {}
+            debater_sampling_kwargs.setdefault("max_tokens", DEBATE_DEFAULT_MAX_OUTPUT_TOKENS)
+            try:
+                flat_results = ensure_inference_results(
+                    engine,
+                    flat_request_contexts,
+                    batch_size=batch_size,
+                    sampling_kwargs=debater_sampling_kwargs,
+                    progress_callback=round_pbar.update,
+                    model_role="debater",
+                )
+            finally:
+                round_pbar.close()
+            flat_completions = [result.text for result in flat_results]
+
+            for q_idx in range(len(parsed_items)):
+                for agent_idx in range(n_agents):
+                    flat_idx = q_idx * n_agents + agent_idx
+                    raw_completion = str(flat_completions[flat_idx])
+                    all_contexts[q_idx][agent_idx].append({"role": "assistant", "content": raw_completion})
+                    round_output = _build_round_output(
+                        dataset=dataset,
+                        raw_response=raw_completion,
+                        raw_task=parsed_items[q_idx][3],
+                        gt_answer=parsed_items[q_idx][2],
+                        public_rationale_max_tokens=public_rationale_max_tokens,
+                        inference_result=flat_results[flat_idx],
+                        request_messages=flat_request_contexts[flat_idx],
+                        request_engine=engine,
+                        prompt_token_counter=debater_token_counter,
+                    )
+                    agent_round_outputs_by_q[q_idx][agent_idx].append(round_output)
+
+            debater_step_name = f"round_{current_debate_round}"
+            _append_state(debater_step_name)
+            if debate_stop_after == debater_step_name:
+                is_final_unjudged_stage = (
+                    round_idx == total_answer_rounds - 1
+                    and current_debate_round not in judge_rounds
+                )
+                if not is_final_unjudged_stage:
+                    raise _DebateStopped(results_by_round)
 
         if round_idx == 0:
             for q_idx, (_item, _question, gt_answer, raw_task) in enumerate(parsed_items):
@@ -382,9 +799,21 @@ def run_debate(
             return judge_contexts
 
         judge_contexts = _build_contexts_for_round()
+        judge_request_contexts = judge_contexts
+        if _provider_is_gemini(_engine_backend_name(judge_engine)):
+            judge_request_contexts = [
+                _build_gemini_judge_cache_context(
+                    messages=judge_contexts[q_idx],
+                    dataset=dataset,
+                    item_uid=parsed_items[q_idx][0].item_uid,
+                    round_idx=round_idx,
+                    phase="raw",
+                )
+                for q_idx in range(len(parsed_items))
+            ]
         judge_raw_results = ensure_inference_results(
             judge_engine,
-            judge_contexts,
+            judge_request_contexts,
             batch_size=batch_size,
             sampling_kwargs=judge_request_sampling_kwargs,
             model_role="judge",
@@ -451,10 +880,22 @@ def run_debate(
                 ]
                 retry_contexts.append(retry_ctx)
                 judge_retry_contexts[q_idx] = retry_ctx
+            retry_request_contexts = retry_contexts
+            if _provider_is_gemini(_engine_backend_name(judge_engine)):
+                retry_request_contexts = [
+                    _build_gemini_judge_cache_context(
+                        messages=retry_contexts[i],
+                        dataset=dataset,
+                        item_uid=parsed_items[q_idx][0].item_uid,
+                        round_idx=round_idx,
+                        phase="retry",
+                    )
+                    for i, q_idx in enumerate(needs_retry_idxs)
+                ]
 
             retry_results_batch = ensure_inference_results(
                 judge_engine,
-                retry_contexts,
+                retry_request_contexts,
                 batch_size=batch_size,
                 sampling_kwargs=retry_sampling,
                 model_role="judge",
@@ -767,7 +1208,73 @@ def run_debate(
                 )
             )
 
+        judge_step_name = f"round_{current_debate_round}_judge"
+        _append_state(judge_step_name)
+        if debate_stop_after == judge_step_name:
+            is_final_judge_stage = round_idx == total_answer_rounds - 1
+            if not is_final_judge_stage:
+                raise _DebateStopped(results_by_round)
+
     return results_by_round
 
 
-__all__ = ["run_debate"]
+def _debate_append_state(
+    *,
+    stage_state_file: Path,
+    completed_stage: str,
+    dataset: str,
+    items: list[SubsetItem],
+    all_contexts: list[list[list[dict[str, Any]]]],
+    agent_round_outputs_by_q: list[list[list[dict[str, Any]]]],
+    results_by_round: dict[int, list[dict[str, Any]]],
+    prev_judge_by_q: list[PrevJudgeInfo | None],
+    round1_majority_by_q: list[dict[str, Any] | None],
+    persona_artifacts: list[PersonaArtifact | None],
+    persona_artifact_paths: list[Path | None],
+    runtime_judge_cards: list[Any | None],
+    runtime_judge_bank_meta: list[dict[str, Any] | None],
+    persona_settings: dict[str, Any],
+    runtime_settings: dict[str, Any],
+    n_agents: int,
+    n_rounds: int,
+    judge_rounds: list[int],
+) -> None:
+    serialised_outputs = [
+        [list(agent_outputs) for agent_outputs in item_outputs]
+        for item_outputs in agent_round_outputs_by_q
+    ]
+    entry = make_stage_entry(
+        stage_type="debate",
+        completed_stage=completed_stage,
+        dataset=dataset,
+        items=[asdict(it) for it in items],
+        debate_data={
+            "all_contexts": all_contexts,
+            "agent_round_outputs_by_q": serialised_outputs,
+            "results_by_round": {str(k): v for k, v in results_by_round.items()},
+            "prev_judge_by_q": [_serialise_prev_judge(prev) for prev in prev_judge_by_q],
+            "round1_majority_by_q": round1_majority_by_q,
+            "persona_artifacts": [
+                None if artifact is None else artifact.to_dict()
+                for artifact in persona_artifacts
+            ],
+            "persona_artifact_paths": [
+                None if artifact_path is None else str(artifact_path)
+                for artifact_path in persona_artifact_paths
+            ],
+            "runtime_judge_cards": [
+                None if judge_card is None else asdict(judge_card)
+                for judge_card in runtime_judge_cards
+            ],
+            "runtime_judge_bank_meta": runtime_judge_bank_meta,
+            "persona_settings": dict(persona_settings),
+            "runtime_settings": dict(runtime_settings),
+            "n_agents": n_agents,
+            "n_rounds": n_rounds,
+            "judge_rounds": list(judge_rounds),
+        },
+    )
+    append_stage_entry(stage_state_file, entry)
+
+
+__all__ = ["run_debate", "_DebateStopped"]

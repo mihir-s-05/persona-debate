@@ -159,6 +159,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out_dir", type=str, default=None, help="Output directory.")
     ap.add_argument("--output", type=str, default=None, help="Optional explicit output JSONL path for the final records file.")
     ap.add_argument("--tag", type=str, default=None, help="Optional tag for output files.")
+    ap.add_argument(
+        "--persona_stage",
+        type=str,
+        default="full",
+        choices=["axes", "descriptors", "cards", "judge_card", "full"],
+        help="Run staged persona generation up to this stage; interactive terminals can continue through later stages without rerunning the command.",
+    )
+    ap.add_argument(
+        "--stage_state_file",
+        type=str,
+        default=None,
+        help="JSONL file for staged execution state. Each stage appends one line; resume reads the last.",
+    )
+    ap.add_argument(
+        "--debate_stop_after",
+        type=str,
+        default=None,
+        help="Stop debate after this step (e.g. 'round_0', 'round_1_judge'). Omit to run to completion.",
+    )
+
     ap.add_argument("--use_personas", action="store_true", help="Enable persona-conditioned debate or majority generation/replay.")
     ap.add_argument("--persona_n", type=int, default=5, help="Number of personas to generate in persona mode.")
     ap.add_argument(
@@ -175,15 +195,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=["maximin", "halton"],
         help="Sampling method for persona axis points.",
     )
-    ap.add_argument("--persona_fixed_axis_count", type=int, default=4, help="Number of fixed axes to use in hybrid/fixed persona generation.")
-    ap.add_argument("--persona_task_axis_count", type=int, default=2, help="Number of task axes to use in hybrid/task persona generation.")
+    ap.add_argument("--persona_fixed_axis_count", type=int, default=3, help="Number of fixed axes to use in hybrid/fixed persona generation.")
+    ap.add_argument("--persona_task_axis_count", type=int, default=3, help="Number of task axes to use in hybrid/task persona generation.")
     ap.add_argument("--persona_axes_file", type=str, default=None, help="JSON file containing axes when --persona_axes_mode file is used.")
     ap.add_argument(
         "--persona_backend",
         type=str,
-        default="auto",
+        default="llm",
         choices=["auto", "heuristic", "llm"],
-        help="Persona generation backend. 'auto' uses llm when a generator model is available, else heuristic.",
+        help="Persona generation backend. Defaults to llm. 'auto' uses llm when a generator model is available, else heuristic.",
     )
     ap.add_argument(
         "--generator_model",

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import mimetypes
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -19,6 +21,7 @@ GEMINI_DEFAULT_TEMPERATURE = 1.0
 GEMINI_DEFAULT_MAX_OUTPUT_TOKENS = 4096
 GEMINI_CACHE_CONTROL_ROLE = "cache_control"
 GEMINI_DEFAULT_CACHE_TTL_SECONDS = 3600
+GEMINI_DEFAULT_MAX_PARALLEL_REQUESTS = 8
 
 
 _dotenv_cache: dict[str, tuple[float, str | None]] = {}
@@ -220,6 +223,7 @@ class GeminiInferenceEngine(BaseInferenceEngine):
         self._client = None
         self._cache_registry: dict[str, dict[str, Any]] = {}
         self._created_cache_names: set[str] = set()
+        self._cache_lock = threading.RLock()
 
     def _api_model_name(self) -> str:
         return GEMINI_3_FLASH_MODEL
@@ -248,14 +252,31 @@ class GeminiInferenceEngine(BaseInferenceEngine):
 
     def shutdown(self) -> None:
         if self._client is not None:
-            for cache_name in list(self._created_cache_names):
+            with self._cache_lock:
+                cache_names = list(self._created_cache_names)
+            for cache_name in cache_names:
                 try:
                     self._client.caches.delete(name=cache_name)
                 except Exception:
                     pass
-        self._cache_registry.clear()
-        self._created_cache_names.clear()
+        with self._cache_lock:
+            self._cache_registry.clear()
+            self._created_cache_names.clear()
         self._client = None
+
+    def _max_parallel_requests(self, batch_size: int | None) -> int:
+        if batch_size is not None:
+            try:
+                return max(1, int(batch_size))
+            except (TypeError, ValueError):
+                pass
+        raw_value = os.environ.get("GEMINI_MAX_PARALLEL_REQUESTS")
+        if raw_value:
+            try:
+                return max(1, int(raw_value))
+            except (TypeError, ValueError):
+                pass
+        return GEMINI_DEFAULT_MAX_PARALLEL_REQUESTS
 
     def _split_cache_control(
         self,
@@ -392,13 +413,22 @@ class GeminiInferenceEngine(BaseInferenceEngine):
         from google.genai import types
 
         assert self._client is not None
-        config = None
+        count_contents = list(contents)
         if system_instruction:
-            config = types.CountTokensConfig(system_instruction=system_instruction)
+            # Gemini's count_tokens endpoint does not accept system_instruction in
+            # CountTokensConfig even though generate_content accepts it in
+            # GenerateContentConfig. For accounting, prepend the system text as a
+            # leading user content block so token counting still includes it.
+            count_contents = [
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=str(system_instruction))],
+                ),
+                *count_contents,
+            ]
         response = self._client.models.count_tokens(
             model=self._api_model_resource_name(),
-            contents=contents,
-            config=config,
+            contents=count_contents,
         )
         total_tokens = getattr(response, "total_tokens", None)
         if total_tokens is None:
@@ -453,63 +483,64 @@ class GeminiInferenceEngine(BaseInferenceEngine):
 
         assert self._client is not None
         cache_key = f"{self.model_name}:{_message_signature(prefix_messages)}"
-        cached_entry = self._cache_registry.get(cache_key)
-        if cached_entry is not None:
-            return {**cached_entry, "created": False}
+        with self._cache_lock:
+            cached_entry = self._cache_registry.get(cache_key)
+            if cached_entry is not None:
+                return {**cached_entry, "created": False}
 
-        system_instruction, contents = self._build_contents(prefix_messages)
-        prefix_token_count = self._count_tokens(
-            system_instruction=system_instruction,
-            contents=contents,
-        )
-        min_tokens = self._cache_min_tokens()
-        if prefix_token_count is not None and prefix_token_count < min_tokens:
-            return {
-                "cache_key": cache_key,
-                "cache_name": None,
-                "display_name": display_name,
-                "ttl_seconds": int(ttl_seconds),
-                "created": False,
-                "cache_skipped": True,
-                "skip_reason": "below_min_tokens",
-                "prefix_token_count": int(prefix_token_count),
-                "min_prefix_tokens": int(min_tokens),
-            }
-        cached = self._client.caches.create(
-            model=self._api_model_resource_name(),
-            config=types.CreateCachedContentConfig(
-                contents=contents,
+            system_instruction, contents = self._build_contents(prefix_messages)
+            prefix_token_count = self._count_tokens(
                 system_instruction=system_instruction,
-                display_name=display_name,
-                ttl=f"{int(ttl_seconds)}s",
-            ),
-        )
-        cache_name = str(getattr(cached, "name", "") or "")
-        entry = {
-            "cache_key": cache_key,
-            "cache_name": cache_name or None,
-            "display_name": display_name,
-            "ttl_seconds": int(ttl_seconds),
-            "created": True,
-            "prefix_signature": _message_signature(prefix_messages),
-            "prefix_token_count": prefix_token_count,
-            "min_prefix_tokens": int(min_tokens),
-        }
-        if not cache_name:
-            return {
+                contents=contents,
+            )
+            min_tokens = self._cache_min_tokens()
+            if prefix_token_count is not None and prefix_token_count < min_tokens:
+                return {
+                    "cache_key": cache_key,
+                    "cache_name": None,
+                    "display_name": display_name,
+                    "ttl_seconds": int(ttl_seconds),
+                    "created": False,
+                    "cache_skipped": True,
+                    "skip_reason": "below_min_tokens",
+                    "prefix_token_count": int(prefix_token_count),
+                    "min_prefix_tokens": int(min_tokens),
+                }
+            cached = self._client.caches.create(
+                model=self._api_model_resource_name(),
+                config=types.CreateCachedContentConfig(
+                    contents=contents,
+                    system_instruction=system_instruction,
+                    display_name=display_name,
+                    ttl=f"{int(ttl_seconds)}s",
+                ),
+            )
+            cache_name = str(getattr(cached, "name", "") or "")
+            entry = {
                 "cache_key": cache_key,
-                "cache_name": None,
+                "cache_name": cache_name or None,
                 "display_name": display_name,
                 "ttl_seconds": int(ttl_seconds),
-                "created": False,
-                "cache_skipped": True,
-                "skip_reason": "missing_cache_name",
+                "created": True,
+                "prefix_signature": _message_signature(prefix_messages),
                 "prefix_token_count": prefix_token_count,
                 "min_prefix_tokens": int(min_tokens),
             }
-        self._created_cache_names.add(cache_name)
-        self._cache_registry[cache_key] = dict(entry)
-        return entry
+            if not cache_name:
+                return {
+                    "cache_key": cache_key,
+                    "cache_name": None,
+                    "display_name": display_name,
+                    "ttl_seconds": int(ttl_seconds),
+                    "created": False,
+                    "cache_skipped": True,
+                    "skip_reason": "missing_cache_name",
+                    "prefix_token_count": prefix_token_count,
+                    "min_prefix_tokens": int(min_tokens),
+                }
+            self._created_cache_names.add(cache_name)
+            self._cache_registry[cache_key] = dict(entry)
+            return entry
 
     def generate_batch_results(
         self,
@@ -520,16 +551,17 @@ class GeminiInferenceEngine(BaseInferenceEngine):
         progress_callback: Callable[[int], None] | None = None,
         model_role: str | None = None,
     ) -> list[InferenceResult]:
-        del batch_size
         self.initialize()
         assert self._client is not None
-        results: list[InferenceResult] = []
+        max_workers = min(len(contexts), self._max_parallel_requests(batch_size))
+        results: list[InferenceResult | None] = [None] * len(contexts)
         requested_max_tokens = (
             int(sampling_kwargs["max_tokens"])
             if sampling_kwargs is not None and sampling_kwargs.get("max_tokens") is not None
             else GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
         )
-        for messages in contexts:
+
+        def _run_one(messages: list[dict[str, str]]) -> InferenceResult:
             cache_control, payload_messages = self._split_cache_control(messages)
             provider_cache_meta: dict[str, Any] = {}
             if cache_control is not None and cache_control["prefix_count"] > 0:
@@ -604,16 +636,32 @@ class GeminiInferenceEngine(BaseInferenceEngine):
                     },
                 )
                 maybe_record_result(result)
-                results.append(result)
+                return result
             except SpendLimitExceeded:
                 raise
             except Exception as exc:
                 raise RuntimeError(
                     f"Gemini API request failed for model {self.model_name}: {type(exc).__name__}: {exc}"
                 ) from exc
-            if progress_callback is not None:
-                progress_callback(1)
-        return results
+
+        if max_workers <= 1:
+            for idx, messages in enumerate(contexts):
+                results[idx] = _run_one(messages)
+                if progress_callback is not None:
+                    progress_callback(1)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_index = {
+                    executor.submit(_run_one, messages): idx
+                    for idx, messages in enumerate(contexts)
+                }
+                for future in concurrent.futures.as_completed(future_to_index):
+                    idx = future_to_index[future]
+                    results[idx] = future.result()
+                    if progress_callback is not None:
+                        progress_callback(1)
+
+        return [result for result in results if result is not None]
 
     def generate_batch(
         self,

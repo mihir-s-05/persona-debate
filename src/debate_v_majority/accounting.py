@@ -354,14 +354,28 @@ def maybe_record_result(result: "InferenceResult") -> dict[str, Any] | None:
     return tracker.record_result(result)
 
 
-def format_cost_summary(summary: dict[str, Any], *, ledger_path: Path) -> str:
+def _remaining_budget(limit_usd: float | None, spent_usd: float) -> str:
+    if limit_usd is None:
+        return "unbounded"
+    return f"${max(0.0, float(limit_usd) - float(spent_usd)):.6f}"
+
+
+def format_cost_summary(
+    summary: dict[str, Any],
+    *,
+    ledger_path: Path,
+    max_run_cost_usd: float | None = None,
+    max_total_cost_usd: float | None = None,
+) -> str:
     session = summary["session"]
     previous = summary["previous"]
     cumulative = summary["cumulative"]
     return (
         f"[cost] run=${session['estimated_cost_usd']:.6f} "
         f"(calls={session['n_calls']}, input={session['input_tokens']}, cached={session['cached_input_tokens']}, output={session['billable_output_tokens']}) | "
+        f"run_remaining={_remaining_budget(max_run_cost_usd, float(session['estimated_cost_usd']))} | "
         f"previous=${previous['estimated_cost_usd']:.6f} | "
         f"cumulative=${cumulative['estimated_cost_usd']:.6f} | "
+        f"cumulative_remaining={_remaining_budget(max_total_cost_usd, float(cumulative['estimated_cost_usd']))} | "
         f"ledger={ledger_path}"
     )

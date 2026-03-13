@@ -4,6 +4,8 @@ import base64
 import io
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -187,7 +189,10 @@ def test_gemini_engine_generate_batch_results_extracts_usage_from_fake_client():
 
 def test_gemini_engine_count_prompt_tokens_uses_count_tokens_api():
     class _FakeModels:
+        last_kwargs = None
+
         def count_tokens(self, **kwargs):
+            self.last_kwargs = kwargs
             return SimpleNamespace(total_tokens=19)
 
     class _FakeClient:
@@ -199,6 +204,75 @@ def test_gemini_engine_count_prompt_tokens_uses_count_tokens_api():
     assert engine.count_prompt_tokens(
         [{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}]
     ) == 19
+    kwargs = engine._client.models.last_kwargs
+    assert "config" not in kwargs
+    assert kwargs["contents"][0].role == "user"
+    assert kwargs["contents"][0].parts[0].text == "sys"
+    assert kwargs["contents"][1].role == "user"
+    assert kwargs["contents"][1].parts[0].text == "hello"
+
+
+def test_gemini_engine_generate_batch_results_runs_requests_in_parallel_and_preserves_order():
+    class _FakeUsage:
+        def model_dump(self, exclude_none=True):
+            del exclude_none
+            return {
+                "prompt_token_count": 13,
+                "candidates_token_count": 7,
+                "total_token_count": 20,
+            }
+
+    class _FakeModels:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.in_flight = 0
+            self.max_in_flight = 0
+
+        def generate_content(self, **kwargs):
+            contents = kwargs["contents"]
+            prompt_text = contents[0].parts[0].text
+            with self._lock:
+                self.in_flight += 1
+                self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            try:
+                time.sleep(0.05)
+                return SimpleNamespace(
+                    text=f"out:{prompt_text}",
+                    usage_metadata=_FakeUsage(),
+                    response_id=f"resp:{prompt_text}",
+                    model_version="gemini-3-flash-preview-001",
+                    sdk_http_response=SimpleNamespace(
+                        status_code=200,
+                        url="https://example.invalid/generate",
+                        headers={"x-request-id": f"req:{prompt_text}"},
+                    ),
+                )
+            finally:
+                with self._lock:
+                    self.in_flight -= 1
+
+    fake_models = _FakeModels()
+    engine = GeminiInferenceEngine(model_name="gemini-3-flash-preview")
+    engine._client = SimpleNamespace(models=fake_models)
+    results = engine.generate_batch_results(
+        [
+            [{"role": "user", "content": "alpha"}],
+            [{"role": "user", "content": "beta"}],
+            [{"role": "user", "content": "gamma"}],
+            [{"role": "user", "content": "delta"}],
+        ],
+        batch_size=4,
+        sampling_kwargs={"max_tokens": 64},
+        model_role="debater",
+    )
+
+    assert [result.text for result in results] == [
+        "out:alpha",
+        "out:beta",
+        "out:gamma",
+        "out:delta",
+    ]
+    assert fake_models.max_in_flight > 1
 
 
 def test_gemini_engine_supports_structured_image_parts_from_local_file(tmp_path: Path):
