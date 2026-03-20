@@ -20,6 +20,8 @@ dependencies = [
 debate-v-majority = "debate_v_majority.cli:main"
 analyze-results = "debate_v_majority.tools.analyze_results:main"
 trace2txt = "debate_v_majority.tools.trace2txt:main"
+token-ledger-cost = "debate_v_majority.tools.token_ledger_cost:main"
+extract-transcripts = "debate_v_majority.tools.extract_transcripts:main"
 
 [project.optional-dependencies]
 dev = [

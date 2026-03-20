@@ -52,11 +52,24 @@ Thumbs.db
 *.md
 !README.md
 2602.03545.pdf
+2602.03545v*.pdf
 _paper*.txt
 _autogen/
+_all_dynamics/
+_full_analysis/
+_interesting_transcripts/
+_mixed_analysis/
+_mixed_compare/
+_round_data/
+_run2_analysis/
+_seed*_analysis/
+_seed*_compare.py
+_trace_dumps/
+_transcripts/
 data/
 out/
 results/
+
 
 # Jupyter
 .ipynb_checkpoints/

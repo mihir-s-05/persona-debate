@@ -205,8 +205,15 @@ def _build_judge_context(
     previous_judge: str | None = None,
     judge_system_prompt: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Build judge context messages."""
-    parts = [f"Question: {question}"]
+    """Build judge context messages.
+
+    Returns three messages: [system, user_body, user_format_suffix].
+    Splitting the format suffix into its own message enables Gemini explicit
+    caching of [system, user_body] as a reusable prefix across raw and retry
+    judge calls.
+    """
+    judge_question = _get_dataset_adapter(dataset).build_judge_question(raw_task) or question
+    parts = [f"Question: {judge_question}"]
     if previous_judge:
         parts.append(f"Previous judge output (from earlier rounds):\n{previous_judge}")
 
@@ -214,13 +221,14 @@ def _build_judge_context(
         parts.append(f"=== Agent {agent_idx} debate transcript ===\n{response}")
 
     judge_prompt = _get_judge_prompt(dataset)
-    user_prompt = "\n\n".join(parts) + judge_prompt["user_prompt_suffix"]
-    user_content: Any = user_prompt
+    user_body = "\n\n".join(parts)
+    user_suffix = judge_prompt["user_prompt_suffix"]
+    body_content: Any = user_body
     if dataset == "hle":
         from ..datasets import hle as hle_dataset
 
-        user_content = hle_dataset.build_prompt_content(
-            user_prompt,
+        body_content = hle_dataset.build_prompt_content(
+            user_body,
             raw_task,
             attach_images=True,
             attachment_notice="Relevant task images are attached with this judge prompt.",
@@ -228,7 +236,8 @@ def _build_judge_context(
 
     return [
         {"role": "system", "content": judge_system_prompt or JUDGE_SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
+        {"role": "user", "content": body_content},
+        {"role": "user", "content": user_suffix},
     ]
 
 

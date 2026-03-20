@@ -227,7 +227,7 @@ def _persona_runtime_meta(
 ) -> dict[str, Any] | None:
     if artifact is None:
         return None
-    return {
+    meta: dict[str, Any] = {
         "artifact_version": artifact.artifact_version,
         "artifact_path": _artifact_path_str(artifact_path, allow_missing=allow_missing_artifact_path),
         "persona_seed": artifact.persona_seed,
@@ -238,6 +238,10 @@ def _persona_runtime_meta(
         "backend": persona_backend,
         "public_rationale_max_tokens": public_rationale_max_tokens,
     }
+    if artifact.slot_layout is not None:
+        meta["slot_layout"] = list(artifact.slot_layout)
+        meta["n_plain_agents"] = artifact.n_plain_agents
+    return meta
 
 
 def _base_row_fields(

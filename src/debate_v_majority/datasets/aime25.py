@@ -50,6 +50,14 @@ def parse_question_answer(sample: dict[str, Any]) -> tuple[str, str, dict[str, A
     return question, gt, raw_task
 
 
+def build_judge_question(raw_task: dict[str, Any]) -> str:
+    """Return the raw problem text for the judge, without agent solving instructions."""
+    question_raw = raw_task.get("problem") or raw_task.get("question")
+    if question_raw is None:
+        raise KeyError("AIME25 sample missing 'problem' field")
+    return str(question_raw)
+
+
 # =============================================================================
 # Answer parsing
 # =============================================================================
@@ -71,7 +79,7 @@ def parse_answer(text: str, task_info: dict[str, Any]) -> str | None:
             except Exception:
                 pass
         # If the boxed content isn't a valid AIME integer in [0,999], fall back to
-        # tail heuristics rather than returning an out-of-range intermediate result.
+        # tail logic rather than returning an out-of-range intermediate result.
     # If no boxed answer is present, avoid grabbing large intermediate values
     # (e.g. counts like 32768) by preferring 0-999 integers near the end.
     text = re.sub(r"(\d),(\d)", r"\1\2", str(text))
@@ -132,3 +140,4 @@ def construct_debate_message(other_agent_answers: list[str]) -> dict[str, str]:
         updates=other_agent_answers,
         outro=AGENT_PROMPT["debate"][1],
     )
+

@@ -23,3 +23,4 @@ def test_normalize_freeform_string_canonicalizes_case_and_spacing():
 def test_most_frequent_answer_ignores_none_and_rejects_ties():
     assert most_frequent_answer([None, "C", "C"]) == "C"
     assert most_frequent_answer(["A", "B", "A", "B"]) is None
+

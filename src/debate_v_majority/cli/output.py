@@ -20,7 +20,7 @@ from ..personas.prompt_templates import (
 )
 
 
-FINAL_OUTPUT_SCHEMA_VERSION = "phase7.logical.v1"
+FINAL_OUTPUT_SCHEMA_VERSION = "phase7.logical.v2"
 FINAL_MANIFEST_VERSION = "phase7.final_manifest.v1"
 
 
@@ -144,7 +144,7 @@ def _strategy_block(
     public_rationale_max_tokens: int | None,
     emit_trace_level: str,
 ) -> dict[str, Any]:
-    return {
+    block: dict[str, Any] = {
         "mode": mode,
         "use_personas": bool(use_personas),
         "judge_trace_mode": judge_trace_mode,
@@ -154,6 +154,12 @@ def _strategy_block(
         "n_rounds": row.get("n_rounds"),
         "n_samples": row.get("n_samples"),
     }
+    persona_meta = row.get("persona_meta")
+    if isinstance(persona_meta, dict):
+        n_plain = persona_meta.get("n_plain_agents", 0)
+        if n_plain:
+            block["persona_plain_agents"] = int(n_plain)
+    return block
 
 
 def _task_block(row: dict[str, Any]) -> dict[str, Any]:
@@ -204,8 +210,10 @@ def _persona_meta_block(row: dict[str, Any]) -> dict[str, Any] | None:
     persona_meta = row.get("persona_meta")
     if isinstance(persona_meta, dict):
         return dict(persona_meta)
+    def _present(value: Any) -> bool:
+        return value not in (None, "", [], {})
     if not any(
-        row.get(key) is not None
+        _present(row.get(key))
         for key in (
             "artifact_path",
             "persona_seed",

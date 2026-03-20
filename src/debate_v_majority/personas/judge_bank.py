@@ -18,6 +18,7 @@ from .schema import JudgeBankArtifact, JudgeCard
 
 JUDGE_BANK_ARTIFACT_VERSION = "judge_bank.v1"
 JUDGE_BANK_GENERATION_RETRIES = 2
+GLOBAL_JUDGE_BANK_DIRNAME = "judge_banks"
 AIME25_JUDGE_FAMILIES = ("math",)
 GPQA_JUDGE_FAMILIES = ("biology", "chemistry", "physics")
 HLE_JUDGE_FAMILIES = (
@@ -50,8 +51,13 @@ class JudgeBankGenerationExhaustedError(ValueError):
         self.metadata = metadata
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
 def default_judge_bank_dir(*, artifacts_dir: Path) -> Path:
-    return artifacts_dir / "judge_banks"
+    _ = artifacts_dir
+    return _repo_root() / "out" / GLOBAL_JUDGE_BANK_DIRNAME
 
 
 def default_gpqa_family_cache_path(*, judge_bank_dir: Path) -> Path:
@@ -108,35 +114,6 @@ def _family_description(dataset: str, judge_family: str) -> str:
         }
         return mapping[judge_family]
     return f"Choose the strongest {judge_family} answer from the debate transcript."
-
-
-def _heuristic_benchmark_judge_card(*, dataset: str, judge_family: str) -> JudgeCard:
-    family_description = _family_description(dataset, judge_family)
-    return JudgeCard(
-        judge_id=f"judge_bank_{dataset}_{judge_family}",
-        judge_family=judge_family,
-        domain_scope=judge_family,
-        evaluation_priorities=[
-            "select the answer best supported by the transcript",
-            "prefer explicit constraint tracking, valid elimination, and concrete verification",
-            "discount unsupported confidence, verbosity, and superficial consensus",
-        ],
-        tie_break_policy="if two answers are close, prefer the answer with clearer transcript-grounded support and fewer unsupported jumps",
-        independent_resolve_policy="limited_check_only",
-        answer_format_policy="return one final answer in the strict format expected by the dataset",
-        confidence_policy="optional",
-        system_prompt=(
-            f"{JUDGE_GUIDANCE}\n"
-            f"Judge family: {judge_family}\n"
-            f"Family scope: {family_description}\n"
-            "You will review visible model outputs from every round and Gemini thought summaries when available.\n"
-            "Use those traces to select the strongest supported answer. Do not run a fresh unconstrained solve."
-        ),
-        card_version=JUDGE_PROMPT_VERSION,
-        source={"backend": "heuristic", "dataset": dataset, "judge_family": judge_family},
-    )
-
-
 def _llm_benchmark_judge_card(
     *,
     dataset: str,
@@ -218,26 +195,24 @@ def ensure_judge_bank_card(
     path = judge_bank_path(judge_bank_dir=judge_bank_dir, dataset=dataset, judge_family=judge_family)
     if path.exists() and not refresh:
         artifact = JudgeBankArtifact.from_dict(_load_json(path))
-        return artifact.judge_card, artifact, path
+        if artifact.backend == "llm":
+            return artifact.judge_card, artifact, path
 
-    use_llm = backend != "heuristic" and engine is not None
-    judge_card = (
-        _llm_benchmark_judge_card(
-            dataset=dataset,
-            judge_family=judge_family,
-            engine=engine,
-            generator_model=generator_model,
-            backend=backend,
-        )
-        if use_llm
-        else _heuristic_benchmark_judge_card(dataset=dataset, judge_family=judge_family)
+    if engine is None:
+        raise ValueError("persona generation requires a judge generator engine for judge-bank generation")
+    judge_card = _llm_benchmark_judge_card(
+        dataset=dataset,
+        judge_family=judge_family,
+        engine=engine,
+        generator_model=generator_model,
+        backend="llm",
     )
     artifact = JudgeBankArtifact(
         artifact_version=JUDGE_BANK_ARTIFACT_VERSION,
         dataset=dataset,
         judge_family=judge_family,
         generator_model=generator_model,
-        backend=backend if use_llm else "heuristic",
+        backend="llm",
         prompt_versions={"judge": JUDGE_PROMPT_VERSION, "judge_bank": JUDGE_BANK_PROMPT_VERSION},
         created_at=_utc_now_iso(),
         judge_card=judge_card,
@@ -273,25 +248,6 @@ def _resolve_hle_family(raw_task: dict[str, Any]) -> JudgeFamilyAssignment:
         source="hle_category",
         details={"category": category},
     )
-
-
-def _heuristic_gpqa_family(question: str) -> str:
-    """Keyword-based fallback for GPQA family classification."""
-    q = question.lower()
-    bio_keywords = ("cell", "protein", "gene", "organism", "dna", "rna")
-    chem_keywords = ("reaction", "compound", "molecule", "bond", "acid", "ph", "oxidation")
-    phys_keywords = ("force", "energy", "mass", "velocity", "quantum", "electric", "magnetic", "wave")
-    bio = sum(1 for kw in bio_keywords if kw in q)
-    chem = sum(1 for kw in chem_keywords if kw in q)
-    phys = sum(1 for kw in phys_keywords if kw in q)
-    if bio > chem and bio > phys:
-        return "biology"
-    if chem > bio and chem > phys:
-        return "chemistry"
-    # Default to physics (largest GPQA category), including ties.
-    return "physics"
-
-
 def _classify_gpqa_family(
     *,
     item_uid: str,
@@ -351,10 +307,8 @@ def _classify_gpqa_family(
     payload = parse_json_payload(str(result.text))
     family = str(payload.get("judge_family") or "").strip().lower()
     if family not in GPQA_JUDGE_FAMILIES:
-        family = _heuristic_gpqa_family(question)
-        source = "gpqa_family_heuristic_fallback"
-    else:
-        source = "gpqa_family_llm"
+        raise ValueError(f"GPQA family classification returned invalid family: {family!r}")
+    source = "gpqa_family_llm"
     assignment_payload = {
         "judge_family": family,
         "source": source,
@@ -407,12 +361,7 @@ def resolve_judge_family_assignment(
                     details=dict(cached),
                 )
     if gpqa_family_cache_path is None or gpqa_classifier_engine is None:
-        family = _heuristic_gpqa_family(question)
-        return JudgeFamilyAssignment(
-            judge_family=family,
-            source="gpqa_family_heuristic",
-            details={"item_uid": item_uid, "question_preview": question[:160]},
-        )
+        raise ValueError("GPQA judge-family resolution requires an LLM classifier engine or an existing cache path")
     return _classify_gpqa_family(
         item_uid=item_uid,
         question=question,

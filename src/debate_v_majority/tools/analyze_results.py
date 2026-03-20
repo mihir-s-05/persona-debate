@@ -229,7 +229,10 @@ def analyze(results_dir: Path, out_dir: Path) -> None:
     def cfg_key(meta: RunMeta) -> str:
         if meta.mode != "debate":
             return "-"
-        return f"{meta.n_agents}a-{meta.n_rounds}r"
+        label = f"{meta.n_agents}a-{meta.n_rounds}r"
+        if meta.method_label == "debate_judge_mixed":
+            label += "-mixed"
+        return label
 
     def item_key(rec: dict[str, Any], *, dataset: str) -> str:
         item_uid = rec.get("item_uid")

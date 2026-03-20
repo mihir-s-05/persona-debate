@@ -18,6 +18,102 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
             f.write(json.dumps(row) + "\n")
 
 
+def _fake_judge_family(prompt: str, all_content: str) -> str:
+    text = f"{prompt}\n{all_content}".lower()
+    if "replication" in text or "biology" in text:
+        return "biology"
+    if "competition_math" in text or "what is 1+1" in text:
+        return "competition_math"
+    if "humanities" in text:
+        return "humanities"
+    return "physics"
+
+
+def _fake_persona_response(prompt: str, all_content: str) -> str | None:
+    family = _fake_judge_family(prompt, all_content)
+    text = f"{prompt}\n{all_content}"
+    lower = text.lower()
+    if "classify this gpqa item into exactly one domain family" in lower:
+        return json.dumps({"judge_family": family})
+    if "you generate reasoning-diversity axes" in lower or "propose reasoning-relevant axes" in lower:
+        return json.dumps(
+            {
+                "axes": [
+                    {
+                        "axis_id": "verification_style",
+                        "name": "Verification Style",
+                        "low_desc": "Validate cautiously before committing.",
+                        "high_desc": "Advance quickly, then verify later.",
+                        "notes": "Keep the axis answer-agnostic.",
+                    }
+                ]
+            }
+        )
+    if "generate the full persona population jointly" in lower:
+        return json.dumps(
+            {
+                "descriptors": [
+                    {
+                        "persona_id": f"persona_{idx + 1}",
+                        "name": f"P{idx + 1}",
+                        "axis_interpretation": {"verification_style": f"mode_{idx}"},
+                        "short_rule": f"rule_{idx}",
+                        "reasoning_summary": f"reasoning summary {idx}",
+                    }
+                    for idx in range(5)
+                ]
+            }
+        )
+    if "expand each descriptor into a compact" in lower:
+        persona_id = next(
+            (f"persona_{idx}" for idx in range(1, 6) if f"persona_{idx}" in lower),
+            "persona_1",
+        )
+        return json.dumps(
+            {
+                "persona_id": persona_id,
+                "title": f"Card {persona_id}",
+                "core_reasoning_strategy": f"strategy {persona_id}",
+                "priorities": ["track support"],
+                "distrusts": ["unsupported jumps"],
+                "decomposition_style": "stepwise",
+                "revision_policy": "revise on evidence",
+                "confidence_policy": "explicit",
+                "failure_mode_to_avoid": "answer leakage",
+                "system_prompt": f"System prompt for {persona_id}.",
+            }
+        )
+    if (
+        "generate a constrained judge card" in lower
+        or "generate reusable benchmark-level judge cards" in lower
+        or "generate a reusable benchmark-level judge card" in lower
+    ):
+        return json.dumps(
+            {
+                "judge_id": f"judge_{family}",
+                "judge_family": family,
+                "domain_scope": family,
+                "evaluation_priorities": ["score transcript support"],
+                "tie_break_policy": "prefer explicit support",
+                "independent_resolve_policy": "limited_check_only",
+                "answer_format_policy": "strict",
+                "confidence_policy": "optional",
+                "system_prompt": f"Judge prompt for {family}",
+            }
+        )
+    return None
+
+
+def _is_special_output_batch(outputs: list[object]) -> bool:
+    def _text(value: object) -> str:
+        if isinstance(value, InferenceResult):
+            return str(value.text or "")
+        return str(value or "")
+
+    markers = ('"judge_family"', '"judge_id"', '"descriptors"', '"axes"', '"persona_id"')
+    return bool(outputs) and all(any(marker in _text(output) for marker in markers) for output in outputs)
+
+
 class _FakeDebateEngine:
     def __init__(self, outputs_by_call: list[list[str]], *, model_name: str = "fake-model") -> None:
         self.outputs_by_call = outputs_by_call
@@ -29,11 +125,28 @@ class _FakeDebateEngine:
         return 11
 
     def generate_batch(self, contexts, batch_size=None, sampling_kwargs=None, progress_callback=None):
-        call_idx = len(self.calls)
+        special_outputs: list[str] = []
+        for ctx in contexts:
+            prompt = str(ctx[-1].get("content", ""))
+            all_content = " ".join(str(msg.get("content", "")) for msg in ctx)
+            response = _fake_persona_response(prompt, all_content)
+            if response is None:
+                special_outputs = []
+                break
+            special_outputs.append(response)
+        if special_outputs:
+            output_idx = getattr(self, "_output_idx", 0)
+            if output_idx < len(self.outputs_by_call) and _is_special_output_batch(self.outputs_by_call[output_idx]):
+                setattr(self, "_output_idx", output_idx + 1)
+            if progress_callback is not None:
+                progress_callback(len(special_outputs))
+            return special_outputs
+        call_idx = getattr(self, "_output_idx", 0)
         assert call_idx < len(self.outputs_by_call), f"Unexpected extra engine call {call_idx}"
         outputs = self.outputs_by_call[call_idx]
         assert len(outputs) == len(contexts), (call_idx, len(outputs), len(contexts))
         self.calls.append(([[dict(msg) for msg in ctx] for ctx in contexts], batch_size, sampling_kwargs))
+        setattr(self, "_output_idx", call_idx + 1)
         if progress_callback is not None:
             progress_callback(len(outputs))
         return outputs
@@ -56,11 +169,35 @@ class _TypedFakeDebateEngine:
         return 11
 
     def generate_batch_results(self, contexts, batch_size=None, sampling_kwargs=None, progress_callback=None, model_role=None):
-        call_idx = len(self.calls)
+        special_outputs: list[InferenceResult] = []
+        for ctx in contexts:
+            prompt = str(ctx[-1].get("content", ""))
+            all_content = " ".join(str(msg.get("content", "")) for msg in ctx)
+            response = _fake_persona_response(prompt, all_content)
+            if response is None:
+                special_outputs = []
+                break
+            special_outputs.append(
+                InferenceResult(
+                    text=response,
+                    model_role=model_role,
+                    model_name=self.model_name,
+                    provider_name=self.provider_name,
+                )
+            )
+        if special_outputs:
+            output_idx = getattr(self, "_output_idx", 0)
+            if output_idx < len(self.outputs_by_call) and _is_special_output_batch(self.outputs_by_call[output_idx]):
+                setattr(self, "_output_idx", output_idx + 1)
+            if progress_callback is not None:
+                progress_callback(len(special_outputs))
+            return special_outputs
+        call_idx = getattr(self, "_output_idx", 0)
         assert call_idx < len(self.outputs_by_call), f"Unexpected extra engine call {call_idx}"
         outputs = self.outputs_by_call[call_idx]
         assert len(outputs) == len(contexts), (call_idx, len(outputs), len(contexts))
         self.calls.append(([[dict(msg) for msg in ctx] for ctx in contexts], batch_size, sampling_kwargs, model_role))
+        setattr(self, "_output_idx", call_idx + 1)
         if progress_callback is not None:
             progress_callback(len(outputs))
         return outputs
@@ -126,7 +263,7 @@ def test_run_debate_with_personas_shares_visible_full_peer_outputs(tmp_path: Pat
         persona_task_axis_count=1,
         persona_sampling_method="maximin",
         persona_judge_mode="task_family_generated",
-        persona_backend="heuristic",
+        persona_backend="llm",
         persona_save_artifacts=True,
         public_rationale_max_tokens=12,
     )
@@ -161,7 +298,7 @@ def test_run_debate_with_personas_shares_visible_full_peer_outputs(tmp_path: Pat
     assert len(row["answer_changes_per_agent"]) == 3
     assert row["agent_responses"][0][0]["role"] == "system"
 
-    second_round_contexts = engine.calls[2][0]
+    second_round_contexts = engine.calls[1][0]
     debate_prompt = second_round_contexts[0][-1]["content"]
     assert f"\\boxed{{{wrong_letter}}}" in debate_prompt
     assert "Public rationale:" not in debate_prompt
@@ -219,12 +356,12 @@ def test_peer_shared_output_contains_full_visible_response(tmp_path: Path):
         judge_block_size=1,
         use_personas=True,
         artifacts_dir=tmp_path / "artifacts",
-        persona_backend="heuristic",
+        persona_backend="llm",
         persona_save_artifacts=True,
     )
 
     row = results[1][0]
-    debate_prompt = engine.calls[2][0][0][-1]["content"]
+    debate_prompt = engine.calls[1][0][0][-1]["content"]
     assert "Reason two." in debate_prompt
 
 
@@ -278,18 +415,18 @@ def test_judge_context_includes_all_round_outputs(tmp_path: Path):
         batch_size=4,
         use_personas=True,
         artifacts_dir=tmp_path / "artifacts",
-        persona_backend="heuristic",
+        persona_backend="llm",
         persona_save_artifacts=True,
     )
 
     row = results[1][0]
-    judge_context = row["judge_trace"]["judge_context"][-1]["content"]
-    assert "Visible explanation one." in judge_context
-    assert "Visible explanation two." in judge_context
-    assert "Visible explanation one, round two." in judge_context
-    assert "Visible explanation two, round two." in judge_context
-    assert "ROUND 1" in judge_context
-    assert "ROUND 2" in judge_context
+    judge_body = row["judge_trace"]["judge_context"][-2]["content"]
+    assert "Visible explanation one." in judge_body
+    assert "Visible explanation two." in judge_body
+    assert "Visible explanation one, round two." in judge_body
+    assert "Visible explanation two, round two." in judge_body
+    assert "ROUND 1" in judge_body
+    assert "ROUND 2" in judge_body
 
 
 def test_benchmark_family_bank_shares_visible_outputs_and_gives_judge_thought_summaries(tmp_path: Path):
@@ -348,14 +485,14 @@ def test_benchmark_family_bank_shares_visible_outputs_and_gives_judge_thought_su
         batch_size=4,
         use_personas=True,
         artifacts_dir=tmp_path / "artifacts",
-        persona_backend="heuristic",
+        persona_backend="llm",
         persona_save_artifacts=True,
         persona_judge_mode="benchmark_family_bank",
         judge_trace_mode="visible_plus_thought_summary",
     )
 
     row = results[1][0]
-    debate_prompt = engine.calls[2][0][0][-1]["content"]
+    debate_prompt = engine.calls[1][0][0][-1]["content"]
     assert "Initial answer" in debate_prompt
     assert "Thought summary" not in debate_prompt
     assert row["judge_meta"]["judge_persona_mode"] == "benchmark_family_bank"
@@ -363,9 +500,9 @@ def test_benchmark_family_bank_shares_visible_outputs_and_gives_judge_thought_su
     assert row["judge_meta"]["judge_bank"]["judge_family_assignment"]["judge_family"] == "biology"
     assert Path(row["judge_meta"]["judge_bank"]["judge_bank_path"]).exists()
     assert row["agent_round_outputs"][0][0]["thought_summary"] == "I favored the biology mechanism."
-    judge_context = row["judge_trace"]["judge_context"][-1]["content"]
-    assert "Thought summary:" in judge_context
-    assert "I corrected my distractor mistake after comparing outputs." in judge_context
+    judge_body = row["judge_trace"]["judge_context"][-2]["content"]
+    assert "Thought summary:" in judge_body
+    assert "I corrected my distractor mistake after comparing outputs." in judge_body
 
 
 def test_visible_plus_thought_summary_mode_reaches_non_benchmark_judges(tmp_path: Path):
@@ -422,19 +559,19 @@ def test_visible_plus_thought_summary_mode_reaches_non_benchmark_judges(tmp_path
         judge_block_size=1,
         use_personas=True,
         artifacts_dir=tmp_path / "artifacts",
-        persona_backend="heuristic",
+        persona_backend="llm",
         persona_save_artifacts=True,
         judge_trace_mode="visible_plus_thought_summary",
     )
 
     row = results[1][0]
-    judge_context = row["judge_trace"]["judge_context"][-1]["content"]
+    judge_body = row["judge_trace"]["judge_context"][-2]["content"]
     assert row["judge_meta"]["judge_trace_mode"] == "visible_plus_thought_summary"
-    assert "Thought summary:" in judge_context
-    assert "Initial mechanism check." in judge_context
-    assert "No contradiction survived round two." in judge_context
-    assert "ROUND 1" in judge_context
-    assert "ROUND 2" in judge_context
+    assert "Thought summary:" in judge_body
+    assert "Initial mechanism check." in judge_body
+    assert "No contradiction survived round two." in judge_body
+    assert "ROUND 1" in judge_body
+    assert "ROUND 2" in judge_body
 
 
 def test_benchmark_family_bank_assistant_transcript_keeps_full_round_history(tmp_path: Path):
@@ -491,20 +628,20 @@ def test_benchmark_family_bank_assistant_transcript_keeps_full_round_history(tmp
         judge_block_size=1,
         use_personas=True,
         artifacts_dir=tmp_path / "artifacts",
-        persona_backend="heuristic",
+        persona_backend="llm",
         persona_save_artifacts=True,
         judge_trace_mode="assistant_transcript",
         persona_judge_mode="benchmark_family_bank",
     )
 
     row = results[1][0]
-    judge_context = row["judge_trace"]["judge_context"][-1]["content"]
+    judge_body = row["judge_trace"]["judge_context"][-2]["content"]
     assert row["judge_meta"]["judge_trace_mode"] == "assistant_transcript"
-    assert "ROUND 1" in judge_context
-    assert "ROUND 2" in judge_context
-    assert "Round one visible" in judge_context
-    assert "Round two visible" in judge_context
-    assert "Private first-round thinking" not in judge_context
+    assert "ROUND 1" in judge_body
+    assert "ROUND 2" in judge_body
+    assert "Round one visible" in judge_body
+    assert "Round two visible" in judge_body
+    assert "Private first-round thinking" not in judge_body
 
 
 def test_run_debate_with_personas_works_on_aime(tmp_path: Path):
@@ -549,7 +686,7 @@ def test_run_debate_with_personas_works_on_aime(tmp_path: Path):
         judge_block_size=1,
         use_personas=True,
         artifacts_dir=tmp_path / "artifacts",
-        persona_backend="heuristic",
+        persona_backend="llm",
         persona_save_artifacts=True,
     )
 
@@ -844,7 +981,7 @@ def test_run_debate_generated_judge_card_without_personas(tmp_path: Path):
         judge_rounds=[0],
         batch_size=4,
         persona_judge_mode="task_family_generated",
-        persona_backend="heuristic",
+        persona_backend="llm",
         enable_runtime_judge_persona=True,
         gpqa_family_cache_path=tmp_path / "gpqa_family_cache.json",
     )
@@ -921,3 +1058,5 @@ def test_run_debate_requires_full_judge_transcript_when_context_is_too_long(tmp_
     assert row["final_judge_answer"] == gt_letter
     assert row["judge_trace"]["judge_context_is_full_transcript"] is False
     assert row["judge_trace"]["judge_context_start_round"] == 2
+
+

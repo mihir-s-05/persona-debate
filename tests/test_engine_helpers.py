@@ -86,3 +86,4 @@ def test_create_inference_engine_rejects_non_gemini_models():
         create_inference_engine(
             model_name="Qwen/Qwen3-8B",
         )
+

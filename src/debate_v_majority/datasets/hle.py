@@ -18,6 +18,7 @@ HLE_SCORER_PROVENANCE = "hle_verified.scorer.v1"
 HLE_EXTRACTOR_PROVENANCE = "hle_verified.extractor.v1"
 
 HLEVariant = Literal["verified", "revised", "verified_full"]
+HLEModality = Literal["any", "text_only", "image_only"]
 HLEAnswerFormat = Literal["multiple_choice", "numeric_exact", "freeform_exact"]
 HLE_IMAGE_KEYS = ("image", "image_preview", "rationale_image")
 
@@ -109,7 +110,7 @@ def inflate_record(sample: dict[str, Any]) -> dict[str, Any]:
 def _extract_choice_map(question: str) -> dict[str, str]:
     choice_map: dict[str, str] = {}
     for line in str(question or "").splitlines():
-        m = re.match(r"^\s*([A-Z])(?:[.)]|:)\s*(.+?)\s*$", line)
+        m = re.match(r"^\s*(?:\\item\s+|[-*]\s+|•\s+)?([A-Z])(?:[.)]|:)\s*(.+?)\s*$", line)
         if not m:
             continue
         label = m.group(1).upper()
@@ -234,6 +235,10 @@ def _image_part_specs(task_info: dict[str, Any]) -> list[dict[str, str]]:
     return specs
 
 
+def has_images(task_info: dict[str, Any]) -> bool:
+    return bool(_image_part_specs(prepare_task(task_info)))
+
+
 def _image_part_specs_with_fallback(task_info: dict[str, Any]) -> list[dict[str, str]]:
     specs: list[dict[str, str]] = []
     for spec in _image_part_specs(task_info):
@@ -268,6 +273,16 @@ def _build_prompt_text(*, raw_task: dict[str, Any], attach_images: bool) -> tupl
     else:
         question_block = f"{question_text}{_render_image_note(raw_task)}\n\n{answer_rule}"
     return AGENT_PROMPT["question"].format(question=question_block), gt
+
+
+def build_judge_question(raw_task: dict[str, Any]) -> str:
+    """Return the raw question text for the judge, without agent solving instructions."""
+    task = prepare_task(raw_task)
+    question_text = str(task.get("question") or "").strip()
+    if not question_text:
+        raise KeyError("HLE record missing question")
+    answer_rule, _ = _answer_rule_and_gt(task, question_text=question_text)
+    return f"{question_text}{_render_image_note(task)}\n\n{answer_rule}"
 
 
 def build_initial_message(task_info: dict[str, Any], *, attach_images: bool = True) -> dict[str, Any]:
@@ -355,12 +370,18 @@ def normalize_freeform_exact_answer(value: str | None) -> str | None:
     s = unicodedata.normalize("NFKC", str(value))
     s = s.replace("\\n", "\n")
     s = re.sub(r"\\(?:text|mathrm|mathbf)\s*{([^{}]+)}", r"\1", s)
+    s = re.sub(r"\s+(?=\\[a-zA-Z])", "", s)
     s = normalize_freeform_string(s)
     if s is None:
         return None
     s = re.sub(r"^(?:the|a|an)\s+", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s or None
+
+
+def _strip_markdown_bold_markers(text: str) -> str:
+    """Remove inline markdown bold wrappers so cue regexes can see the underlying keyword."""
+    return "\n".join(re.sub(r"\*\*([^*]+)\*\*", r"\1", line) for line in str(text).splitlines())
 
 
 def _iter_candidate_strings(value: Any) -> Iterable[str]:
@@ -469,6 +490,7 @@ def _extract_multiple_choice_candidate(text: str, task_info: dict[str, Any], *, 
         normalized = normalize_multiple_choice_answer(boxed, task_info)
         if normalized is not None:
             return normalized
+    stripped = _strip_markdown_bold_markers(stripped)
 
     labels = sorted(set(task_info.get("choice_labels") or task_info.get("choice_map", {}).keys()))
     if not labels:
@@ -476,7 +498,7 @@ def _extract_multiple_choice_candidate(text: str, task_info: dict[str, Any], *, 
     label_class = "".join(re.escape(label) for label in labels)
 
     cue_pat = re.compile(
-        r"(?im)^\s*(?:final\s+answer|answer|final\s+choice|choice|option)\b\s*[:=-]?\s*(.+?)\s*$"
+        r"(?im)^\s*(?:winning\s+answer|final\s+answer|answer|final\s+choice|choice|option|qed)\b(?:\s*(?:=+>|:|=|-)\s*|\s+)(.+?)\s*$"
     )
     last_label = None
     for m in cue_pat.finditer(stripped):
@@ -488,7 +510,7 @@ def _extract_multiple_choice_candidate(text: str, task_info: dict[str, Any], *, 
         return last_label
 
     inline_label_pat = re.compile(
-        rf"(?i)\b(?:final\s+answer|answer|final\s+choice|choice|option)\b[^{label_class}]{{0,40}}\(?\s*([{label_class}])\s*\)?\b"
+        rf"(?i)\b(?:winning\s+answer|final\s+answer|answer|final\s+choice|choice|option)\b[^{label_class}]{{0,40}}\(?\s*([{label_class}])\s*\)?\b"
     )
     for m in inline_label_pat.finditer(stripped):
         label = normalize_multiple_choice_answer(m.group(1), task_info)
@@ -518,9 +540,10 @@ def _extract_exact_candidate(text: str, *, strict: bool, recover: bool) -> str |
     boxed = parse_math(stripped)
     if boxed is not None:
         return boxed.strip() or None
+    stripped = _strip_markdown_bold_markers(stripped)
 
     cue_pat = re.compile(
-        r"(?im)^\s*(?:final\s+answer|answer|final)\b(?:\s*(?::|=|-)\s*|\s+is\s+|\s+)(.+?)\s*$"
+        r"(?im)^\s*(?:winning\s+answer|final\s+answer|answer|final|qed)\b(?:\s*(?:=+>|:|=|-)\s*|\s+is\s+|\s+)(.+?)\s*$"
     )
     last_candidate = None
     for m in cue_pat.finditer(stripped):
@@ -540,9 +563,11 @@ def _extract_exact_candidate(text: str, *, strict: bool, recover: bool) -> str |
         return None
     if recover:
         for line in reversed(lines[-12:]):
-            if len(line) <= 256:
+            if len(line) <= 256 and not re.match(r"(?i)^\s*confidence\s*[:=]", line):
                 return line
     last = lines[-1]
+    if re.match(r"(?i)^\s*confidence\s*[:=]", last):
+        return None
     return last if len(last) <= 256 else None
 
 

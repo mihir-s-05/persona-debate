@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from typing import Any, cast
@@ -180,104 +179,39 @@ def _default_token_ledger_path() -> Path:
     return Path("out") / "token_ledger.jsonl"
 
 
-def _gemini_explicit_cache_ttl_seconds() -> int:
-    raw_value = os.environ.get("GEMINI_EXPLICIT_CACHE_TTL_SECONDS", "3600")
-    try:
-        ttl_seconds = int(raw_value)
-    except (TypeError, ValueError):
-        ttl_seconds = 3600
-    return max(60, ttl_seconds)
-
-
-def _build_gemini_debate_cache_context(
-    *,
-    messages: list[dict[str, str]],
-    dataset: str,
-    item_uid: str,
-    agent_idx: int,
-    round_idx: int,
-    persona_id: str | None = None,
-) -> list[dict[str, str]]:
-    return _build_gemini_explicit_cache_context(
-        messages=messages,
-        prefix_count=max(0, len(messages) - 1),
-        display_name_parts=[
-            "debate",
-            str(dataset),
-            str(item_uid),
-            *( [str(persona_id)] if persona_id else [] ),
-            f"agent{agent_idx}",
-            f"round{round_idx + 1}",
-        ],
-        cache_scope="debate_round_prefix",
-    )
-
-
-def _build_gemini_explicit_cache_context(
-    *,
-    messages: list[dict[str, str]],
-    prefix_count: int,
-    display_name_parts: list[str],
-    cache_scope: str,
-) -> list[dict[str, str]]:
-    if len(messages) < 2:
-        return messages
-    if prefix_count <= 0:
-        return messages
-    normalized_prefix_count = max(0, min(int(prefix_count), len(messages)))
-    if normalized_prefix_count <= 0:
-        return messages
-    return [
-        {
-            "role": "cache_control",
-            "content": "",
-            "cache_prefix_message_count": str(normalized_prefix_count),
-            "cache_display_name": "-".join(str(part) for part in display_name_parts if str(part).strip()),
-            "cache_ttl_seconds": str(_gemini_explicit_cache_ttl_seconds()),
-            "cache_scope": str(cache_scope),
-        },
-        *messages,
-    ]
-
-
-def _build_gemini_judge_cache_context(
-    *,
-    messages: list[dict[str, str]],
-    dataset: str,
-    item_uid: str,
-    round_idx: int,
-    phase: str,
-) -> list[dict[str, str]]:
-    prefix_count = len(messages) - (1 if phase == "raw" else 2)
-    return _build_gemini_explicit_cache_context(
-        messages=messages,
-        prefix_count=prefix_count,
-        display_name_parts=[
-            "judge",
-            str(dataset),
-            str(item_uid),
-            f"round{round_idx + 1}",
-            str(phase),
-        ],
-        cache_scope="judge_round_prefix",
-    )
-
-
-def _persona_summaries(artifact: PersonaArtifact | None) -> list[dict[str, Any]] | None:
+def _persona_summaries(artifact: PersonaArtifact | None, *, n_agents: int | None = None) -> list[dict[str, Any] | None] | None:
     if artifact is None:
         return None
-    return [
-        {
-            "persona_id": card.persona_id,
-            "title": card.title,
-            "core_reasoning_strategy": card.core_reasoning_strategy,
-            "short_rule": next(
-                (descriptor.short_rule for descriptor in artifact.descriptors if descriptor.persona_id == card.persona_id),
-                None,
-            ),
-        }
-        for card in artifact.cards
-    ]
+    if artifact.slot_layout is None:
+        return [
+            {
+                "persona_id": card.persona_id,
+                "title": card.title,
+                "core_reasoning_strategy": card.core_reasoning_strategy,
+                "short_rule": next(
+                    (descriptor.short_rule for descriptor in artifact.descriptors if descriptor.persona_id == card.persona_id),
+                    None,
+                ),
+            }
+            for card in artifact.cards
+        ]
+    total = n_agents if n_agents is not None else artifact.n_total_agents
+    summaries: list[dict[str, Any] | None] = []
+    for agent_idx in range(total):
+        card = artifact.card_for_agent(agent_idx)
+        if card is None:
+            summaries.append(None)
+        else:
+            summaries.append({
+                "persona_id": card.persona_id,
+                "title": card.title,
+                "core_reasoning_strategy": card.core_reasoning_strategy,
+                "short_rule": next(
+                    (descriptor.short_rule for descriptor in artifact.descriptors if descriptor.persona_id == card.persona_id),
+                    None,
+                ),
+            })
+    return summaries
 
 
 def _judge_summary_from_card(card: Any | None) -> dict[str, Any] | None:
@@ -300,14 +234,10 @@ def _judge_summary(artifact: PersonaArtifact | None) -> dict[str, Any] | None:
 
 
 __all__ = [
-    "_build_gemini_debate_cache_context",
-    "_build_gemini_explicit_cache_context",
-    "_build_gemini_judge_cache_context",
     "_create_role_engine",
     "_default_judge_max_tokens",
     "_default_token_ledger_path",
     "_engine_backend_name",
-    "_gemini_explicit_cache_ttl_seconds",
     "_inference_result_meta",
     "_judge_summary",
     "_judge_summary_from_card",

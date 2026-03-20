@@ -22,7 +22,14 @@ def path_setting(path: Path | None) -> str | None:
 
 
 def subset_item_resume_signature(item: Any) -> dict[str, Any]:
-    data = asdict(item) if is_dataclass(item) else dict(item)
+    if is_dataclass(item):
+        data = asdict(item)
+    elif isinstance(item, dict):
+        data = dict(item)
+    elif hasattr(item, "__dict__"):
+        data = dict(vars(item))
+    else:
+        data = dict(item)
     return {
         "subset_id": data.get("subset_id"),
         "orig_id": data.get("orig_id"),
@@ -127,6 +134,12 @@ def _trace_file_path(path: Path, entry: StageEntry) -> Path:
     )
 
 
+def _trace_file_glob(path: Path, entry: StageEntry) -> str:
+    stage_type = _sanitize_filename_part(entry.stage_type)
+    completed_stage = _sanitize_filename_part(entry.completed_stage)
+    return f"{path.stem}.trace.{stage_type}.{completed_stage}.v2.*.md"
+
+
 def _format_multiline_block(text: str) -> str:
     stripped = str(text or "").strip()
     if not stripped:
@@ -227,11 +240,25 @@ def _render_debate_stage(entry: StageEntry) -> list[str]:
     persona_titles: list[str] = []
     persona_artifacts = list(debate_data.get("persona_artifacts") or [])
     if persona_artifacts:
-        cards = list((persona_artifacts[0] or {}).get("cards") or [])
-        persona_titles = [
-            str(card.get("title") or card.get("persona_id") or f"agent_{idx}")
-            for idx, card in enumerate(cards)
-        ]
+        first_artifact = persona_artifacts[0] or {}
+        slot_layout = first_artifact.get("slot_layout")
+        cards = list(first_artifact.get("cards") or [])
+        if slot_layout:
+            card_iter = iter(cards)
+            for slot_idx, slot_type in enumerate(slot_layout):
+                if slot_type == "plain":
+                    persona_titles.append(f"agent_{slot_idx + 1} (Plain)")
+                else:
+                    card = next(card_iter, None)
+                    persona_titles.append(
+                        str(card.get("title") or card.get("persona_id") or f"agent_{slot_idx + 1}")
+                        if card else f"agent_{slot_idx + 1}"
+                    )
+        else:
+            persona_titles = [
+                str(card.get("title") or card.get("persona_id") or f"agent_{idx}")
+                for idx, card in enumerate(cards)
+            ]
 
     stage_name = str(entry.completed_stage)
     if stage_name.endswith("_judge"):
@@ -320,6 +347,13 @@ def _format_stage_trace(entry: StageEntry) -> str:
 def _write_stage_trace(*, path: Path, entry: StageEntry) -> Path:
     trace_path = _trace_file_path(path, entry)
     trace_path.write_text(_format_stage_trace(entry), encoding="utf-8")
+    for old_trace in path.parent.glob(_trace_file_glob(path, entry)):
+        if old_trace == trace_path:
+            continue
+        try:
+            old_trace.unlink()
+        except FileNotFoundError:
+            continue
     return trace_path
 
 

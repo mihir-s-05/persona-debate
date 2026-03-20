@@ -95,6 +95,15 @@ def method_label_from_row(row: dict[str, Any] | None, *, mode: str) -> str:
             return "standalone_sampling_majority"
         return "standalone_majority"
     if mode == "debate":
+        strategy = row.get("strategy") if isinstance(row.get("strategy"), dict) else {}
+        persona_meta = row.get("persona_meta") if isinstance(row.get("persona_meta"), dict) else {}
+        n_plain = (
+            strategy.get("persona_plain_agents")
+            or persona_meta.get("n_plain_agents")
+            or 0
+        )
+        if int(n_plain) > 0:
+            return "debate_judge_mixed"
         return "debate_judge"
     return mode
 

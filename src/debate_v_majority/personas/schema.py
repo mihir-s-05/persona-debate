@@ -143,6 +143,14 @@ class JudgeCard:
         )
 
 
+SlotMode = Literal["persona", "plain"]
+
+
+def build_slot_layout(*, n_agents: int, n_plain_agents: int) -> list[SlotMode]:
+    """Build a slot layout placing plain agents first, then persona agents."""
+    return (["plain"] * n_plain_agents) + (["persona"] * (n_agents - n_plain_agents))
+
+
 @dataclass(frozen=True)
 class PersonaArtifact:
     artifact_version: str
@@ -162,12 +170,58 @@ class PersonaArtifact:
     created_at: str
     generation_settings: dict[str, Any] = field(default_factory=dict)
     validator_metadata: dict[str, Any] = field(default_factory=dict)
+    slot_layout: list[SlotMode] | None = None
+
+    def card_for_agent(self, agent_idx: int) -> PersonaCard | None:
+        """Return the persona card assigned to *agent_idx*, or ``None`` for
+        plain slots / out-of-range indices."""
+        if self.slot_layout is None:
+            if agent_idx < len(self.cards):
+                return self.cards[agent_idx]
+            return None
+        if agent_idx >= len(self.slot_layout):
+            return None
+        if self.slot_layout[agent_idx] != "persona":
+            return None
+        card_idx = sum(1 for i in range(agent_idx) if self.slot_layout[i] == "persona")
+        if card_idx < len(self.cards):
+            return self.cards[card_idx]
+        return None
+
+    @property
+    def n_plain_agents(self) -> int:
+        if self.slot_layout is None:
+            return 0
+        return sum(1 for s in self.slot_layout if s == "plain")
+
+    @property
+    def n_total_agents(self) -> int:
+        if self.slot_layout is None:
+            return len(self.cards)
+        return len(self.slot_layout)
+
+    def persona_agent_indices(self) -> list[int]:
+        if self.slot_layout is None:
+            return list(range(len(self.cards)))
+        return [i for i, s in enumerate(self.slot_layout) if s == "persona"]
+
+    def plain_agent_indices(self) -> list[int]:
+        if self.slot_layout is None:
+            return []
+        return [i for i, s in enumerate(self.slot_layout) if s == "plain"]
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        if self.slot_layout is None:
+            data.pop("slot_layout", None)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PersonaArtifact":
+        raw_layout = data.get("slot_layout")
+        slot_layout: list[SlotMode] | None = None
+        if isinstance(raw_layout, list) and raw_layout:
+            slot_layout = [str(s) for s in raw_layout]  # type: ignore[misc]
         return cls(
             artifact_version=str(data["artifact_version"]),
             dataset=str(data["dataset"]),
@@ -189,6 +243,7 @@ class PersonaArtifact:
             created_at=str(data["created_at"]),
             generation_settings=dict(data.get("generation_settings") or {}),
             validator_metadata=dict(data.get("validator_metadata") or {}),
+            slot_layout=slot_layout,
         )
 
 
@@ -214,7 +269,7 @@ class JudgeBankArtifact:
             dataset=str(data["dataset"]),
             judge_family=str(data["judge_family"]),
             generator_model=data.get("generator_model"),
-            backend=str(data.get("backend") or "heuristic"),
+            backend=str(data.get("backend") or "llm"),
             prompt_versions={str(k): str(v) for k, v in (data.get("prompt_versions") or {}).items()},
             created_at=str(data["created_at"]),
             judge_card=JudgeCard.from_dict(data["judge_card"]),
@@ -245,5 +300,6 @@ class PersonaGenerationConfig:
     generator_model: str | None = None
     judge_generator_model: str | None = None
     judge_persona_mode: JudgePersonaMode = "task_family_generated"
-    backend: Literal["heuristic", "llm", "auto"] = "auto"
+    backend: Literal["llm"] = "llm"
     axes_file: Path | None = None
+    n_plain_agents: int = 0

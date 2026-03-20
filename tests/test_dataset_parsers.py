@@ -58,6 +58,28 @@ def test_hle_parse_question_answer_multiple_choice_normalizes_answer_text():
     assert raw["domain_family"] == "physical_sciences"
 
 
+def test_hle_parse_question_answer_supports_latex_itemized_choices():
+    sample = {
+        "id": "hle-mcq-itemized-1",
+        "question": (
+            "Consider the options.\n\n"
+            "\\begin{itemize}\n"
+            "  \\item A. red\n"
+            "  \\item B. blue\n"
+            "  \\item C. green\n"
+            "\\end{itemize}"
+        ),
+        "answer": "B",
+        "answer_type": "multipleChoice",
+        "category": "physics",
+        "Verified_Classes": "Gold subset",
+    }
+    prompt, gt, raw = hle.parse_question_answer(sample)
+    assert "\\boxed{A}" in prompt
+    assert gt == "B"
+    assert raw["choice_map"] == {"A": "red", "B": "blue", "C": "green"}
+
+
 def test_hle_extract_response_parses_confidence_and_choice_label():
     task = {
         "id": "hle-mcq-2",
@@ -72,6 +94,36 @@ def test_hle_extract_response_parses_confidence_and_choice_label():
     assert extraction["parse_success"] is True
     assert extraction["normalized_confidence"] == 0.73
     assert extraction["confidence_parse_failed"] is False
+
+
+def test_hle_extract_response_strips_markdown_bold_cues_for_multiple_choice_text_answers():
+    task = {
+        "id": "hle-mcq-3",
+        "question": "Which option is correct?\nA) red\nB) blue\nC) green",
+        "answer": "B",
+        "answer_type": "multipleChoice",
+        "category": "physics",
+        "Verified_Classes": "Gold subset",
+    }
+    extraction = hle.extract_response("Reasoning.\n**Final Answer**: blue", task)
+    assert extraction["candidate_answer"] == "B"
+    assert extraction["normalized_answer"] == "B"
+    assert extraction["parse_success"] is True
+
+
+def test_hle_extract_response_accepts_qed_arrow_for_multiple_choice():
+    task = {
+        "id": "hle-mcq-4",
+        "question": "Which option is correct?\nA) red\nB) blue\nC) green",
+        "answer": "B",
+        "answer_type": "multipleChoice",
+        "category": "physics",
+        "Verified_Classes": "Gold subset",
+    }
+    extraction = hle.extract_response("Reasoning.\nQED ==> B", task)
+    assert extraction["candidate_answer"] == "B"
+    assert extraction["normalized_answer"] == "B"
+    assert extraction["parse_success"] is True
 
 
 def test_hle_infer_domain_family_uses_judge_bank_family_names():
@@ -110,6 +162,52 @@ def test_hle_freeform_exact_normalizes_text_commands():
     scoring = hle.score_answer(extraction["normalized_answer"], task)
     assert extraction["normalized_answer"] == "bayes theorem"
     assert scoring["match_type"] == "freeform_verified_rule_set"
+    assert scoring["correct"] == 1
+
+
+def test_hle_numeric_exact_strips_markdown_bold_cues_before_fallback_capture():
+    task = {
+        "id": "hle-num-2",
+        "question": "Compute the value.",
+        "answer": "42",
+        "answer_type": "exactMatch",
+        "category": "math",
+        "Verified_Classes": "Gold subset",
+    }
+    extraction = hle.extract_response("Reasoning.\n**Final Answer**: 42", task)
+    assert extraction["candidate_answer"] == "42"
+    assert extraction["normalized_answer"] == "42"
+    assert extraction["parse_success"] is True
+
+
+def test_hle_numeric_exact_accepts_qed_arrow():
+    task = {
+        "id": "hle-num-3",
+        "question": "Compute the value.",
+        "answer": "42",
+        "answer_type": "exactMatch",
+        "category": "math",
+        "Verified_Classes": "Gold subset",
+    }
+    extraction = hle.extract_response("Reasoning.\nQED ==> 42", task)
+    scoring = hle.score_answer(extraction["normalized_answer"], task)
+    assert extraction["candidate_answer"] == "42"
+    assert extraction["normalized_answer"] == "42"
+    assert scoring["correct"] == 1
+
+
+def test_hle_freeform_exact_normalizes_spacing_before_latex_commands():
+    task = {
+        "id": "hle-free-3",
+        "question": "State the exact expression.",
+        "answer": "\\frac{2 \\sqrt{3}}{\\pi}",
+        "answer_type": "exactMatch",
+        "category": "math",
+        "Verified_Classes": "Gold subset",
+    }
+    scoring = hle.score_answer("\\frac{2\\sqrt{3}}{\\pi}", task)
+    assert scoring["predicted_answer"] == "\\frac{2\\sqrt{3}}{\\pi}"
+    assert scoring["expected_answer"] == "\\frac{2\\sqrt{3}}{\\pi}"
     assert scoring["correct"] == 1
 
 
@@ -155,3 +253,4 @@ def test_gpqa_strict_judge_parse_requires_boxed_choice():
     }
     assert strict_judge_parse_answer("gpqa", "Final answer: B", raw_task) is None
     assert strict_judge_parse_answer("gpqa", "\\boxed{B}", raw_task) == "B"
+

@@ -14,6 +14,81 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
             handle.write(json.dumps(row) + "\n")
 
 
+def _fake_persona_response(prompt: str, all_content: str) -> str | None:
+    text = f"{prompt}\n{all_content}".lower()
+    if "you generate reasoning-diversity axes" in text or "propose reasoning-relevant axes" in text:
+        return json.dumps(
+            {
+                "axes": [
+                    {
+                        "axis_id": "verification_style",
+                        "name": "Verification Style",
+                        "low_desc": "Validate cautiously before committing.",
+                        "high_desc": "Advance quickly, then verify later.",
+                        "notes": "Keep the axis answer-agnostic.",
+                    }
+                ]
+            }
+        )
+    if "generate the full persona population jointly" in text:
+        return json.dumps(
+            {
+                "descriptors": [
+                    {
+                        "persona_id": "persona_1",
+                        "name": "Verifier",
+                        "axis_interpretation": {"verification_style": "steady"},
+                        "short_rule": "check details",
+                        "reasoning_summary": "verify claims carefully",
+                    },
+                    {
+                        "persona_id": "persona_2",
+                        "name": "Challenger",
+                        "axis_interpretation": {"verification_style": "skeptical"},
+                        "short_rule": "probe weaknesses",
+                        "reasoning_summary": "stress test arguments",
+                    },
+                ]
+            }
+        )
+    if "expand each descriptor into a compact" in text:
+        persona_id = "persona_1" if "persona_1" in text else "persona_2"
+        return json.dumps(
+            {
+                "persona_id": persona_id,
+                "title": f"Card {persona_id}",
+                "core_reasoning_strategy": f"strategy {persona_id}",
+                "priorities": ["track support"],
+                "distrusts": ["unsupported jumps"],
+                "decomposition_style": "stepwise",
+                "revision_policy": "revise on evidence",
+                "confidence_policy": "explicit",
+                "failure_mode_to_avoid": "answer leakage",
+                "system_prompt": f"System prompt for {persona_id}.",
+            }
+        )
+    if "generate a constrained judge card" in text:
+        return json.dumps(
+            {
+                "judge_id": "judge_physical_sciences",
+                "judge_family": "physical_sciences",
+                "domain_scope": "physical_sciences",
+                "evaluation_priorities": ["score transcript support"],
+                "tie_break_policy": "prefer explicit support",
+                "independent_resolve_policy": "limited_check_only",
+                "answer_format_policy": "strict",
+                "confidence_policy": "optional",
+                "system_prompt": "Judge prompt",
+            }
+        )
+    return None
+
+
+def _is_special_output_batch(outputs: list[object]) -> bool:
+    markers = ('"judge_family"', '"judge_id"', '"descriptors"', '"axes"', '"persona_id"')
+    return bool(outputs) and all(any(marker in str(output or "") for marker in markers) for output in outputs)
+
+
 class _FakeDebateEngine:
     def __init__(self, outputs_by_call: list[list[str]], *, model_name: str = "fake-hle-model") -> None:
         self.outputs_by_call = outputs_by_call
@@ -24,10 +99,26 @@ class _FakeDebateEngine:
         return sum(len(str(message.get("content") or "")) for message in messages) + len(messages)
 
     def generate_batch(self, contexts, batch_size=None, sampling_kwargs=None, progress_callback=None):
-        call_idx = getattr(self, "_call_idx", 0)
+        special_outputs: list[str] = []
+        for context in contexts:
+            prompt = str(context[-1].get("content", ""))
+            all_content = " ".join(str(message.get("content", "")) for message in context)
+            response = _fake_persona_response(prompt, all_content)
+            if response is None:
+                special_outputs = []
+                break
+            special_outputs.append(response)
+        if special_outputs:
+            output_idx = getattr(self, "_output_idx", 0)
+            if output_idx < len(self.outputs_by_call) and _is_special_output_batch(self.outputs_by_call[output_idx]):
+                setattr(self, "_output_idx", output_idx + 1)
+            if progress_callback is not None:
+                progress_callback(len(special_outputs))
+            return special_outputs
+        call_idx = getattr(self, "_output_idx", 0)
         outputs = self.outputs_by_call[call_idx]
         assert len(outputs) == len(contexts)
-        setattr(self, "_call_idx", call_idx + 1)
+        setattr(self, "_output_idx", call_idx + 1)
         self.calls.append([[dict(message) for message in context] for context in contexts])
         if progress_callback is not None:
             progress_callback(len(outputs))
@@ -88,7 +179,7 @@ def test_run_debate_hle_emits_phase4_metadata_and_audit_traces(tmp_path: Path):
         judge_block_size=1,
         use_personas=True,
         artifacts_dir=tmp_path / "artifacts",
-        persona_backend="heuristic",
+        persona_backend="llm",
         persona_save_artifacts=True,
     )
 
@@ -171,7 +262,7 @@ def test_run_debate_hle_retry_keeps_primary_judge_trace_aligned_with_final_answe
         judge_block_size=1,
         use_personas=True,
         artifacts_dir=tmp_path / "artifacts",
-        persona_backend="heuristic",
+        persona_backend="llm",
         persona_save_artifacts=True,
     )
     row = results[0][0]
@@ -239,7 +330,7 @@ def test_run_debate_hle_multi_round_uses_chat_message_shape_for_debate_sharing(t
         judge_block_size=1,
         use_personas=True,
         artifacts_dir=tmp_path / "artifacts",
-        persona_backend="heuristic",
+        persona_backend="llm",
         persona_save_artifacts=True,
     )
 
@@ -249,3 +340,5 @@ def test_run_debate_hle_multi_round_uses_chat_message_shape_for_debate_sharing(t
     assert round2_context[-1]["role"] == "user"
     assert "These are the prior-round outputs from other agents:" in round2_context[-1]["content"]
     assert "Agent 1:" in round2_context[-1]["content"]
+
+

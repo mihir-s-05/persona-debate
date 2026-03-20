@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import importlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -41,6 +42,12 @@ class ModuleDatasetAdapter(DatasetAdapter):
 
     def parse_question_answer(self, sample: dict[str, Any]) -> tuple[str, Any, dict[str, Any]]:
         return cast(tuple[str, Any, dict[str, Any]], self.module.parse_question_answer(sample))
+
+    def build_judge_question(self, raw_task: dict[str, Any]) -> str | None:
+        fn = getattr(self.module, "build_judge_question", None)
+        if fn is None:
+            return None
+        return fn(raw_task)
 
     def render_prompt(self, raw_task: dict[str, Any]) -> tuple[str, Any, dict[str, Any]]:
         return self.parse_question_answer(raw_task)
@@ -98,9 +105,15 @@ class ModuleDatasetAdapter(DatasetAdapter):
             _write_jsonl(out_path, (dict(ex) for ex in ds))
             return
         if self.dataset_name == "hle":
+            resolved_split = _resolve_hle_source_split(
+                datasets_module=datasets,
+                dataset_id=cast(str, self.entry.source_dataset_id),
+                configured_split=self.entry.source_dataset_split,
+                revision=self.entry.source_dataset_revision,
+            )
             ds = datasets.load_dataset(
                 self.entry.source_dataset_id,
-                split=self.entry.source_dataset_split,
+                split=resolved_split,
                 revision=self.entry.source_dataset_revision,
             )
             allowed = self.module.allowed_subset_labels(str(variant or "verified"))
@@ -114,7 +127,7 @@ class ModuleDatasetAdapter(DatasetAdapter):
                 raw_row["source_subset_label"] = subset_label
                 raw_row["source_dataset_id"] = self.entry.source_dataset_id
                 raw_row["source_dataset_config"] = self.entry.source_dataset_config
-                raw_row["source_dataset_split"] = self.entry.source_dataset_split
+                raw_row["source_dataset_split"] = resolved_split
                 raw_row["source_dataset_revision"] = self.entry.source_dataset_revision
                 raw_row["source_paper_version"] = self.module.HLE_PAPER_VERSION
                 rows.append(raw_row)
@@ -160,11 +173,64 @@ class ModuleDatasetAdapter(DatasetAdapter):
         meta.setdefault("source_dataset_config", self.entry.source_dataset_config)
         meta.setdefault("source_dataset_split", self.entry.source_dataset_split)
         meta.setdefault("source_dataset_revision", self.entry.source_dataset_revision)
+        if self.dataset_name == "hle":
+            first_row = _read_first_jsonl_row(path)
+            if first_row is not None and first_row.get("source_dataset_split") is not None:
+                meta["source_dataset_split"] = str(first_row.get("source_dataset_split"))
         return super().load_items(path, registry_meta=meta)
 
 
 _REGISTRY_CACHE: dict[str, DatasetRegistryEntry] | None = None
 _ADAPTER_CACHE: dict[str, ModuleDatasetAdapter] = {}
+
+
+def _read_first_jsonl_row(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                return cast(dict[str, Any], json.loads(line))
+    return None
+
+
+def _resolve_hle_source_split(
+    *,
+    datasets_module: Any,
+    dataset_id: str,
+    configured_split: str | None,
+    revision: str | None,
+) -> str:
+    preferred = "test"
+    available: list[str] | None = None
+
+    split_names_fn = getattr(datasets_module, "get_dataset_split_names", None)
+    if callable(split_names_fn):
+        try:
+            available = [str(name) for name in split_names_fn(dataset_id, revision=revision)]
+        except Exception:
+            available = None
+
+    if available is None:
+        builder_fn = getattr(datasets_module, "load_dataset_builder", None)
+        if callable(builder_fn):
+            try:
+                builder = builder_fn(dataset_id, revision=revision)
+                available = [str(name) for name in getattr(getattr(builder, "info", None), "splits", {}).keys()]
+            except Exception:
+                available = None
+
+    if available:
+        if preferred in available:
+            return preferred
+        if configured_split and configured_split in available:
+            return str(configured_split)
+        if "train" in available:
+            return "train"
+        return str(available[0])
+
+    return str(configured_split or preferred)
 
 
 def _registry_path() -> Path:

@@ -22,6 +22,9 @@ from .response_parsing import _extract_output_details
 from .subset import SubsetItem
 
 
+SINGLE_DEFAULT_MAX_OUTPUT_TOKENS = 32768
+
+
 def run_sampled(
     *,
     dataset: DatasetName,
@@ -54,6 +57,9 @@ def run_sampled(
     if use_personas and artifacts_dir is None:
         raise ValueError("artifacts_dir is required when use_personas=True")
 
+    effective_persona_generator_engine = persona_generator_engine or (engine if use_personas else None)
+    effective_persona_judge_engine = persona_judge_engine or effective_persona_generator_engine
+
     model_name = getattr(engine, "model_name", None)
     model_backend = _engine_backend_name(engine)
     parsed_inputs: list[tuple[SubsetItem, str, Any, dict[str, Any], PersonaArtifact | None, Path | None]] = []
@@ -85,8 +91,8 @@ def run_sampled(
                 backend=persona_backend,
                 generator_model=generator_model,
                 judge_generator_model=judge_generator_model,
-                generator_engine=persona_generator_engine,
-                judge_engine=persona_judge_engine,
+                generator_engine=effective_persona_generator_engine,
+                judge_engine=effective_persona_judge_engine,
                 axes_file=persona_axes_file,
                 judge_bank_dir=judge_bank_dir,
                 judge_bank_refresh=judge_bank_refresh,
@@ -110,10 +116,14 @@ def run_sampled(
             contexts_flat.append(ctx)
 
     pbar = tqdm(total=len(contexts_flat), desc=mode_label, unit="call", file=progress_file)
+    sampling_kwargs: dict[str, Any] | None = None
+    if mode_label == "single":
+        sampling_kwargs = {"max_tokens": SINGLE_DEFAULT_MAX_OUTPUT_TOKENS}
     inference_results_flat = ensure_inference_results(
         engine,
         contexts_flat,
         batch_size=batch_size,
+        sampling_kwargs=sampling_kwargs,
         progress_callback=pbar.update,
         model_role="debater",
     )

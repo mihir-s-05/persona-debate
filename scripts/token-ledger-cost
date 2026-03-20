@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+#!/usr/bin/env python3
 import sys
 from pathlib import Path
 
@@ -8,3 +7,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from debate_v_majority.tools.token_ledger_cost import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

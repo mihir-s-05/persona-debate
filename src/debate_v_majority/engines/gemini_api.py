@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import concurrent.futures
-import hashlib
 import json
 import mimetypes
 import os
-import threading
+import random
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -19,8 +19,6 @@ from .engine_impl import GEMINI_3_FLASH_MODEL, normalize_gemini_model_name
 GEMINI_DEFAULT_CONTEXT_LEN = 1_048_576
 GEMINI_DEFAULT_TEMPERATURE = 1.0
 GEMINI_DEFAULT_MAX_OUTPUT_TOKENS = 4096
-GEMINI_CACHE_CONTROL_ROLE = "cache_control"
-GEMINI_DEFAULT_CACHE_TTL_SECONDS = 3600
 GEMINI_DEFAULT_MAX_PARALLEL_REQUESTS = 8
 
 
@@ -160,17 +158,21 @@ def _response_channels(response: Any) -> tuple[str, str | None, dict[str, Any]]:
     )
 
 
-def _message_signature(messages: list[dict[str, Any]]) -> str:
-    payload = [
-        {
-            "role": str(message.get("role") or ""),
-            "content": message.get("content"),
-        }
-        for message in messages
-    ]
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+_TRANSIENT_MAX_RETRIES = 5
+_TRANSIENT_BASE_DELAY = 4.0
+_TRANSIENT_MAX_DELAY = 120.0
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and status_code in _TRANSIENT_STATUS_CODES:
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in ("503", "unavailable", "overloaded", "resource exhausted", "429", "rate limit")
+    )
 
 
 def _guess_mime_type(ref: str | None) -> str:
@@ -221,9 +223,6 @@ class GeminiInferenceEngine(BaseInferenceEngine):
         self._api_version = api_version or os.environ.get("GOOGLE_GENAI_API_VERSION")
         self._max_model_len = int(max_model_len) if max_model_len is not None else GEMINI_DEFAULT_CONTEXT_LEN
         self._client = None
-        self._cache_registry: dict[str, dict[str, Any]] = {}
-        self._created_cache_names: set[str] = set()
-        self._cache_lock = threading.RLock()
 
     def _api_model_name(self) -> str:
         return GEMINI_3_FLASH_MODEL
@@ -251,17 +250,6 @@ class GeminiInferenceEngine(BaseInferenceEngine):
         self._client = genai.Client(**client_kwargs)
 
     def shutdown(self) -> None:
-        if self._client is not None:
-            with self._cache_lock:
-                cache_names = list(self._created_cache_names)
-            for cache_name in cache_names:
-                try:
-                    self._client.caches.delete(name=cache_name)
-                except Exception:
-                    pass
-        with self._cache_lock:
-            self._cache_registry.clear()
-            self._created_cache_names.clear()
         self._client = None
 
     def _max_parallel_requests(self, batch_size: int | None) -> int:
@@ -277,36 +265,6 @@ class GeminiInferenceEngine(BaseInferenceEngine):
             except (TypeError, ValueError):
                 pass
         return GEMINI_DEFAULT_MAX_PARALLEL_REQUESTS
-
-    def _split_cache_control(
-        self,
-        messages: list[dict[str, Any]],
-    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-        if not messages:
-            return None, messages
-        first = messages[0]
-        if str(first.get("role") or "").strip().lower() != GEMINI_CACHE_CONTROL_ROLE:
-            return None, messages
-        payload_messages = list(messages[1:])
-        raw_prefix_count = first.get("cache_prefix_message_count")
-        try:
-            prefix_count = int(raw_prefix_count)
-        except (TypeError, ValueError):
-            prefix_count = 0
-        prefix_count = max(0, min(prefix_count, len(payload_messages)))
-        raw_ttl = first.get("cache_ttl_seconds")
-        try:
-            ttl_seconds = int(raw_ttl)
-        except (TypeError, ValueError):
-            ttl_seconds = GEMINI_DEFAULT_CACHE_TTL_SECONDS
-        ttl_seconds = max(1, ttl_seconds)
-        control = {
-            "prefix_count": prefix_count,
-            "display_name": str(first.get("cache_display_name") or "").strip() or None,
-            "ttl_seconds": ttl_seconds,
-            "cache_scope": str(first.get("cache_scope") or "").strip() or None,
-        }
-        return control, payload_messages
 
     def _build_contents(self, messages: list[dict[str, Any]]) -> tuple[str | None, list[Any]]:
         from google.genai import types
@@ -388,6 +346,11 @@ class GeminiInferenceEngine(BaseInferenceEngine):
         for message in messages:
             role = str(message.get("role") or "user").strip().lower()
             content = message.get("content")
+            if role == "cache_control":
+                # Older callers may still emit the pseudo-role used for the
+                # removed explicit cache path; ignore it rather than forwarding
+                # an empty user message to Gemini.
+                continue
             if role == "system":
                 system_parts.append(_system_text(content))
                 continue
@@ -400,9 +363,6 @@ class GeminiInferenceEngine(BaseInferenceEngine):
             )
         system_instruction = "\n\n".join(part for part in system_parts if part.strip()) or None
         return system_instruction, contents
-
-    def _cache_min_tokens(self) -> int:
-        return 1024
 
     def _count_tokens(
         self,
@@ -437,8 +397,7 @@ class GeminiInferenceEngine(BaseInferenceEngine):
 
     def count_prompt_tokens(self, messages: list[dict[str, Any]]) -> int:
         self.initialize()
-        _cache_control, payload_messages = self._split_cache_control(messages)
-        system_instruction, contents = self._build_contents(payload_messages)
+        system_instruction, contents = self._build_contents(messages)
         return self._count_tokens(
             system_instruction=system_instruction,
             contents=contents,
@@ -448,8 +407,6 @@ class GeminiInferenceEngine(BaseInferenceEngine):
         self,
         sampling_kwargs: dict[str, Any] | None,
         system_instruction: str | None,
-        *,
-        cached_content: str | None = None,
     ) -> Any:
         from google.genai import types
 
@@ -457,7 +414,7 @@ class GeminiInferenceEngine(BaseInferenceEngine):
         include_thought_summaries = bool(kwargs.pop("include_thought_summaries", False))
         config_kwargs: dict[str, Any] = {
             "candidate_count": 1,
-            "temperature": float(kwargs["temperature"]) if kwargs.get("temperature") is not None else GEMINI_DEFAULT_TEMPERATURE,
+            "temperature": GEMINI_DEFAULT_TEMPERATURE,
             "max_output_tokens": int(kwargs["max_tokens"]) if kwargs.get("max_tokens") is not None else GEMINI_DEFAULT_MAX_OUTPUT_TOKENS,
         }
         if kwargs.get("top_p") is not None:
@@ -466,81 +423,9 @@ class GeminiInferenceEngine(BaseInferenceEngine):
             config_kwargs["top_k"] = int(kwargs["top_k"])
         if system_instruction:
             config_kwargs["system_instruction"] = system_instruction
-        if cached_content:
-            config_kwargs["cached_content"] = cached_content
         if include_thought_summaries:
             config_kwargs["thinking_config"] = types.ThinkingConfig(include_thoughts=True)
         return types.GenerateContentConfig(**config_kwargs)
-
-    def _get_or_create_cached_content(
-        self,
-        *,
-        prefix_messages: list[dict[str, Any]],
-        display_name: str | None,
-        ttl_seconds: int,
-    ) -> dict[str, Any]:
-        from google.genai import types
-
-        assert self._client is not None
-        cache_key = f"{self.model_name}:{_message_signature(prefix_messages)}"
-        with self._cache_lock:
-            cached_entry = self._cache_registry.get(cache_key)
-            if cached_entry is not None:
-                return {**cached_entry, "created": False}
-
-            system_instruction, contents = self._build_contents(prefix_messages)
-            prefix_token_count = self._count_tokens(
-                system_instruction=system_instruction,
-                contents=contents,
-            )
-            min_tokens = self._cache_min_tokens()
-            if prefix_token_count is not None and prefix_token_count < min_tokens:
-                return {
-                    "cache_key": cache_key,
-                    "cache_name": None,
-                    "display_name": display_name,
-                    "ttl_seconds": int(ttl_seconds),
-                    "created": False,
-                    "cache_skipped": True,
-                    "skip_reason": "below_min_tokens",
-                    "prefix_token_count": int(prefix_token_count),
-                    "min_prefix_tokens": int(min_tokens),
-                }
-            cached = self._client.caches.create(
-                model=self._api_model_resource_name(),
-                config=types.CreateCachedContentConfig(
-                    contents=contents,
-                    system_instruction=system_instruction,
-                    display_name=display_name,
-                    ttl=f"{int(ttl_seconds)}s",
-                ),
-            )
-            cache_name = str(getattr(cached, "name", "") or "")
-            entry = {
-                "cache_key": cache_key,
-                "cache_name": cache_name or None,
-                "display_name": display_name,
-                "ttl_seconds": int(ttl_seconds),
-                "created": True,
-                "prefix_signature": _message_signature(prefix_messages),
-                "prefix_token_count": prefix_token_count,
-                "min_prefix_tokens": int(min_tokens),
-            }
-            if not cache_name:
-                return {
-                    "cache_key": cache_key,
-                    "cache_name": None,
-                    "display_name": display_name,
-                    "ttl_seconds": int(ttl_seconds),
-                    "created": False,
-                    "cache_skipped": True,
-                    "skip_reason": "missing_cache_name",
-                    "prefix_token_count": prefix_token_count,
-                    "min_prefix_tokens": int(min_tokens),
-                }
-            self._created_cache_names.add(cache_name)
-            self._cache_registry[cache_key] = dict(entry)
-            return entry
 
     def generate_batch_results(
         self,
@@ -549,6 +434,7 @@ class GeminiInferenceEngine(BaseInferenceEngine):
         *,
         sampling_kwargs: dict[str, Any] | None = None,
         progress_callback: Callable[[int], None] | None = None,
+        result_callback: Callable[[int, InferenceResult], None] | None = None,
         model_role: str | None = None,
     ) -> list[InferenceResult]:
         self.initialize()
@@ -562,91 +448,72 @@ class GeminiInferenceEngine(BaseInferenceEngine):
         )
 
         def _run_one(messages: list[dict[str, str]]) -> InferenceResult:
-            cache_control, payload_messages = self._split_cache_control(messages)
-            provider_cache_meta: dict[str, Any] = {}
-            if cache_control is not None and cache_control["prefix_count"] > 0:
-                prefix_messages = payload_messages[: int(cache_control["prefix_count"])]
-                live_messages = payload_messages[int(cache_control["prefix_count"]) :]
-                cache_entry = self._get_or_create_cached_content(
-                    prefix_messages=prefix_messages,
-                    display_name=cache_control["display_name"],
-                    ttl_seconds=int(cache_control["ttl_seconds"]),
-                )
-                provider_cache_meta = {
-                    "explicit_cache_requested": True,
-                    "explicit_cache_used": bool(cache_entry.get("cache_name")),
-                    "explicit_cache_name": cache_entry.get("cache_name"),
-                    "explicit_cache_key": cache_entry.get("cache_key"),
-                    "explicit_cache_created": bool(cache_entry.get("created")),
-                    "explicit_cache_scope": cache_control.get("cache_scope"),
-                    "explicit_cache_prefix_message_count": int(cache_control["prefix_count"]),
-                    "explicit_cache_live_message_count": len(live_messages),
-                    "explicit_cache_ttl_seconds": int(cache_control["ttl_seconds"]),
-                    "explicit_cache_prefix_tokens": cache_entry.get("prefix_token_count"),
-                    "explicit_cache_min_prefix_tokens": cache_entry.get("min_prefix_tokens"),
-                    "explicit_cache_skip_reason": cache_entry.get("skip_reason"),
-                }
-                system_instruction, contents = self._build_contents(live_messages)
-                config = self._build_config(
-                    sampling_kwargs,
-                    system_instruction,
-                    cached_content=cache_entry.get("cache_name"),
-                )
-                if not contents or not cache_entry.get("cache_name"):
-                    system_instruction, contents = self._build_contents(payload_messages)
-                    config = self._build_config(sampling_kwargs, system_instruction)
-            else:
-                system_instruction, contents = self._build_contents(payload_messages)
+            transient_retries = 0
+            for _ in range(1 + _TRANSIENT_MAX_RETRIES):
+                system_instruction, contents = self._build_contents(messages)
                 config = self._build_config(sampling_kwargs, system_instruction)
-            start = time.perf_counter()
-            try:
-                response = self._client.models.generate_content(
-                    model=self._api_model_name(),
-                    contents=contents,
-                    config=config,
-                )
-                latency_ms = int((time.perf_counter() - start) * 1000)
-                usage = _usage_to_dict(getattr(response, "usage_metadata", None))
-                visible_text, thought_summary, thought_meta = _response_channels(response)
-                provider_meta = {
-                    "response_id": getattr(response, "response_id", None),
-                    "model_version": getattr(response, "model_version", None),
-                    **thought_meta,
-                    **_sdk_http_response_meta(response),
-                    **provider_cache_meta,
-                }
-                provider_meta = {key: value for key, value in provider_meta.items() if value is not None}
-                result = InferenceResult(
-                    text=visible_text or _response_text(response),
-                    thought_summary=thought_summary,
-                    thought_summary_available=bool(thought_summary is not None),
-                    usage=usage,
-                    latency_ms=latency_ms,
-                    provider_meta=provider_meta,
-                    retries=0,
-                    error=None,
-                    model_role=model_role or self.model_role,
-                    model_name=self._api_model_name(),
-                    provider_name=self.provider_name,
-                    token_budget={
-                        "context_len_tokens": self.context_len_tokens,
-                        "requested_max_output_tokens": requested_max_tokens,
-                        "prompt_token_count": usage.get("prompt_token_count"),
-                        "total_token_count": usage.get("total_token_count"),
-                    },
-                )
-                maybe_record_result(result)
-                return result
-            except SpendLimitExceeded:
-                raise
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Gemini API request failed for model {self.model_name}: {type(exc).__name__}: {exc}"
-                ) from exc
+                start = time.perf_counter()
+                try:
+                    response = self._client.models.generate_content(
+                        model=self._api_model_name(),
+                        contents=contents,
+                        config=config,
+                    )
+                    latency_ms = int((time.perf_counter() - start) * 1000)
+                    usage = _usage_to_dict(getattr(response, "usage_metadata", None))
+                    visible_text, thought_summary, thought_meta = _response_channels(response)
+                    provider_meta = {
+                        "response_id": getattr(response, "response_id", None),
+                        "model_version": getattr(response, "model_version", None),
+                        **thought_meta,
+                        **_sdk_http_response_meta(response),
+                    }
+                    provider_meta = {key: value for key, value in provider_meta.items() if value is not None}
+                    result = InferenceResult(
+                        text=visible_text or _response_text(response),
+                        thought_summary=thought_summary,
+                        thought_summary_available=bool(thought_summary is not None),
+                        usage=usage,
+                        latency_ms=latency_ms,
+                        provider_meta=provider_meta,
+                        retries=transient_retries,
+                        error=None,
+                        model_role=model_role or self.model_role,
+                        model_name=self._api_model_name(),
+                        provider_name=self.provider_name,
+                        token_budget={
+                            "context_len_tokens": self.context_len_tokens,
+                            "requested_max_output_tokens": requested_max_tokens,
+                            "prompt_token_count": usage.get("prompt_token_count"),
+                            "total_token_count": usage.get("total_token_count"),
+                        },
+                    )
+                    maybe_record_result(result)
+                    return result
+                except SpendLimitExceeded:
+                    raise
+                except Exception as exc:
+                    if _is_transient_error(exc) and transient_retries < _TRANSIENT_MAX_RETRIES:
+                        transient_retries += 1
+                        delay = min(_TRANSIENT_BASE_DELAY * (2 ** (transient_retries - 1)), _TRANSIENT_MAX_DELAY)
+                        delay *= 0.5 + random.random()
+                        print(
+                            f"[gemini] Transient error (attempt {transient_retries}/{_TRANSIENT_MAX_RETRIES}), "
+                            f"retrying in {delay:.1f}s: {type(exc).__name__}: {exc}",
+                            file=sys.stderr,
+                        )
+                        time.sleep(delay)
+                        continue
+                    raise RuntimeError(
+                        f"Gemini API request failed for model {self.model_name}: {type(exc).__name__}: {exc}"
+                    ) from exc
+            raise AssertionError("unreachable")
 
         if max_workers <= 1:
             for idx, messages in enumerate(contexts):
                 results[idx] = _run_one(messages)
+                if result_callback is not None:
+                    result_callback(idx, results[idx])
                 if progress_callback is not None:
                     progress_callback(1)
         else:
@@ -658,6 +525,8 @@ class GeminiInferenceEngine(BaseInferenceEngine):
                 for future in concurrent.futures.as_completed(future_to_index):
                     idx = future_to_index[future]
                     results[idx] = future.result()
+                    if result_callback is not None:
+                        result_callback(idx, results[idx])
                     if progress_callback is not None:
                         progress_callback(1)
 
@@ -670,6 +539,7 @@ class GeminiInferenceEngine(BaseInferenceEngine):
         *,
         sampling_kwargs: dict[str, Any] | None = None,
         progress_callback: Callable[[int], None] | None = None,
+        result_callback: Callable[[int, InferenceResult], None] | None = None,
         model_role: str | None = None,
     ) -> list[str]:
         return [
@@ -679,6 +549,7 @@ class GeminiInferenceEngine(BaseInferenceEngine):
                 batch_size=batch_size,
                 sampling_kwargs=sampling_kwargs,
                 progress_callback=progress_callback,
+                result_callback=result_callback,
                 model_role=model_role,
             )
         ]

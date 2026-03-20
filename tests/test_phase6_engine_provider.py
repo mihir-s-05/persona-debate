@@ -497,12 +497,12 @@ def test_run_debate_hle_on_gemini_builds_multimodal_initial_prompt(tmp_path: Pat
     assert initial_context[0]["content"][1]["type"] == "image"
     assert initial_context[0]["content"][1]["image_uri"] == str(image_path)
     judge_context = judge_engine.calls[0]["contexts"][0]
-    assert judge_context[-1]["role"] == "user"
-    assert isinstance(judge_context[-1]["content"], list)
-    assert judge_context[-1]["content"][0]["type"] == "text"
-    assert "Relevant task images are attached with this judge prompt." in judge_context[-1]["content"][0]["text"]
-    assert judge_context[-1]["content"][1]["type"] == "image"
-    assert judge_context[-1]["content"][1]["image_uri"] == str(image_path)
+    assert judge_context[-2]["role"] == "user"
+    assert isinstance(judge_context[-2]["content"], list)
+    assert judge_context[-2]["content"][0]["type"] == "text"
+    assert "Relevant task images are attached with this judge prompt." in judge_context[-2]["content"][0]["text"]
+    assert judge_context[-2]["content"][1]["type"] == "image"
+    assert judge_context[-2]["content"][1]["image_uri"] == str(image_path)
     assert results[0][0]["final_judge_answer"] == "B"
 
 
@@ -547,9 +547,8 @@ def test_run_debate_emits_agent_and_judge_call_metadata(tmp_path: Path):
     assert judge_engine.calls[0]["sampling_kwargs"] == {"max_tokens": 32768}
 
 
-def test_run_debate_wraps_round2_gemini_requests_with_cache_control(tmp_path: Path, monkeypatch):
+def test_run_debate_round2_gemini_requests_do_not_include_cache_control(tmp_path: Path, monkeypatch):
     dataset_path = tmp_path / "aime25.jsonl"
-    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE_TTL_SECONDS", "7200")
     _write_jsonl(
         dataset_path,
         [{"problem": "What is 2+2?", "answer": "4"}],
@@ -585,10 +584,7 @@ def test_run_debate_wraps_round2_gemini_requests_with_cache_control(tmp_path: Pa
     )
     assert len(debater_engine.calls) == 2
     round2_context = debater_engine.calls[1]["contexts"][0]
-    assert round2_context[0]["role"] == "cache_control"
-    assert round2_context[0]["cache_scope"] == "debate_round_prefix"
-    assert round2_context[0]["cache_ttl_seconds"] == "7200"
-    assert int(round2_context[0]["cache_prefix_message_count"]) == len(round2_context) - 2
+    assert all(message["role"] != "cache_control" for message in round2_context)
     row = results[1][0]
     assert row["token_usage_summary"]["debater"]["n_calls"] == 4
     assert row["token_usage_summary"]["all"]["n_calls"] == 5
@@ -702,7 +698,7 @@ def test_cli_main_honors_output_override_and_writes_phase7_logical_blocks(tmp_pa
     assert row["display"]["question_short"] == "What is 2+2?"
     assert row["trace"]["engine_calls"][0]["provider_name"] == "gemini"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["locked_config"]["output_schema_version"] == "phase7.logical.v1"
+    assert manifest["locked_config"]["output_schema_version"] == "phase7.logical.v2"
 
 
 def test_arg_parser_accepts_judge_runtime_and_cost_flags():
@@ -774,7 +770,7 @@ def test_main_routes_provider_specific_engines_for_debate_and_persona_roles(tmp_
 
     def _fake_build_sampling_config(model_name):
         sampling_models.append(str(model_name))
-        return SimpleNamespace(max_tokens=128, temperature=0.3, top_p=0.95, top_k=-1)
+        return SimpleNamespace(max_tokens=128, temperature=1.0, top_p=0.95, top_k=-1)
 
     def _fake_run_debate(**kwargs):
         run_debate_args.update(kwargs)
@@ -876,7 +872,7 @@ def test_main_auto_persona_backend_creates_llm_persona_engines(tmp_path, monkeyp
     monkeypatch.setattr("debate_v_majority.cli.engine_runtime.create_inference_engine", _fake_create_inference_engine)
     monkeypatch.setattr(
         "debate_v_majority.cli.main_impl.build_sampling_config",
-        lambda model_name: SimpleNamespace(max_tokens=128, temperature=0.3, top_p=0.95, top_k=-1),
+        lambda model_name: SimpleNamespace(max_tokens=128, temperature=1.0, top_p=0.95, top_k=-1),
     )
     monkeypatch.setattr("debate_v_majority.cli.main_impl.set_sampling_config", lambda cfg: None)
     monkeypatch.setattr("debate_v_majority.cli.main_impl.run_debate", lambda **kwargs: (run_debate_args.update(kwargs) or {1: [{"final_correct": 1}]}))
@@ -959,7 +955,7 @@ def test_main_reuses_generator_engine_for_judge_generation_when_effective_provid
     monkeypatch.setattr("debate_v_majority.cli.engine_runtime.create_inference_engine", _fake_create_inference_engine)
     monkeypatch.setattr(
         "debate_v_majority.cli.main_impl.build_sampling_config",
-        lambda model_name: SimpleNamespace(max_tokens=128, temperature=0.3, top_p=0.95, top_k=-1),
+        lambda model_name: SimpleNamespace(max_tokens=128, temperature=1.0, top_p=0.95, top_k=-1),
     )
     monkeypatch.setattr("debate_v_majority.cli.main_impl.set_sampling_config", lambda cfg: None)
     monkeypatch.setattr("debate_v_majority.cli.main_impl.run_debate", lambda **kwargs: (run_debate_args.update(kwargs) or {1: [{"final_correct": 1}]}))
@@ -1004,3 +1000,4 @@ def test_main_reuses_generator_engine_for_judge_generation_when_effective_provid
     assert all("enable_yarn" not in call for call in engine_calls)
     assert all("enforce_eager" not in call for call in engine_calls)
     assert run_debate_args["persona_generator_engine"] is run_debate_args["persona_judge_engine"]
+

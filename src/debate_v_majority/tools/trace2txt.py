@@ -94,7 +94,9 @@ def _judge_trace(row: dict[str, Any]) -> dict[str, Any]:
 def _persona_label(row: dict[str, Any], agent_idx: int) -> str:
     summaries = _persona_summaries(row)
     if agent_idx < len(summaries):
-        summary = summaries[agent_idx] or {}
+        summary = summaries[agent_idx]
+        if summary is None:
+            return f"Agent {agent_idx + 1} (Plain)"
         title = summary.get("title")
         persona_id = summary.get("persona_id")
         if title and persona_id:
@@ -110,6 +112,9 @@ def _render_persona_section(row: dict[str, Any]) -> list[str]:
         return []
     lines = ["", "Personas"]
     for idx, summary in enumerate(summaries, start=1):
+        if summary is None:
+            lines.append(f"- Agent {idx}: (Plain – no persona)")
+            continue
         title = summary.get("title") or "Untitled persona"
         persona_id = summary.get("persona_id") or f"persona-{idx}"
         short_rule = summary.get("short_rule")
@@ -422,6 +427,45 @@ def _render_majority_trace(row: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _render_single_trace(row: dict[str, Any]) -> list[str]:
+    lines = ["", "Single Trace"]
+    completions = row.get("sample_completions") or []
+    parsed = row.get("sample_parsed_answers") or []
+    extractions = row.get("sample_extractions") or []
+    scoring_results = row.get("sample_scoring_results") or []
+    call_metadata = row.get("sample_call_metadata") or []
+
+    for idx, completion in enumerate(completions):
+        lines.append(f"- Sample {idx + 1}")
+        metadata = call_metadata[idx] if idx < len(call_metadata) else {}
+        thought_summary = str(metadata.get("thought_summary") or "").strip() if isinstance(metadata, dict) else ""
+        if thought_summary:
+            lines.append("  Thought summary:")
+            lines.append(_indent(thought_summary, prefix="    "))
+        parsed_answer = parsed[idx] if idx < len(parsed) else None
+        extraction = extractions[idx] if idx < len(extractions) else {}
+        score = scoring_results[idx] if idx < len(scoring_results) else None
+        lines.extend(
+            _render_extraction_block(
+                parsed_answer=parsed_answer,
+                parse_success=extraction.get("parse_success"),
+                confidence=extraction.get("normalized_confidence"),
+                confidence_raw_text=extraction.get("confidence_raw_text"),
+                confidence_parse_failed=extraction.get("confidence_parse_failed"),
+                extractor=extraction,
+                scoring=score,
+                prefix="  ",
+            )
+        )
+        lines.extend(_render_response_block(str(completion or ""), prefix="  ", heading="Completion"))
+
+    lines.append("")
+    lines.append("Outcome")
+    lines.append(f"- Final answer: {row.get('final_answer')}")
+    lines.append(f"- Correct: {row.get('final_correct')}")
+    return lines
+
+
 def render_row_text(row: dict[str, Any]) -> str:
     lines = [
         f"Mode: {row.get('mode')}",
@@ -443,6 +487,8 @@ def render_row_text(row: dict[str, Any]) -> str:
     mode = str(row.get("mode") or "").strip().lower()
     if mode == "debate":
         lines.extend(_render_debate_trace(row))
+    elif mode == "single":
+        lines.extend(_render_single_trace(row))
     elif mode == "majority":
         lines.extend(_render_majority_trace(row))
     return "\n".join(lines).rstrip() + "\n"

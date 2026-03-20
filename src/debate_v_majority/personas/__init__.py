@@ -43,7 +43,9 @@ from .schema import (
     PersonaCard,
     PersonaDescriptor,
     PersonaGenerationConfig,
+    SlotMode,
     ValidationResult,
+    build_slot_layout,
 )
 from .validators import (
     DUPLICATE_SIMILARITY_THRESHOLD,
@@ -63,7 +65,9 @@ __all__ = [
     "PersonaCard",
     "PersonaDescriptor",
     "PersonaGenerationConfig",
+    "SlotMode",
     "ValidationResult",
+    "build_slot_layout",
     "FIXED_AXIS_BANK",
     "DUPLICATE_SIMILARITY_THRESHOLD",
     "artifact_path",

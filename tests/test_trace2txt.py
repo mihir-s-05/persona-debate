@@ -60,7 +60,7 @@ def test_render_trace2txt_for_debate_row(tmp_path: Path):
                 "judge_meta": {
                     "judge_persona_mode": "task_family_generated",
                     "judge_trace_mode": "assistant_transcript",
-                    "judge_family_assignment": {"judge_family": "physics", "source": "gpqa_family_heuristic"},
+                    "judge_family_assignment": {"judge_family": "physics", "source": "gpqa_family_llm"},
                 },
                 "agent_round_outputs": [
                     [
@@ -145,7 +145,7 @@ def test_render_trace2txt_for_debate_row(tmp_path: Path):
     assert "Round 2" in stdout_path.read_text(encoding="utf-8")
 
 
-def test_trace2txt_renders_real_run_debate_judge_summary(tmp_path: Path):
+def test_trace2txt_renders_real_run_debate_judge_summary(tmp_path: Path, monkeypatch):
     dataset_path = tmp_path / "gpqa.jsonl"
     _write_jsonl(
         dataset_path,
@@ -168,22 +168,118 @@ def test_trace2txt_renders_real_run_debate_judge_summary(tmp_path: Path):
         ids=[0],
         range_str=None,
     )
+    monkeypatch.setattr(
+        "debate_v_majority.shared.token_counting.PromptTokenCounter.count_chat_tokens",
+        lambda self, messages: 11,
+    )
     _, gt_letter, _ = _parse_question_answer("gpqa", items[0].raw_task)
     wrong_letter = next(letter for letter in ("A", "B", "C", "D") if letter != gt_letter)
-    engine = _FakeDebateEngine(
+    class _FakePersonaEngine:
+        model_name = "fake-persona-model"
+        provider_name = "fake"
+
+        def generate_batch(self, contexts, batch_size=None, sampling_kwargs=None, progress_callback=None, model_role=None):
+            del batch_size, sampling_kwargs, model_role
+            outputs = []
+            for ctx in contexts:
+                all_content = " ".join(str(message.get("content", "")) for message in ctx)
+                prompt = str(ctx[-1].get("content", ""))
+                if "Classify this GPQA item into exactly one domain family" in prompt:
+                    outputs.append('{"judge_family":"physics"}')
+                elif "You generate reasoning-diversity axes" in all_content:
+                    outputs.append(
+                        json.dumps(
+                            {
+                                "axes": [
+                                    {
+                                        "axis_id": "verification_style",
+                                        "name": "Verification Style",
+                                        "low_desc": "Validate cautiously before committing.",
+                                        "high_desc": "Advance quickly, then verify at the end.",
+                                        "notes": "Keep the axis answer-agnostic.",
+                                    }
+                                ]
+                            }
+                        )
+                    )
+                elif "Generate the full persona population jointly" in all_content:
+                    outputs.append(
+                        json.dumps(
+                            {
+                                "descriptors": [
+                                    {
+                                        "persona_id": "persona_1",
+                                        "name": "Verifier",
+                                        "axis_interpretation": {"x": "steady"},
+                                        "short_rule": "check details",
+                                        "reasoning_summary": "verify claims carefully",
+                                    },
+                                    {
+                                        "persona_id": "persona_2",
+                                        "name": "Challenger",
+                                        "axis_interpretation": {"x": "skeptical"},
+                                        "short_rule": "probe weaknesses",
+                                        "reasoning_summary": "stress test arguments",
+                                    },
+                                ]
+                            }
+                        )
+                    )
+                elif "Expand each descriptor into a compact" in prompt:
+                    persona_id = "persona_1" if "persona_1" in prompt else "persona_2"
+                    outputs.append(
+                        json.dumps(
+                            {
+                                "persona_id": persona_id,
+                                "title": f"Card {persona_id}",
+                                "core_reasoning_strategy": f"strategy {persona_id}",
+                                "priorities": ["track support"],
+                                "distrusts": ["unsupported jumps"],
+                                "decomposition_style": "stepwise",
+                                "revision_policy": "revise on evidence",
+                                "confidence_policy": "explicit",
+                                "failure_mode_to_avoid": "answer leakage",
+                                "system_prompt": f"System prompt for {persona_id}.",
+                            }
+                        )
+                    )
+                elif "Generate a constrained judge card" in prompt:
+                    outputs.append(
+                        json.dumps(
+                            {
+                                "judge_id": "judge_physics",
+                                "judge_family": "physics",
+                                "domain_scope": "physics",
+                                "evaluation_priorities": ["score transcript support"],
+                                "tie_break_policy": "prefer explicit support",
+                                "independent_resolve_policy": "limited_check_only",
+                                "answer_format_policy": "strict",
+                                "confidence_policy": "optional",
+                                "system_prompt": "Judge prompt",
+                            }
+                        )
+                    )
+                else:
+                    raise AssertionError(f"Unexpected persona prompt: {prompt}")
+            if progress_callback is not None:
+                progress_callback(len(outputs))
+            return outputs
+
+    debater_engine = _FakeDebateEngine(
         outputs_by_call=[
-            ['{"judge_family":"physics"}'],
             [
                 f"Reason one.\nConfidence: 0.80\n\\boxed{{{gt_letter}}}",
                 f"Reason two.\nConfidence: 0.40\n\\boxed{{{wrong_letter}}}",
             ],
-            [f"Confidence: 0.75\n\\boxed{{{gt_letter}}}"],
         ]
     )
+    judge_engine = _FakeDebateEngine(outputs_by_call=[[f"Confidence: 0.75\n\\boxed{{{gt_letter}}}"]])
+    persona_engine = _FakePersonaEngine()
     results = run_debate(
         dataset="gpqa",
         items=items,
-        engine=engine,
+        engine=debater_engine,
+        judge_engine=judge_engine,
         n_agents=2,
         n_rounds=0,
         judge_rounds=[0],
@@ -191,8 +287,10 @@ def test_trace2txt_renders_real_run_debate_judge_summary(tmp_path: Path):
         judge_block_size=1,
         use_personas=True,
         artifacts_dir=tmp_path / "artifacts",
-        persona_backend="heuristic",
+        persona_backend="llm",
         persona_save_artifacts=True,
+        persona_generator_engine=persona_engine,
+        persona_judge_engine=persona_engine,
         gpqa_family_cache_path=tmp_path / "gpqa_family_cache.json",
     )
 
@@ -350,6 +448,64 @@ def test_trace2txt_renders_hle_majority_extraction_details(tmp_path: Path):
     assert "Accepted answers: ['united states of america', 'united states']" in text
 
 
+def test_trace2txt_renders_single_completion_and_outcome(tmp_path: Path):
+    input_path = tmp_path / "single_trace.jsonl"
+    _write_jsonl(
+        input_path,
+        [
+            {
+                "dataset": "hle",
+                "mode": "single",
+                "item_uid": "hle:single-item",
+                "item_display_id": "single-item",
+                "question": "What is 2 + 2?",
+                "answer": "4",
+                "source_variant": "verified",
+                "answer_format_type": "freeform_exact",
+                "sample_completions": ["I compute 2 + 2 = 4.\nFinal answer: 4"],
+                "sample_parsed_answers": ["4"],
+                "sample_extractions": [
+                    {
+                        "extractor_provenance": "hle_verified.extractor.v1",
+                        "parse_success": True,
+                        "candidate_answer": "4",
+                        "normalized_confidence": 0.91,
+                        "answer_format_type": "freeform_exact",
+                    }
+                ],
+                "sample_scoring_results": [
+                    {
+                        "match_type": "freeform_verified_rule_set",
+                        "expected_answer": "4",
+                        "predicted_answer": "4",
+                        "correct": 1,
+                    }
+                ],
+                "sample_call_metadata": [
+                    {
+                        "thought_summary": "Adds the two integers directly before stating the answer."
+                    }
+                ],
+                "final_answer": "4",
+                "final_correct": 1,
+            }
+        ],
+    )
+    output_path = tmp_path / "single_trace.txt"
+    exit_code = trace2txt.main(["--input", str(input_path), "--row-index", "0", "--out", str(output_path)])
+    assert exit_code == 0
+    text = output_path.read_text(encoding="utf-8")
+    assert "Question" in text
+    assert "What is 2 + 2?" in text
+    assert "Single Trace" in text
+    assert "Thought summary:" in text
+    assert "Adds the two integers directly before stating the answer." in text
+    assert "Completion:" in text
+    assert "Final answer: 4" in text
+    assert "Parsed answer: 4" in text
+    assert "Correct: 1" in text
+
+
 def test_trace2txt_prefers_phase7_nested_display_and_trace_blocks(tmp_path: Path):
     input_path = tmp_path / "phase7_trace.jsonl"
     _write_jsonl(
@@ -394,3 +550,5 @@ def test_trace2txt_prefers_phase7_nested_display_and_trace_blocks(tmp_path: Path
     assert "Round-1 majority: B" in text
     assert "Final-round majority: A (correct=1)" in text
     assert "Judge final: A (correct=1)" in text
+
+

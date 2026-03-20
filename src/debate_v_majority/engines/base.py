@@ -35,6 +35,7 @@ class BaseInferenceEngine:
         *,
         sampling_kwargs: dict[str, Any] | None = None,
         progress_callback: Callable[[int], None] | None = None,
+        result_callback: Callable[[int, "InferenceResult"], None] | None = None,
         model_role: str | None = None,
     ) -> list[str]:
         return results_to_texts(
@@ -43,6 +44,7 @@ class BaseInferenceEngine:
                 batch_size=batch_size,
                 sampling_kwargs=sampling_kwargs,
                 progress_callback=progress_callback,
+                result_callback=result_callback,
                 model_role=model_role,
             )
         )
@@ -54,6 +56,7 @@ class BaseInferenceEngine:
         *,
         sampling_kwargs: dict[str, Any] | None = None,
         progress_callback: Callable[[int], None] | None = None,
+        result_callback: Callable[[int, "InferenceResult"], None] | None = None,
         model_role: str | None = None,
     ) -> list[InferenceResult]:
         raise NotImplementedError
@@ -76,6 +79,7 @@ class SupportsInferenceResults(Protocol):
         *,
         sampling_kwargs: dict[str, Any] | None = None,
         progress_callback: Callable[[int], None] | None = None,
+        result_callback: Callable[[int, InferenceResult], None] | None = None,
         model_role: str | None = None,
     ) -> list[str]: ...
 
@@ -134,6 +138,7 @@ def _call_legacy_generate_batch(
     *,
     sampling_kwargs: dict[str, Any] | None = None,
     progress_callback: Callable[[int], None] | None = None,
+    result_callback: Callable[[int, InferenceResult], None] | None = None,
     model_role: str | None = None,
 ) -> list[str]:
     generate_batch = engine.generate_batch
@@ -152,6 +157,7 @@ def _call_legacy_generate_batch(
         ("batch_size", batch_size),
         ("sampling_kwargs", sampling_kwargs),
         ("progress_callback", progress_callback),
+        ("result_callback", result_callback),
         ("model_role", model_role),
     ):
         parameter = parameters.get(name)
@@ -174,24 +180,38 @@ def ensure_inference_results(
     *,
     sampling_kwargs: dict[str, Any] | None = None,
     progress_callback: Callable[[int], None] | None = None,
+    result_callback: Callable[[int, InferenceResult], None] | None = None,
     model_role: str | None = None,
 ) -> list[InferenceResult]:
     if hasattr(engine, "generate_batch_results"):
-        return list(
-            engine.generate_batch_results(
-                contexts,
-                batch_size=batch_size,
-                sampling_kwargs=sampling_kwargs,
-                progress_callback=progress_callback,
-                model_role=model_role,
-            )
+        generate_batch_results = engine.generate_batch_results
+        signature = inspect.signature(generate_batch_results)
+        accepts_var_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
         )
+        kwargs: dict[str, Any] = {}
+        for name, value in (
+            ("batch_size", batch_size),
+            ("sampling_kwargs", sampling_kwargs),
+            ("progress_callback", progress_callback),
+            ("result_callback", result_callback),
+            ("model_role", model_role),
+        ):
+            parameter = signature.parameters.get(name)
+            if parameter is None:
+                if accepts_var_kwargs:
+                    kwargs[name] = value
+                continue
+            kwargs[name] = value
+        return list(generate_batch_results(contexts, **kwargs))
     texts = _call_legacy_generate_batch(
         engine,
         contexts,
         batch_size=batch_size,
         sampling_kwargs=sampling_kwargs,
         progress_callback=progress_callback,
+        result_callback=result_callback,
         model_role=model_role,
     )
     model_name = getattr(engine, "model_name", None)

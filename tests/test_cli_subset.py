@@ -40,6 +40,34 @@ def test_cli_has_no_duplicate_long_flags():
     assert len(flags) == len(set(flags))
 
 
+def test_main_rejects_persona_plain_agents_outside_debate(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "debate-v-majority",
+            "--dataset",
+            "aime25",
+            "--mode",
+            "majority",
+            "--model_name",
+            "gemini-3-flash-preview",
+            "--provider",
+            "gemini",
+            "--use_personas",
+            "--persona_plain_agents",
+            "1",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main_impl.main()
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 2
+    assert "--persona_plain_agents currently applies only to persona-backed debate or --hle_experiment" in captured.err
+
+
 def test_make_dataset_subset_with_explicit_ids(tmp_path: Path):
     path = tmp_path / "dataset.jsonl"
     rows = [
@@ -226,6 +254,60 @@ def test_make_dataset_subset_excludes_hle_items_and_keeps_metadata(tmp_path: Pat
     assert meta["exclude_ids_path"] == str(exclude_path)
     assert items[0].dataset_meta["exclude_ids_path"] == str(exclude_path)
     assert items[0].dataset_meta["subset_size"] == 1
+
+
+def test_make_dataset_subset_filters_hle_by_modality(tmp_path: Path):
+    path = tmp_path / "verified.jsonl"
+    rows = [
+        {
+            "id": "hle-text-1",
+            "question": "Which option is correct?\nA) red\nB) blue",
+            "answer": "blue",
+            "answer_type": "multipleChoice",
+            "category": "physics",
+            "Verified_Classes": "Gold subset",
+            "source_variant": "verified",
+        },
+        {
+            "id": "hle-image-1",
+            "question": "Which option is correct?\nA) cat\nB) dog",
+            "answer": "dog",
+            "answer_type": "multipleChoice",
+            "category": "physics",
+            "Verified_Classes": "Gold subset",
+            "source_variant": "verified",
+            "image": "https://example.invalid/question.png",
+        },
+    ]
+    _write_jsonl(path, rows)
+
+    text_only_items, text_only_meta = _make_dataset_subset(
+        dataset="hle",
+        test_path=path,
+        n=2,
+        seed=123,
+        ids=None,
+        range_str="all",
+        hle_variant="verified",
+        hle_modality="text_only",
+    )
+    image_only_items, image_only_meta = _make_dataset_subset(
+        dataset="hle",
+        test_path=path,
+        n=2,
+        seed=123,
+        ids=None,
+        range_str="all",
+        hle_variant="verified",
+        hle_modality="image_only",
+    )
+
+    assert [item.item_display_id for item in text_only_items] == ["hle-text-1"]
+    assert [item.item_display_id for item in image_only_items] == ["hle-image-1"]
+    assert text_only_meta["hle_modality"] == "text_only"
+    assert image_only_meta["hle_modality"] == "image_only"
+    assert text_only_meta["total_available_before_modality"] == 2
+    assert image_only_meta["total_available_before_modality"] == 2
 
 
 def test_make_dataset_subset_exclude_ids_prefers_canonical_numeric_id_over_orig_id(tmp_path: Path):
@@ -583,7 +665,7 @@ def test_main_single_supports_one_output_and_final_manifest(tmp_path: Path, monk
     rows = [json.loads(line) for line in (tmp_path / "single-output.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(rows) == 1
     row = rows[0]
-    assert row["run_meta"]["output_schema_version"] == "phase7.logical.v1"
+    assert row["run_meta"]["output_schema_version"] == "phase7.logical.v2"
     assert row["run_meta"]["output_path"] == str(tmp_path / "single-output.jsonl")
     assert row["run_meta"]["final_manifest_path"] == str(tmp_path / "final-manifest.json")
     assert row["task"]["item_uid"] == "aime25:item-2"
@@ -597,7 +679,7 @@ def test_main_single_supports_one_output_and_final_manifest(tmp_path: Path, monk
     manifest = json.loads((tmp_path / "final-manifest.json").read_text(encoding="utf-8"))
     assert manifest["manifest_version"] == "phase7.final_manifest.v1"
     assert manifest["locked_config"]["item_uids"] == ["aime25:item-2"]
-    assert manifest["locked_config"]["output_schema_version"] == "phase7.logical.v1"
+    assert manifest["locked_config"]["output_schema_version"] == "phase7.logical.v2"
 
 
 def test_write_or_validate_final_manifest_rejects_mismatch_for_final_run(tmp_path: Path):
@@ -648,7 +730,7 @@ def test_augment_output_rows_adds_phase7_logical_blocks_for_debate_rows():
     }
     rows = cli_main_impl._augment_output_rows(
         [row],
-        run_meta={"run_tag": "run-1", "output_schema_version": "phase7.logical.v1"},
+        run_meta={"run_tag": "run-1", "output_schema_version": "phase7.logical.v2"},
         mode="debate",
         use_personas=True,
         public_rationale_max_tokens=96,
@@ -665,3 +747,4 @@ def test_augment_output_rows_adds_phase7_logical_blocks_for_debate_rows():
     assert updated["display"]["judge_final_answer"] == "A"
     assert updated["trace"]["engine_calls"]["judge_round_token_usage"]["aggregate"]["n_calls"] == 1
     assert updated["trace"]["judge_trace"]["judge_raw_response"] == "\\boxed{A}"
+

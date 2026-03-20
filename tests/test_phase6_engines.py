@@ -134,7 +134,7 @@ def test_gemini_inference_engine_emits_typed_usage_and_provider_metadata():
     engine._client = SimpleNamespace(models=_FakeModels())
     results = engine.generate_batch_results(
         [[{"role": "system", "content": "system policy"}, {"role": "user", "content": "hello"}]],
-        sampling_kwargs={"max_tokens": 256, "top_p": 0.2, "top_k": 4, "include_thought_summaries": True},
+        sampling_kwargs={"max_tokens": 256, "temperature": 1.0, "top_p": 0.2, "top_k": 4, "include_thought_summaries": True},
         model_role="debater",
     )
     assert len(results) == 1
@@ -175,47 +175,30 @@ def test_gemini_inference_engine_raises_provider_error_with_default_token_budget
     assert progress_updates == []
 
 
-def test_gemini_inference_engine_uses_explicit_cached_content_for_controlled_prefix():
+def test_gemini_inference_engine_ignores_cache_control_pseudo_messages():
     class _FakeUsage:
         def model_dump(self, exclude_none: bool = True):
             del exclude_none
             return {
                 "prompt_token_count": 52,
-                "cached_content_token_count": 41,
                 "candidates_token_count": 9,
                 "total_token_count": 61,
             }
-
-    class _FakeCaches:
-        def __init__(self) -> None:
-            self.created = []
-            self.deleted = []
-
-        def create(self, *, model, config):
-            self.created.append((model, config))
-            return SimpleNamespace(name="cachedContents/debate-prefix-1")
-
-        def delete(self, *, name):
-            self.deleted.append(name)
-            return None
 
     class _FakeModels:
         def __init__(self) -> None:
             self.calls = []
 
-        def count_tokens(self, *, model, contents, config=None):
-            del model
-            del contents
-            del config
-            return SimpleNamespace(total_tokens=2048)
-
         def generate_content(self, *, model, contents, config):
             self.calls.append((model, contents, config))
-            assert config.cached_content == "cachedContents/debate-prefix-1"
             assert config.max_output_tokens == 128
             assert config.temperature == 1.0
             assert contents[0].role == "user"
-            assert "peer critique" in contents[0].parts[0].text
+            assert "original question" in contents[0].parts[0].text
+            assert contents[1].role == "model"
+            assert "prior private reasoning" in contents[1].parts[0].text
+            assert contents[2].role == "user"
+            assert "peer critique" in contents[2].parts[0].text
             return SimpleNamespace(
                 text="updated answer",
                 usage_metadata=_FakeUsage(),
@@ -228,10 +211,9 @@ def test_gemini_inference_engine_uses_explicit_cached_content_for_controlled_pre
                 ),
             )
 
-    fake_caches = _FakeCaches()
     fake_models = _FakeModels()
     engine = GeminiInferenceEngine(model_name="gemini-3-flash-preview", api_key="test-key", max_model_len=16384)
-    engine._client = SimpleNamespace(models=fake_models, caches=fake_caches)
+    engine._client = SimpleNamespace(models=fake_models)
     contexts = [[
         {"role": "cache_control", "content": "", "cache_prefix_message_count": "3", "cache_display_name": "debate-prefix", "cache_ttl_seconds": "7200", "cache_scope": "debate_round_prefix"},
         {"role": "system", "content": "system policy"},
@@ -246,29 +228,68 @@ def test_gemini_inference_engine_uses_explicit_cached_content_for_controlled_pre
     )
     assert len(results) == 1
     result = results[0]
-    assert result.provider_meta["explicit_cache_used"] is True
-    assert result.provider_meta["explicit_cache_name"] == "cachedContents/debate-prefix-1"
-    assert result.provider_meta["explicit_cache_scope"] == "debate_round_prefix"
-    assert result.provider_meta["explicit_cache_created"] is True
-    assert result.usage["cached_content_token_count"] == 41
-    assert len(fake_caches.created) == 1
-    cache_model, cache_config = fake_caches.created[0]
-    assert cache_model == "models/gemini-3-flash-preview"
-    assert cache_config.system_instruction == "system policy"
-    assert cache_config.ttl == "7200s"
-    assert cache_config.contents[0].role == "user"
-    assert cache_config.contents[1].role == "model"
+    assert "explicit_cache_used" not in result.provider_meta
+    assert "cached_content_token_count" not in result.usage
+    assert len(fake_models.calls) == 1
 
-    second = engine.generate_batch_results(
-        contexts,
+
+def test_gemini_inference_engine_retries_transient_errors(monkeypatch):
+    class _FakeUsage:
+        def model_dump(self, exclude_none: bool = True):
+            del exclude_none
+            return {
+                "prompt_token_count": 52,
+                "candidates_token_count": 9,
+                "total_token_count": 61,
+            }
+
+    class _FakeModels:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def count_tokens(self, *, model, contents, config=None):
+            del model
+            del contents
+            del config
+            return SimpleNamespace(total_tokens=2048)
+
+        def generate_content(self, *, model, contents, config):
+            del model
+            del contents
+            self.calls.append(config)
+            if len(self.calls) == 1:
+                raise RuntimeError("503 service unavailable")
+            return SimpleNamespace(
+                text="updated answer after retry",
+                usage_metadata=_FakeUsage(),
+                response_id="resp-cache-2",
+                model_version="gemini-3-flash-preview-001",
+                sdk_http_response=SimpleNamespace(
+                    status_code=200,
+                    url="https://example.test/generate",
+                    headers={"x-goog-request-id": "req-cache-2"},
+                ),
+            )
+
+    fake_models = _FakeModels()
+    engine = GeminiInferenceEngine(model_name="gemini-3-flash-preview", api_key="test-key", max_model_len=16384)
+    engine._client = SimpleNamespace(models=fake_models)
+    monkeypatch.setattr(gemini_api.time, "sleep", lambda _: None)
+
+    result = engine.generate_batch_results(
+        [[{"role": "user", "content": "hello"}]],
         sampling_kwargs={"max_tokens": 128},
         model_role="debater",
     )[0]
-    assert second.provider_meta["explicit_cache_created"] is False
-    assert len(fake_caches.created) == 1
+
+    assert result.text == "updated answer after retry"
+    assert result.retries == 1
+    assert len(fake_models.calls) == 2
+    assert fake_models.calls[0].temperature == 1.0
+    assert fake_models.calls[1].temperature == 1.0
 
 
-def test_gemini_inference_engine_skips_explicit_cache_when_prefix_is_below_minimum():
+def test_gemini_inference_engine_ignores_cache_control_when_building_contents():
     class _FakeUsage:
         def model_dump(self, exclude_none: bool = True):
             del exclude_none
@@ -278,21 +299,7 @@ def test_gemini_inference_engine_skips_explicit_cache_when_prefix_is_below_minim
                 "total_token_count": 24,
             }
 
-    class _FakeCaches:
-        def __init__(self) -> None:
-            self.created = []
-
-        def create(self, *, model, config):
-            self.created.append((model, config))
-            raise AssertionError("cache creation should have been skipped")
-
     class _FakeModels:
-        def count_tokens(self, *, model, contents, config=None):
-            del model
-            del contents
-            del config
-            return SimpleNamespace(total_tokens=120)
-
         def generate_content(self, *, model, contents, config):
             assert model == "gemini-3-flash-preview"
             assert getattr(config, "cached_content", None) is None
@@ -310,7 +317,7 @@ def test_gemini_inference_engine_skips_explicit_cache_when_prefix_is_below_minim
             )
 
     engine = GeminiInferenceEngine(model_name="gemini-3-flash-preview", api_key="test-key", max_model_len=16384)
-    engine._client = SimpleNamespace(models=_FakeModels(), caches=_FakeCaches())
+    engine._client = SimpleNamespace(models=_FakeModels())
     context = [[
         {"role": "cache_control", "content": "", "cache_prefix_message_count": "3", "cache_display_name": "debate-prefix", "cache_ttl_seconds": "3600", "cache_scope": "debate_round_prefix"},
         {"role": "system", "content": "system policy"},
@@ -323,10 +330,7 @@ def test_gemini_inference_engine_skips_explicit_cache_when_prefix_is_below_minim
         sampling_kwargs={"max_tokens": 128},
         model_role="debater",
     )[0]
-    assert result.provider_meta["explicit_cache_requested"] is True
-    assert result.provider_meta["explicit_cache_used"] is False
-    assert result.provider_meta["explicit_cache_skip_reason"] == "below_min_tokens"
-    assert result.provider_meta["explicit_cache_prefix_tokens"] == 120
+    assert result.text == "uncached answer"
 
 
 def test_run_sampled_emits_sample_call_metadata():
@@ -412,3 +416,4 @@ def test_run_debate_emits_separate_debater_and_judge_call_metadata():
     assert row["judge_trace"]["judge_raw_call_metadata"]["request_message_token_counts"] == {"prompt_tokens": 11}
     assert row["debater_round_token_usage"][0]["n_calls"] == 2
     assert row["judge_round_token_usage"]["aggregate"]["n_calls"] == 1
+

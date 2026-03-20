@@ -181,6 +181,21 @@ def parse_question_answer(sample: dict[str, Any]) -> tuple[str, str, dict[str, A
     return prompt, gt_letter, raw_task
 
 
+def build_judge_question(raw_task: dict[str, Any]) -> str:
+    """Return the raw question text for the judge, without agent solving instructions."""
+    question_raw, correct_text, incorrect_texts = _extract_fields(raw_task)
+    options = [correct_text] + incorrect_texts
+    shuffled = _stable_shuffle(options, seed_text=question_raw)
+    return (
+        f"Question:\n{question_raw}\n\n"
+        f"Choices:\n"
+        f"A) {shuffled[0]}\n"
+        f"B) {shuffled[1]}\n"
+        f"C) {shuffled[2]}\n"
+        f"D) {shuffled[3]}"
+    )
+
+
 # =============================================================================
 # Answer parsing
 # =============================================================================
@@ -232,7 +247,7 @@ def parse_answer(text: str, task_info: dict[str, Any]) -> str | None:
 
     # Fallback: try to extract a final choice from unboxed outputs.
     # We search cue-based patterns across the whole completion (less brittle when the model states an
-    # answer and then continues), but still use a character tail for "last-line" heuristics.
+    # answer and then continues), but still use a character tail for "last-line" logic.
     t = str(text or "")
     tail = t[-2400:] if len(t) > 2400 else t
 
@@ -312,3 +327,4 @@ def construct_debate_message(other_agent_answers: list[str]) -> dict[str, str]:
         updates=other_agent_answers,
         outro=AGENT_PROMPT["debate"][1],
     )
+

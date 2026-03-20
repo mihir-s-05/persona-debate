@@ -48,3 +48,4 @@ def test_gemini_3_flash_model_available():
             f"\nNote: exact name '{target}' not in API, "
             f"but these variants exist: {flash_variants}"
         )
+

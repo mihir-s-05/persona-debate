@@ -72,6 +72,13 @@ class DatasetAdapter(ABC):
     def recover_parse_answer(self, text: str, task_info: dict[str, Any]) -> Any:
         return self.parse_answer(text, task_info)
 
+    def build_judge_question(self, raw_task: dict[str, Any]) -> str | None:
+        """Return the question text for the judge, without agent-facing solving instructions.
+
+        Returns None to fall back to the agent-formatted question.
+        """
+        return None
+
     def render_prompt(self, raw_task: dict[str, Any]) -> tuple[str, Any, dict[str, Any]]:
         return self.parse_question_answer(raw_task)
 

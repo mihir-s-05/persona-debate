@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, TextIO, cast
@@ -67,6 +69,7 @@ def _persona_generation_settings(
     generator_model: str | None,
     judge_generator_model: str | None,
     axes_file: Path | None,
+    n_plain_agents: int = 0,
 ) -> dict[str, Any]:
     return {
         "n_personas": int(n_personas),
@@ -80,6 +83,7 @@ def _persona_generation_settings(
         "generator_model": generator_model,
         "judge_generator_model": judge_generator_model,
         "axes_file": None if axes_file is None else str(axes_file),
+        "n_plain_agents": int(n_plain_agents),
     }
 
 
@@ -97,6 +101,7 @@ def _staged_persona_resume_settings(
     generator_model: str | None,
     judge_generator_model: str | None,
     axes_file: Path | None,
+    n_plain_agents: int = 0,
 ) -> dict[str, Any]:
     settings = _persona_generation_settings(
         n_personas=n_personas,
@@ -110,6 +115,7 @@ def _staged_persona_resume_settings(
         generator_model=generator_model,
         judge_generator_model=judge_generator_model,
         axes_file=axes_file,
+        n_plain_agents=n_plain_agents,
     )
     settings.update(
         {
@@ -164,6 +170,10 @@ def _replayed_persona_artifact_mismatch(
         return f"Artifact {artifact_path} axis_mode mismatch: {artifact.axes.mode} != {axis_mode}"
     if len(artifact.cards) != n_personas:
         return f"Artifact {artifact_path} n_personas mismatch: {len(artifact.cards)} != {n_personas}"
+    expected_n_plain = int(generation_settings.get("n_plain_agents", 0))
+    actual_n_plain = artifact.n_plain_agents
+    if actual_n_plain != expected_n_plain:
+        return f"Artifact {artifact_path} n_plain_agents mismatch: {actual_n_plain} != {expected_n_plain}"
     if (artifact.generator_model or None) != (generator_model or None):
         return f"Artifact {artifact_path} generator_model mismatch: {artifact.generator_model} != {generator_model}"
     if (artifact.judge_generator_model or None) != (judge_generator_model or None):
@@ -182,8 +192,8 @@ def _replayed_persona_artifact_mismatch(
 
 def _persona_artifact_row(artifact: PersonaArtifact, *, artifact_path_str: str | None) -> dict[str, Any]:
     data = artifact.to_dict()
-    return {
-        "schema_version": "phase0.v1",
+    row: dict[str, Any] = {
+        "schema_version": "phase0.v2",
         "mode": "personas",
         "dataset": artifact.dataset,
         "item_uid": artifact.item_uid,
@@ -203,6 +213,9 @@ def _persona_artifact_row(artifact: PersonaArtifact, *, artifact_path_str: str |
         "validator_metadata": data["validator_metadata"],
         "artifact_path": artifact_path_str,
     }
+    if artifact.slot_layout is not None:
+        row["slot_layout"] = list(artifact.slot_layout)
+    return row
 
 
 def persona_rows_from_stage_entry(entry: StageEntry) -> list[dict[str, Any]]:
@@ -233,27 +246,28 @@ def persona_rows_from_stage_entry(entry: StageEntry) -> list[dict[str, Any]]:
 def persona_artifacts_from_rows(rows: list[dict[str, Any]]) -> dict[str, PersonaArtifact]:
     artifacts_by_item: dict[str, PersonaArtifact] = {}
     for row in rows:
-        artifact = PersonaArtifact.from_dict(
-            {
-                "artifact_version": row["artifact_version"],
-                "dataset": row["dataset"],
-                "item_uid": row["item_uid"],
-                "dataset_revision": row.get("dataset_revision"),
-                "item_display_id": row.get("item_display_id"),
-                "persona_seed": row.get("persona_seed"),
-                "generator_model": row.get("generator_model"),
-                "judge_generator_model": row.get("judge_generator_model"),
-                "axes": row["axes"],
-                "sampled_points": row.get("sampled_points", []),
-                "descriptors": row.get("descriptors", []),
-                "cards": row.get("cards", []),
-                "judge_card": row.get("judge_card"),
-                "prompt_versions": row.get("prompt_versions", {}),
-                "created_at": row["created_at"],
-                "generation_settings": row.get("generation_settings", {}),
-                "validator_metadata": row.get("validator_metadata", {}),
-            }
-        )
+        from_dict_payload: dict[str, Any] = {
+            "artifact_version": row["artifact_version"],
+            "dataset": row["dataset"],
+            "item_uid": row["item_uid"],
+            "dataset_revision": row.get("dataset_revision"),
+            "item_display_id": row.get("item_display_id"),
+            "persona_seed": row.get("persona_seed"),
+            "generator_model": row.get("generator_model"),
+            "judge_generator_model": row.get("judge_generator_model"),
+            "axes": row["axes"],
+            "sampled_points": row.get("sampled_points", []),
+            "descriptors": row.get("descriptors", []),
+            "cards": row.get("cards", []),
+            "judge_card": row.get("judge_card"),
+            "prompt_versions": row.get("prompt_versions", {}),
+            "created_at": row["created_at"],
+            "generation_settings": row.get("generation_settings", {}),
+            "validator_metadata": row.get("validator_metadata", {}),
+        }
+        if "slot_layout" in row:
+            from_dict_payload["slot_layout"] = row["slot_layout"]
+        artifact = PersonaArtifact.from_dict(from_dict_payload)
         artifacts_by_item[artifact.item_uid] = artifact
     return artifacts_by_item
 
@@ -265,8 +279,10 @@ def _print_persona_artifact_summary(
     dump_cards: bool,
     artifact_path_str: str | None,
 ) -> None:
+    plain_count = artifact.n_plain_agents
+    slot_label = f" plain_agents={plain_count}" if plain_count > 0 else ""
     print(
-        f"[persona] item_uid={artifact.item_uid} axes={len(artifact.axes.axes)} personas={len(artifact.cards)}",
+        f"[persona] item_uid={artifact.item_uid} axes={len(artifact.axes.axes)} personas={len(artifact.cards)}{slot_label}",
         file=output_file,
     )
     if artifact_path_str:
@@ -304,6 +320,7 @@ def _resolve_persona_artifact(
     gpqa_family_cache_path: Path | None = None,
     save_artifact: bool,
     replay: bool,
+    n_plain_agents: int = 0,
 ) -> tuple[PersonaArtifact, Path]:
     generation_settings = _persona_generation_settings(
         n_personas=n_personas,
@@ -317,6 +334,7 @@ def _resolve_persona_artifact(
         generator_model=generator_model,
         judge_generator_model=judge_generator_model,
         axes_file=axes_file,
+        n_plain_agents=n_plain_agents,
     )
     artifact_file = persona_artifact_path(
         artifacts_dir=artifacts_dir,
@@ -375,6 +393,7 @@ def _resolve_persona_artifact(
         generator_model=generator_model,
         judge_generator_model=judge_generator_model,
         axes_file=axes_file,
+        n_plain_agents=n_plain_agents,
     )
     judge_card, judge_bank_meta = _resolve_runtime_judge_card(
         dataset=dataset,
@@ -388,7 +407,7 @@ def _resolve_persona_artifact(
         judge_persona_mode=judge_persona_mode,
         persona_backend=backend,
         judge_generator_model=judge_generator_model,
-        judge_engine=judge_engine,
+        judge_engine=judge_engine or generator_engine,
     )
     artifact = build_persona_artifact(
         config=config,
@@ -430,44 +449,110 @@ def run_persona_generation(
     replay: bool,
     dump_cards: bool,
     summary_file: TextIO,
+    n_plain_agents: int = 0,
 ) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for item in items:
-        question, _, raw_task = _parse_question_answer(dataset, item.raw_task)
-        artifact, artifact_file = _resolve_persona_artifact(
-            dataset=dataset,
-            item=item,
-            question=question,
-            raw_task=raw_task,
-            artifacts_dir=artifacts_dir,
-            n_personas=n_personas,
-            persona_seed=persona_seed,
-            axis_mode=axis_mode,
-            fixed_axis_count=fixed_axis_count,
-            task_axis_count=task_axis_count,
-            sampling_method=sampling_method,
-            judge_persona_mode=judge_persona_mode,
-            backend=backend,
-            generator_model=generator_model,
-            judge_generator_model=judge_generator_model,
-            generator_engine=generator_engine,
-            judge_engine=judge_engine,
-            axes_file=axes_file,
-            judge_bank_dir=judge_bank_dir,
-            judge_bank_refresh=judge_bank_refresh,
-            gpqa_family_cache_path=gpqa_family_cache_path,
-            save_artifact=save_artifacts,
-            replay=replay,
-        )
-        artifact_path_str = str(artifact_file) if artifact_file.exists() or save_artifacts else None
-        _print_persona_artifact_summary(
-            artifact,
-            output_file=summary_file,
-            dump_cards=dump_cards,
-            artifact_path_str=artifact_path_str,
-        )
-        rows.append(_persona_artifact_row(artifact, artifact_path_str=artifact_path_str))
-    return rows
+    if replay:
+        rows: list[dict[str, Any]] = []
+        for item in items:
+            question, _, raw_task = _parse_question_answer(dataset, item.raw_task)
+            artifact, artifact_file = _resolve_persona_artifact(
+                dataset=dataset,
+                item=item,
+                question=question,
+                raw_task=raw_task,
+                artifacts_dir=artifacts_dir,
+                n_personas=n_personas,
+                persona_seed=persona_seed,
+                axis_mode=axis_mode,
+                fixed_axis_count=fixed_axis_count,
+                task_axis_count=task_axis_count,
+                sampling_method=sampling_method,
+                judge_persona_mode=judge_persona_mode,
+                backend=backend,
+                generator_model=generator_model,
+                judge_generator_model=judge_generator_model,
+                generator_engine=generator_engine,
+                judge_engine=judge_engine or generator_engine,
+                axes_file=axes_file,
+                judge_bank_dir=judge_bank_dir,
+                judge_bank_refresh=judge_bank_refresh,
+                gpqa_family_cache_path=gpqa_family_cache_path,
+                save_artifact=save_artifacts,
+                replay=True,
+                n_plain_agents=n_plain_agents,
+            )
+            artifact_path_str = str(artifact_file) if artifact_file.exists() or save_artifacts else None
+            _print_persona_artifact_summary(
+                artifact,
+                output_file=summary_file,
+                dump_cards=dump_cards,
+                artifact_path_str=artifact_path_str,
+            )
+            rows.append(_persona_artifact_row(artifact, artifact_path_str=artifact_path_str))
+        return rows
+
+    effective_backend = "llm"
+    resume_settings = _staged_persona_resume_settings(
+        n_personas=n_personas,
+        persona_seed=persona_seed,
+        axis_mode=axis_mode,
+        fixed_axis_count=fixed_axis_count,
+        task_axis_count=task_axis_count,
+        sampling_method=sampling_method,
+        judge_persona_mode=judge_persona_mode,
+        requested_backend=backend,
+        effective_backend=effective_backend,
+        generator_model=generator_model,
+        judge_generator_model=judge_generator_model,
+        axes_file=axes_file,
+        n_plain_agents=n_plain_agents,
+    )
+    internal_stage_state_file = _persona_internal_stage_state_path(
+        artifacts_dir=artifacts_dir,
+        dataset=dataset,
+        items=items,
+        resume_settings=resume_settings,
+    )
+    final_entry: StageEntry | None = None
+    try:
+        for stage_name in _PERSONA_STAGE_ORDER:
+            final_entry = run_persona_generation_staged(
+                dataset=dataset,
+                items=items,
+                artifacts_dir=artifacts_dir,
+                stage_state_file=internal_stage_state_file,
+                persona_stage=stage_name,
+                n_personas=n_personas,
+                persona_seed=persona_seed,
+                axis_mode=axis_mode,
+                fixed_axis_count=fixed_axis_count,
+                task_axis_count=task_axis_count,
+                sampling_method=sampling_method,
+                judge_persona_mode=judge_persona_mode,
+                backend=backend,
+                generator_model=generator_model,
+                judge_generator_model=judge_generator_model,
+                generator_engine=generator_engine,
+                judge_engine=judge_engine or generator_engine,
+                axes_file=axes_file,
+                judge_bank_dir=judge_bank_dir,
+                judge_bank_refresh=judge_bank_refresh,
+                gpqa_family_cache_path=gpqa_family_cache_path,
+                save_artifacts=save_artifacts,
+                replay=False,
+                dump_cards=dump_cards,
+                summary_file=summary_file,
+                n_plain_agents=n_plain_agents,
+            )
+    finally:
+        if final_entry is not None and final_entry.completed_stage == "judge_card" and internal_stage_state_file.exists():
+            try:
+                internal_stage_state_file.unlink()
+            except OSError:
+                pass
+    if final_entry is None:
+        return []
+    return persona_rows_from_stage_entry(final_entry)
 
 
 _PERSONA_STAGE_ORDER = ["axes", "descriptors", "cards", "judge_card"]
@@ -524,6 +609,102 @@ def _append_persona_failure_audit(
     with audit_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
     return audit_path
+
+
+def _persona_stage_item_complete(*, stage_name: str, item_data: dict[str, Any]) -> bool:
+    if stage_name == "axes":
+        return "axis_selection" in item_data and "sampled_points" in item_data
+    if stage_name == "descriptors":
+        return (
+            "descriptors" in item_data
+            and "descriptor_validator_metadata" in item_data
+            and "descriptor_call_metadata" in item_data
+        )
+    if stage_name == "cards":
+        return (
+            "cards" in item_data
+            and "card_metadata" in item_data
+            and "card_call_metadata" in item_data
+        )
+    if stage_name == "judge_card":
+        return (
+            "judge_card" in item_data
+            and "judge_bank_meta" in item_data
+            and "artifact_created_at" in item_data
+            and "artifact" in item_data
+        )
+    raise ValueError(f"Unknown persona stage: {stage_name}")
+
+
+def _persona_stage_pending_items(
+    *,
+    stage_name: str,
+    items: list[SubsetItem],
+    per_item: dict[str, dict[str, Any]],
+) -> list[SubsetItem]:
+    return [
+        item
+        for item in items
+        if not _persona_stage_item_complete(stage_name=stage_name, item_data=dict(per_item.get(item.item_uid) or {}))
+    ]
+
+
+def _persona_stage_meta(
+    *,
+    persona_stage: str,
+    n_personas: int,
+    persona_seed: int,
+    axis_mode: str,
+    backend: str,
+    generator_model: str | None,
+    judge_generator_model: str | None,
+    current_resume_settings: dict[str, Any],
+    active_stage: str,
+    active_stage_complete: bool,
+) -> dict[str, Any]:
+    return {
+        "persona_stage": persona_stage,
+        "n_personas": n_personas,
+        "persona_seed": persona_seed,
+        "axis_mode": axis_mode,
+        "backend": backend,
+        "generator_model": generator_model,
+        "judge_generator_model": judge_generator_model,
+        "resume_settings": dict(current_resume_settings),
+        "active_stage": active_stage,
+        "active_stage_complete": bool(active_stage_complete),
+    }
+
+
+def _staged_persona_start_index(*, prev_entry: StageEntry | None) -> int:
+    if prev_entry is None:
+        return 0
+    active_stage = str(prev_entry.meta.get("active_stage") or "")
+    active_stage_complete = bool(prev_entry.meta.get("active_stage_complete", True))
+    if active_stage in _PERSONA_STAGE_ORDER and not active_stage_complete:
+        return _stage_index(active_stage)
+    completed = prev_entry.completed_stage
+    if completed in _PERSONA_STAGE_ORDER:
+        return _stage_index(completed) + 1
+    return 0
+
+
+def _persona_internal_stage_state_path(
+    *,
+    artifacts_dir: Path,
+    dataset: DatasetName,
+    items: list[SubsetItem],
+    resume_settings: dict[str, Any],
+) -> Path:
+    payload = {
+        "dataset": str(dataset),
+        "items": [subset_item_resume_signature(item) for item in items],
+        "resume_settings": dict(resume_settings),
+    }
+    digest = hashlib.sha256(
+        json.dumps(_json_ready(payload), sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:12]
+    return artifacts_dir / f".persona_stage_state.{digest}.jsonl"
 
 
 def _build_staged_persona_artifact(
@@ -622,6 +803,7 @@ def _persona_config_for_item(
     judge_persona_mode: str,
     backend: str,
     axes_file: Path | None,
+    n_plain_agents: int = 0,
 ) -> PersonaGenerationConfig:
     return PersonaGenerationConfig(
         dataset=dataset,
@@ -641,6 +823,7 @@ def _persona_config_for_item(
         judge_persona_mode=cast(Any, judge_persona_mode),
         backend=cast(Any, backend),
         axes_file=axes_file,
+        n_plain_agents=n_plain_agents,
     )
 
 
@@ -672,6 +855,210 @@ def _card_stage_metadata_from_artifact(artifact: PersonaArtifact) -> dict[str, A
     }
 
 
+PERSONA_STAGE_MAX_WORKERS = 8
+
+
+def _persona_stage_worker_count(n_items: int) -> int:
+    return max(1, min(PERSONA_STAGE_MAX_WORKERS, int(n_items)))
+
+
+def _persona_stage_parallel_map(
+    *,
+    stage_name: str,
+    stage_inputs: list[Any],
+    worker: Any,
+    on_result: Any | None = None,
+) -> list[Any]:
+    if len(stage_inputs) <= 1:
+        results = [worker(stage_input) for stage_input in stage_inputs]
+        if on_result is not None:
+            for idx, result in enumerate(results):
+                on_result(idx, result)
+        return results
+    results: list[Any] = [None] * len(stage_inputs)
+    first_exc: Exception | None = None
+    with ThreadPoolExecutor(
+        max_workers=_persona_stage_worker_count(len(stage_inputs)),
+        thread_name_prefix=f"persona_{stage_name}",
+    ) as executor:
+        future_to_idx = {
+            executor.submit(worker, stage_input): idx
+            for idx, stage_input in enumerate(stage_inputs)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                if first_exc is None:
+                    first_exc = exc
+                    for pending in future_to_idx:
+                        if pending is not future:
+                            pending.cancel()
+                continue
+            results[idx] = result
+            if on_result is not None:
+                on_result(idx, result)
+    if first_exc is not None:
+        raise first_exc
+    return results
+
+
+def _persona_inputs_for_items(
+    *,
+    dataset: DatasetName,
+    items: list[SubsetItem],
+    n_personas: int,
+    persona_seed: int,
+    axis_mode: str,
+    fixed_axis_count: int,
+    task_axis_count: int,
+    sampling_method: str,
+    generator_model: str | None,
+    judge_generator_model: str | None,
+    judge_persona_mode: str,
+    backend: str,
+    axes_file: Path | None,
+    n_plain_agents: int = 0,
+) -> list[dict[str, Any]]:
+    parsed_inputs: list[dict[str, Any]] = []
+    for item in items:
+        question, _, raw_task = _parse_question_answer(dataset, item.raw_task)
+        parsed_inputs.append(
+            {
+                "item": item,
+                "question": question,
+                "raw_task": raw_task,
+                "config": _persona_config_for_item(
+                    dataset=dataset,
+                    item=item,
+                    question=question,
+                    raw_task=raw_task,
+                    n_personas=n_personas,
+                    persona_seed=persona_seed,
+                    axis_mode=axis_mode,
+                    fixed_axis_count=fixed_axis_count,
+                    task_axis_count=task_axis_count,
+                    sampling_method=sampling_method,
+                    generator_model=generator_model,
+                    judge_generator_model=judge_generator_model,
+                    judge_persona_mode=judge_persona_mode,
+                    backend=backend,
+                    axes_file=axes_file,
+                    n_plain_agents=n_plain_agents,
+                ),
+            }
+        )
+    return parsed_inputs
+
+
+def _run_axes_stage_parallel(
+    *,
+    parsed_inputs: list[dict[str, Any]],
+    generator_engine: Any | None,
+    on_result: Any | None = None,
+) -> list[dict[str, Any]]:
+    def _worker(parsed_input: dict[str, Any]) -> dict[str, Any]:
+        axis_selection, points, _stage_backend = prepare_descriptor_generation(
+            config=parsed_input["config"],
+            engine=generator_engine,
+        )
+        return {
+            "axis_selection": asdict(axis_selection),
+            "sampled_points": points,
+        }
+
+    return _persona_stage_parallel_map(
+        stage_name="axes",
+        stage_inputs=parsed_inputs,
+        worker=_worker,
+        on_result=on_result,
+    )
+
+
+def _run_descriptors_stage_parallel(
+    *,
+    parsed_inputs: list[dict[str, Any]],
+    per_item_data: dict[str, dict[str, Any]],
+    generator_engine: Any | None,
+    on_result: Any | None = None,
+) -> list[dict[str, Any]]:
+    stage_inputs = [
+        {
+            "parsed_input": parsed_input,
+            "axis_selection": AxisSelection.from_dict(per_item_data[parsed_input["item"].item_uid]["axis_selection"]),
+            "sampled_points": [
+                {str(k): float(v) for k, v in point.items()}
+                for point in per_item_data[parsed_input["item"].item_uid]["sampled_points"]
+            ],
+        }
+        for parsed_input in parsed_inputs
+    ]
+
+    def _worker(stage_input: dict[str, Any]) -> dict[str, Any]:
+        descriptors, descriptor_meta = generate_descriptors_from_state(
+            config=stage_input["parsed_input"]["config"],
+            axis_selection=stage_input["axis_selection"],
+            points=stage_input["sampled_points"],
+            engine=generator_engine,
+        )
+        return {
+            "descriptors": [asdict(desc) for desc in descriptors],
+            "descriptor_validator_metadata": dict(descriptor_meta["validator_metadata"]),
+            "descriptor_call_metadata": descriptor_meta["validator_metadata"].get("descriptor_call_metadata"),
+        }
+
+    return _persona_stage_parallel_map(
+        stage_name="descriptors",
+        stage_inputs=stage_inputs,
+        worker=_worker,
+        on_result=on_result,
+    )
+
+
+def _run_cards_stage_parallel(
+    *,
+    parsed_inputs: list[dict[str, Any]],
+    per_item_data: dict[str, dict[str, Any]],
+    generator_engine: Any | None,
+    effective_backend: str,
+    on_result: Any | None = None,
+) -> list[dict[str, Any]]:
+    stage_inputs = [
+        {
+            "parsed_input": parsed_input,
+            "descriptors": [
+                PersonaDescriptor.from_dict(desc_dict)
+                for desc_dict in per_item_data[parsed_input["item"].item_uid]["descriptors"]
+            ],
+        }
+        for parsed_input in parsed_inputs
+    ]
+
+    def _worker(stage_input: dict[str, Any]) -> dict[str, Any]:
+        parsed_input = stage_input["parsed_input"]
+        cards, card_meta = expand_cards(
+            stage_input["descriptors"],
+            dataset=parsed_input["config"].dataset,
+            question=parsed_input["question"],
+            raw_task=parsed_input["raw_task"],
+            engine=generator_engine,
+            backend=effective_backend,
+        )
+        return {
+            "cards": [asdict(card) for card in cards],
+            "card_metadata": dict(card_meta),
+            "card_call_metadata": deepcopy(card_meta.get("card_call_metadata") or []),
+        }
+
+    return _persona_stage_parallel_map(
+        stage_name="cards",
+        stage_inputs=stage_inputs,
+        worker=_worker,
+        on_result=on_result,
+    )
+
+
 def run_persona_generation_staged(
     *,
     dataset: DatasetName,
@@ -699,14 +1086,13 @@ def run_persona_generation_staged(
     replay: bool = False,
     dump_cards: bool = False,
     summary_file: TextIO,
+    n_plain_agents: int = 0,
 ) -> StageEntry:
     """Run persona generation one stage at a time, appending state after each batch."""
 
     target_idx = _stage_index(persona_stage)
     items_ser = [asdict(it) for it in items]
-    effective_backend = (
-        "llm" if backend == "llm" or (backend == "auto" and generator_engine is not None) else "heuristic"
-    )
+    effective_backend = "llm"
     current_resume_settings = _staged_persona_resume_settings(
         n_personas=n_personas,
         persona_seed=persona_seed,
@@ -720,6 +1106,7 @@ def run_persona_generation_staged(
         generator_model=generator_model,
         judge_generator_model=judge_generator_model,
         axes_file=axes_file,
+        n_plain_agents=n_plain_agents,
     )
 
     prev_entry = load_latest_stage_entry_of_type(stage_state_file, "persona") if stage_state_file.exists() else None
@@ -732,15 +1119,31 @@ def run_persona_generation_staged(
         )
 
     per_item: dict[str, dict[str, Any]] = {} if prev_entry is None else dict(prev_entry.persona_data)
+    parsed_inputs = _persona_inputs_for_items(
+        dataset=dataset,
+        items=items,
+        n_personas=n_personas,
+        persona_seed=persona_seed,
+        axis_mode=axis_mode,
+        fixed_axis_count=fixed_axis_count,
+        task_axis_count=task_axis_count,
+        sampling_method=sampling_method,
+        generator_model=generator_model,
+        judge_generator_model=judge_generator_model,
+        judge_persona_mode=judge_persona_mode,
+        backend=backend,
+        axes_file=axes_file,
+        n_plain_agents=n_plain_agents,
+    )
+    parsed_input_by_uid = {
+        parsed_input["item"].item_uid: parsed_input
+        for parsed_input in parsed_inputs
+    }
 
     def _item_data(item: SubsetItem) -> dict[str, Any]:
         return per_item.setdefault(item.item_uid, {})
 
-    start_idx = 0
-    if prev_entry is not None:
-        completed = prev_entry.completed_stage
-        if completed in _PERSONA_STAGE_ORDER:
-            start_idx = _stage_index(completed) + 1
+    start_idx = _staged_persona_start_index(prev_entry=prev_entry)
 
     if prev_entry is not None and start_idx > target_idx:
         print(
@@ -770,9 +1173,10 @@ def run_persona_generation_staged(
                 generator_model=generator_model,
                 judge_generator_model=judge_generator_model,
                 generator_engine=generator_engine,
-                judge_engine=judge_engine,
+                        judge_engine=judge_engine or generator_engine,
                 axes_file=axes_file,
                 judge_bank_dir=judge_bank_dir,
+                n_plain_agents=n_plain_agents,
                 judge_bank_refresh=judge_bank_refresh,
                 gpqa_family_cache_path=gpqa_family_cache_path,
                 save_artifact=False,
@@ -781,108 +1185,92 @@ def run_persona_generation_staged(
 
     for stage_idx in range(start_idx, target_idx + 1):
         stage_name = _PERSONA_STAGE_ORDER[stage_idx]
+        stage_items = _persona_stage_pending_items(stage_name=stage_name, items=items, per_item=per_item)
         print(f"[staged-persona] running stage: {stage_name}", file=summary_file)
         try:
             if stage_name == "axes":
-                for item in items:
-                    d = _item_data(item)
-                    if replay:
+                if replay:
+                    for item in stage_items:
+                        d = _item_data(item)
                         artifact, _artifact_path = replay_artifacts[item.item_uid]
                         d["axis_selection"] = asdict(artifact.axes)
                         d["sampled_points"] = deepcopy(artifact.sampled_points)
-                        continue
-                    question, _, raw_task = _parse_question_answer(dataset, item.raw_task)
-                    config = _persona_config_for_item(
-                        dataset=dataset,
-                        item=item,
-                        question=question,
-                        raw_task=raw_task,
-                        n_personas=n_personas,
-                        persona_seed=persona_seed,
-                        axis_mode=axis_mode,
-                        fixed_axis_count=fixed_axis_count,
-                        task_axis_count=task_axis_count,
-                        sampling_method=sampling_method,
-                        generator_model=generator_model,
-                        judge_generator_model=judge_generator_model,
-                        judge_persona_mode=judge_persona_mode,
-                        backend=backend,
-                        axes_file=axes_file,
+                else:
+                    stage_parsed_inputs = [parsed_input_by_uid[item.item_uid] for item in stage_items]
+                    axis_results = _run_axes_stage_parallel(
+                        parsed_inputs=stage_parsed_inputs,
+                        generator_engine=generator_engine,
+                        on_result=lambda idx, stage_result: _item_data(stage_parsed_inputs[idx]["item"]).update(
+                            {
+                                "axis_selection": stage_result["axis_selection"],
+                                "sampled_points": stage_result["sampled_points"],
+                            }
+                        ),
                     )
-                    axis_selection, points, _stage_backend = prepare_descriptor_generation(
-                        config=config,
-                        engine=generator_engine,
-                    )
-                    d["axis_selection"] = asdict(axis_selection)
-                    d["sampled_points"] = points
+                    for parsed_input, stage_result in zip(stage_parsed_inputs, axis_results):
+                        d = _item_data(parsed_input["item"])
+                        d["axis_selection"] = stage_result["axis_selection"]
+                        d["sampled_points"] = stage_result["sampled_points"]
 
             elif stage_name == "descriptors":
-                for item in items:
-                    d = _item_data(item)
-                    if replay:
+                if replay:
+                    for item in stage_items:
+                        d = _item_data(item)
                         artifact, _artifact_path = replay_artifacts[item.item_uid]
                         d["descriptors"] = [asdict(desc) for desc in artifact.descriptors]
                         d["descriptor_validator_metadata"] = _descriptor_stage_metadata_from_artifact(artifact)
                         d["descriptor_call_metadata"] = artifact.validator_metadata.get("descriptor_call_metadata")
-                        continue
-                    axis_selection = AxisSelection.from_dict(d["axis_selection"])
-                    points = [
-                        {str(k): float(v) for k, v in point.items()}
-                        for point in d["sampled_points"]
-                    ]
-                    question, _, raw_task = _parse_question_answer(dataset, item.raw_task)
-                    config = _persona_config_for_item(
-                        dataset=dataset,
-                        item=item,
-                        question=question,
-                        raw_task=raw_task,
-                        n_personas=n_personas,
-                        persona_seed=persona_seed,
-                        axis_mode=axis_mode,
-                        fixed_axis_count=fixed_axis_count,
-                        task_axis_count=task_axis_count,
-                        sampling_method=sampling_method,
-                        generator_model=generator_model,
-                        judge_generator_model=judge_generator_model,
-                        judge_persona_mode=judge_persona_mode,
-                        backend=backend,
-                        axes_file=axes_file,
+                else:
+                    stage_parsed_inputs = [parsed_input_by_uid[item.item_uid] for item in stage_items]
+                    descriptor_results = _run_descriptors_stage_parallel(
+                        parsed_inputs=stage_parsed_inputs,
+                        per_item_data=per_item,
+                        generator_engine=generator_engine,
+                        on_result=lambda idx, stage_result: _item_data(stage_parsed_inputs[idx]["item"]).update(
+                            {
+                                "descriptors": stage_result["descriptors"],
+                                "descriptor_validator_metadata": stage_result["descriptor_validator_metadata"],
+                                "descriptor_call_metadata": stage_result["descriptor_call_metadata"],
+                            }
+                        ),
                     )
-                    descriptors, descriptor_meta = generate_descriptors_from_state(
-                        config=config,
-                        axis_selection=axis_selection,
-                        points=points,
-                        engine=generator_engine,
-                    )
-                    d["descriptors"] = [asdict(desc) for desc in descriptors]
-                    d["descriptor_validator_metadata"] = dict(descriptor_meta["validator_metadata"])
-                    d["descriptor_call_metadata"] = descriptor_meta["validator_metadata"].get("descriptor_call_metadata")
+                    for parsed_input, stage_result in zip(stage_parsed_inputs, descriptor_results):
+                        d = _item_data(parsed_input["item"])
+                        d["descriptors"] = stage_result["descriptors"]
+                        d["descriptor_validator_metadata"] = stage_result["descriptor_validator_metadata"]
+                        d["descriptor_call_metadata"] = stage_result["descriptor_call_metadata"]
 
             elif stage_name == "cards":
-                for item in items:
-                    d = _item_data(item)
-                    if replay:
+                if replay:
+                    for item in stage_items:
+                        d = _item_data(item)
                         artifact, _artifact_path = replay_artifacts[item.item_uid]
                         d["cards"] = [asdict(card) for card in artifact.cards]
                         d["card_metadata"] = _card_stage_metadata_from_artifact(artifact)
                         d["card_call_metadata"] = deepcopy(artifact.validator_metadata.get("card_call_metadata") or [])
-                        continue
-                    descriptors = [PersonaDescriptor.from_dict(desc_dict) for desc_dict in d["descriptors"]]
-                    question, _, raw_task = _parse_question_answer(dataset, item.raw_task)
-                    cards, card_meta = expand_cards(
-                        descriptors,
-                        dataset=dataset,
-                        question=question,
-                        raw_task=raw_task,
-                        engine=generator_engine,
-                        backend=effective_backend,
+                else:
+                    stage_parsed_inputs = [parsed_input_by_uid[item.item_uid] for item in stage_items]
+                    card_results = _run_cards_stage_parallel(
+                        parsed_inputs=stage_parsed_inputs,
+                        per_item_data=per_item,
+                        generator_engine=generator_engine,
+                        effective_backend=effective_backend,
+                        on_result=lambda idx, stage_result: _item_data(stage_parsed_inputs[idx]["item"]).update(
+                            {
+                                "cards": stage_result["cards"],
+                                "card_metadata": stage_result["card_metadata"],
+                                "card_call_metadata": stage_result["card_call_metadata"],
+                            }
+                        ),
                     )
-                    d["cards"] = [asdict(card) for card in cards]
-                    d["card_metadata"] = dict(card_meta)
-                    d["card_call_metadata"] = deepcopy(card_meta.get("card_call_metadata") or [])
+                    for parsed_input, stage_result in zip(stage_parsed_inputs, card_results):
+                        d = _item_data(parsed_input["item"])
+                        d["cards"] = stage_result["cards"]
+                        d["card_metadata"] = stage_result["card_metadata"]
+                        d["card_call_metadata"] = stage_result["card_call_metadata"]
 
             elif stage_name == "judge_card":
-                for item in items:
+                for item in stage_items:
                     d = _item_data(item)
                     artifact_path_str: str | None = None
                     if replay:
@@ -901,36 +1289,21 @@ def run_persona_generation_staged(
                             artifact_path_str=artifact_path_str,
                         )
                         continue
-                    question, _, raw_task = _parse_question_answer(dataset, item.raw_task)
+                    parsed_input = parsed_input_by_uid[item.item_uid]
+                    question = parsed_input["question"]
+                    raw_task = parsed_input["raw_task"]
                     judge_card, judge_bank_meta = _resolve_runtime_judge_card(
                         dataset=dataset, item=item, question=question, raw_task=raw_task,
                         persona_artifacts_dir=artifacts_dir,
                         judge_bank_dir=judge_bank_dir, judge_bank_refresh=judge_bank_refresh,
                         gpqa_family_cache_path=gpqa_family_cache_path,
                         judge_persona_mode=judge_persona_mode, persona_backend=effective_backend,
-                        judge_generator_model=judge_generator_model, judge_engine=judge_engine,
+                        judge_generator_model=judge_generator_model, judge_engine=judge_engine or generator_engine,
                     )
                     d["judge_card"] = asdict(judge_card) if judge_card is not None else None
                     d["judge_bank_meta"] = judge_bank_meta
-                    config = _persona_config_for_item(
-                        dataset=dataset,
-                        item=item,
-                        question=question,
-                        raw_task=raw_task,
-                        n_personas=n_personas,
-                        persona_seed=persona_seed,
-                        axis_mode=axis_mode,
-                        fixed_axis_count=fixed_axis_count,
-                        task_axis_count=task_axis_count,
-                        sampling_method=sampling_method,
-                        generator_model=generator_model,
-                        judge_generator_model=judge_generator_model,
-                        judge_persona_mode=judge_persona_mode,
-                        backend=backend,
-                        axes_file=axes_file,
-                    )
                     artifact = _build_staged_persona_artifact(
-                        config=config,
+                        config=parsed_input["config"],
                         item_data=d,
                         backend=effective_backend,
                     )
@@ -950,6 +1323,26 @@ def run_persona_generation_staged(
             last_completed_stage = prev_entry.completed_stage if prev_entry is not None else ""
             if stage_idx > 0:
                 last_completed_stage = _PERSONA_STAGE_ORDER[stage_idx - 1]
+            partial_entry = make_stage_entry(
+                stage_type="persona",
+                completed_stage=last_completed_stage,
+                dataset=str(dataset),
+                items=items_ser,
+                persona_data=per_item,
+                meta=_persona_stage_meta(
+                    persona_stage=persona_stage,
+                    n_personas=n_personas,
+                    persona_seed=persona_seed,
+                    axis_mode=axis_mode,
+                    backend=effective_backend,
+                    generator_model=generator_model,
+                    judge_generator_model=judge_generator_model,
+                    current_resume_settings=current_resume_settings,
+                    active_stage=stage_name,
+                    active_stage_complete=False,
+                ),
+            )
+            append_stage_entry(stage_state_file, partial_entry)
             audit_path = _append_persona_failure_audit(
                 stage_state_file=stage_state_file,
                 dataset=dataset,
@@ -968,16 +1361,18 @@ def run_persona_generation_staged(
             dataset=str(dataset),
             items=items_ser,
             persona_data=per_item,
-            meta={
-                "persona_stage": persona_stage,
-                "n_personas": n_personas,
-                "persona_seed": persona_seed,
-                "axis_mode": axis_mode,
-                "backend": effective_backend,
-                "generator_model": generator_model,
-                "judge_generator_model": judge_generator_model,
-                "resume_settings": dict(current_resume_settings),
-            },
+            meta=_persona_stage_meta(
+                persona_stage=persona_stage,
+                n_personas=n_personas,
+                persona_seed=persona_seed,
+                axis_mode=axis_mode,
+                backend=effective_backend,
+                generator_model=generator_model,
+                judge_generator_model=judge_generator_model,
+                current_resume_settings=current_resume_settings,
+                active_stage=stage_name,
+                active_stage_complete=True,
+            ),
         )
         append_stage_entry(stage_state_file, entry)
         print(f"[staged-persona] stage {stage_name} complete, state appended to {stage_state_file}", file=summary_file)

@@ -144,6 +144,35 @@ def test_hle_adapter_load_items_populates_family_and_prompt_metadata(tmp_path: P
     assert item.prompt_metadata["domain_family"] == "physical_sciences"
 
 
+def test_hle_adapter_load_items_prefers_split_recorded_in_materialized_rows(tmp_path: Path):
+    path = tmp_path / "verified.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "id": "hle-reg-2",
+                "question": "Which option is correct?\nA) red\nB) blue\nC) green",
+                "answer": "blue",
+                "answer_type": "multipleChoice",
+                "category": "Physics",
+                "Verified_Classes": "Gold subset",
+                "source_variant": "verified",
+                "source_dataset_split": "test",
+            }
+        ],
+    )
+    adapter = get_dataset_adapter("hle")
+    result = adapter.load_items(
+        path,
+        registry_meta={
+            "source_dataset_id": "skylenage/HLE-Verified",
+            "source_dataset_config": "default",
+            "source_dataset_split": "train",
+        },
+    )
+    assert result.registry_meta["source_dataset_split"] == "test"
+
+
 def test_gpqa_materialize_uses_pinned_registry_config(tmp_path: Path, monkeypatch):
     recorded: list[tuple[object, object, object]] = []
 
@@ -168,3 +197,58 @@ def test_gpqa_materialize_preserves_underlying_exception(tmp_path: Path, monkeyp
     adapter = get_dataset_adapter("gpqa")
     with pytest.raises(ConnectionError, match="hub timeout"):
         adapter.materialize(tmp_path / "gpqa.jsonl")
+
+
+def test_hle_materialize_prefers_test_split_when_available(tmp_path: Path, monkeypatch):
+    recorded: list[tuple[object, object, object]] = []
+
+    fake_datasets = types.SimpleNamespace(
+        get_dataset_split_names=lambda dataset_id, revision=None: ["test", "train"],
+        load_dataset=lambda dataset_id, split=None, revision=None, **kwargs: recorded.append((dataset_id, split, revision)) or [
+            {
+                "id": "gold-1",
+                "question": "Q1\nA) x\nB) y",
+                "answer": "B",
+                "answer_type": "multipleChoice",
+                "category": "Physics",
+                "Verified_Classes": "Gold subset",
+            }
+        ],
+    )
+    monkeypatch.setitem(sys.modules, "datasets", fake_datasets)
+
+    adapter = get_dataset_adapter("hle")
+    out_path = tmp_path / "verified.jsonl"
+    adapter.materialize(out_path, variant="verified")
+
+    rows = [json.loads(line) for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert recorded == [("skylenage/HLE-Verified", "test", "0bc83643672d4f68a5f89998617a639d85e7318b")]
+    assert rows[0]["source_dataset_split"] == "test"
+
+
+def test_hle_materialize_falls_back_to_train_when_test_is_unavailable(tmp_path: Path, monkeypatch):
+    recorded: list[tuple[object, object, object]] = []
+
+    fake_datasets = types.SimpleNamespace(
+        get_dataset_split_names=lambda dataset_id, revision=None: ["train"],
+        load_dataset=lambda dataset_id, split=None, revision=None, **kwargs: recorded.append((dataset_id, split, revision)) or [
+            {
+                "id": "gold-1",
+                "question": "Q1\nA) x\nB) y",
+                "answer": "B",
+                "answer_type": "multipleChoice",
+                "category": "Physics",
+                "Verified_Classes": "Gold subset",
+            }
+        ],
+    )
+    monkeypatch.setitem(sys.modules, "datasets", fake_datasets)
+
+    adapter = get_dataset_adapter("hle")
+    out_path = tmp_path / "verified.jsonl"
+    adapter.materialize(out_path, variant="verified")
+
+    rows = [json.loads(line) for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert recorded == [("skylenage/HLE-Verified", "train", "0bc83643672d4f68a5f89998617a639d85e7318b")]
+    assert rows[0]["source_dataset_split"] == "train"
+

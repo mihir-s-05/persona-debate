@@ -61,6 +61,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="HLE-Verified slice to materialize/use when --dataset hle is selected.",
     )
     ap.add_argument(
+        "--hle_modality",
+        type=str,
+        default="any",
+        choices=["any", "text_only", "image_only"],
+        help="Optional HLE modality filter applied before subset sampling.",
+    )
+    ap.add_argument(
         "--exclude_ids",
         type=str,
         default=None,
@@ -182,6 +189,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--use_personas", action="store_true", help="Enable persona-conditioned debate or majority generation/replay.")
     ap.add_argument("--persona_n", type=int, default=5, help="Number of personas to generate in persona mode.")
     ap.add_argument(
+        "--persona_plain_agents",
+        type=int,
+        default=0,
+        help="Number of debate agents that remain plain (no persona) in a persona-enabled debate. The first N agents are plain; the rest receive generated personas. Default 0 (all agents use personas).",
+    )
+    ap.add_argument(
         "--persona_axes_mode",
         type=str,
         default="hybrid",
@@ -202,8 +215,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--persona_backend",
         type=str,
         default="llm",
-        choices=["auto", "heuristic", "llm"],
-        help="Persona generation backend. Defaults to llm. 'auto' uses llm when a generator model is available, else heuristic.",
+        choices=["llm"],
+        help="Persona generation backend. Persona and judge generation are LLM-only.",
     )
     ap.add_argument(
         "--generator_model",
@@ -244,7 +257,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--judge_bank_dir", type=str, default=None, help="Directory for persistent benchmark-family judge-bank artifacts.")
     ap.add_argument("--judge_bank_refresh", action="store_true", help="Regenerate persistent benchmark-family judge-bank entries.")
     ap.add_argument("--gpqa_family_cache_path", type=str, default=None, help="Optional cache path for GPQA biology/chemistry/physics family assignments.")
-    ap.add_argument("--persona_seed", type=int, default=0, help="Seed for persona sampling.")
+    ap.add_argument("--persona_seed", type=int, default=None, help="Seed for persona sampling. Defaults to subset_seed if set, otherwise 0.")
     ap.add_argument("--persona_replay", action="store_true", help="Replay saved persona artifacts instead of generating new ones.")
     ap.add_argument("--persona_save_artifacts", action="store_true", help="Persist generated persona artifacts.")
     ap.add_argument("--persona_dump_cards", action="store_true", help="Print generated persona system prompts to stdout/stderr summary stream.")
@@ -267,6 +280,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="full",
         choices=["minimal", "full"],
         help="Logical trace block detail level embedded in output rows.",
+    )
+    ap.add_argument(
+        "--hle_experiment",
+        action="store_true",
+        help="Run the HLE-only three-arm experiment: single baseline, plain debate, and persona debate.",
+    )
+    ap.add_argument(
+        "--hle_experiment_stop_after",
+        type=str,
+        default=None,
+        choices=["single", "debate_plain", "persona_debate"],
+        help="Optional experiment arm to stop after when --hle_experiment is enabled.",
     )
     ap.add_argument("--final_manifest", type=str, default=None, help="Optional manifest path used to write or lock final-run config.")
     ap.add_argument("--final_run", action="store_true", help="Validate or create a final-run manifest that freezes key config.")

@@ -4,12 +4,13 @@ import json
 import io
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from debate_v_majority.cli import main_impl as cli_main_impl
 from debate_v_majority.cli.subset import _make_dataset_subset
-from debate_v_majority.personas.axes import build_axis_selection
+from debate_v_majority.personas.axes import AxisGenerationExhaustedError, build_axis_selection
 from debate_v_majority.personas import (
     FIXED_AXIS_BANK,
     PersonaGenerationConfig,
@@ -64,6 +65,9 @@ class _FakeEngine:
     def __init__(self) -> None:
         self.calls = []
 
+    def shutdown(self) -> None:
+        return None
+
     def generate_batch(self, contexts, batch_size=1, sampling_kwargs=None, progress_callback=None, model_role=None):
         self.calls.append(
             {
@@ -98,6 +102,13 @@ class _FakeEngine:
                                     "low_desc": "low mode",
                                     "high_desc": "high mode",
                                     "notes": "generated",
+                                },
+                                {
+                                    "axis_id": "llm_axis_2",
+                                    "name": "LLM Axis 2",
+                                    "low_desc": "low mode two",
+                                    "high_desc": "high mode two",
+                                    "notes": "generated",
                                 }
                             ]
                         }
@@ -109,25 +120,22 @@ class _FakeEngine:
                         {
                             "descriptors": [
                                 {
-                                    "persona_id": "persona_1",
-                                    "name": "Verifier",
-                                    "axis_interpretation": {"llm_axis": "leans low"},
-                                    "short_rule": "verify before concluding",
-                                    "reasoning_summary": "checks constraints before committing",
-                                },
-                                {
-                                    "persona_id": "persona_2",
-                                    "name": "Pruner",
-                                    "axis_interpretation": {"llm_axis": "leans high"},
-                                    "short_rule": "prune quickly and stress test",
-                                    "reasoning_summary": "moves fast but checks contradictions",
-                                },
+                                    "persona_id": f"persona_{idx + 1}",
+                                    "name": f"Persona {idx + 1}",
+                                    "axis_interpretation": {"llm_axis": f"mode_{idx}"},
+                                    "short_rule": f"rule_{idx}",
+                                    "reasoning_summary": f"reasoning summary {idx}",
+                                }
+                                for idx in range(5)
                             ]
                         }
                     )
                 )
             elif "Expand each descriptor into a compact" in prompt:
-                persona_id = "persona_1" if "persona_1" in prompt else "persona_2"
+                persona_id = next(
+                    (f"persona_{idx}" for idx in range(1, 6) if f"persona_{idx}" in prompt),
+                    "persona_1",
+                )
                 outputs.append(
                     json.dumps(
                         {
@@ -160,6 +168,24 @@ class _FakeEngine:
                         }
                     )
                 )
+            elif "Generate a reusable benchmark-level judge card" in prompt:
+                outputs.append(
+                    json.dumps(
+                        {
+                            "judge_id": "judge_bank_generated",
+                            "judge_family": "math",
+                            "domain_scope": "competition_math",
+                            "evaluation_priorities": ["score transcript support"],
+                            "tie_break_policy": "prefer explicit support",
+                            "independent_resolve_policy": "limited_check_only",
+                            "answer_format_policy": "strict",
+                            "confidence_policy": "optional",
+                            "system_prompt": "Generated judge bank prompt",
+                        }
+                    )
+                )
+            elif "Classify this GPQA item into exactly one domain family" in prompt:
+                outputs.append(json.dumps({"judge_family": "physics"}))
             else:
                 raise AssertionError(f"Unexpected prompt: {prompt}")
         if progress_callback is not None:
@@ -311,6 +337,7 @@ def test_generate_task_axes_retries_after_parse_error():
 
 
 def test_descriptor_generation_skips_task_overlap_context():
+    engine = _FakeEngine()
     axis_selection = build_axis_selection(
         mode="task",
         question="Let f(x)=((x-18)(x-72)(x-98)(x-k))/x. Find the sum of the three values of k.",
@@ -319,8 +346,8 @@ def test_descriptor_generation_skips_task_overlap_context():
         fixed_count=0,
         task_count=1,
         generator_model=None,
-        engine=None,
-        backend="heuristic",
+        engine=engine,
+        backend="llm",
         axes_file=None,
     )
 
@@ -358,22 +385,31 @@ def test_duplicate_diagnostics_flags_near_duplicates():
 
 def test_judge_generation_modes_differ():
     raw_task = {"problem": "What is 1+1?", "answer": "2"}
-    neutral = build_judge_card(dataset="aime25", raw_task=raw_task, question="q", mode="neutral_baseline")
-    family = build_judge_card(dataset="aime25", raw_task=raw_task, question="q", mode="task_family_generated")
-    question = build_judge_card(dataset="aime25", raw_task=raw_task, question="What is 1+1?", mode="question_conditioned_generated")
+    engine = _FakeEngine()
+    neutral = build_judge_card(dataset="aime25", raw_task=raw_task, question="q", mode="neutral_baseline", engine=engine, backend="llm")
+    family = build_judge_card(dataset="aime25", raw_task=raw_task, question="q", mode="task_family_generated", engine=engine, backend="llm")
+    question = build_judge_card(
+        dataset="aime25",
+        raw_task=raw_task,
+        question="What is 1+1?",
+        mode="question_conditioned_generated",
+        engine=engine,
+        backend="llm",
+    )
     assert neutral is not None and family is not None and question is not None
-    assert neutral.judge_family != family.judge_family
-    assert question.domain_scope != family.domain_scope
+    assert neutral.judge_family == "competition_math"
+    assert family.judge_family == "competition_math"
+    assert question.domain_scope == "competition_math"
 
 
 def test_benchmark_family_bank_artifact_and_family_routing(tmp_path: Path):
     judge_card, artifact, path = ensure_judge_bank_card(
-        judge_bank_dir=default_judge_bank_dir(artifacts_dir=tmp_path),
+        judge_bank_dir=tmp_path / "judge_banks",
         dataset="aime25",
         judge_family="math",
-        engine=None,
-        generator_model=None,
-        backend="heuristic",
+        engine=_FakeEngine(),
+        generator_model="fake-judge-generator",
+        backend="llm",
         refresh=False,
     )
     assert judge_card.judge_family == "math"
@@ -415,8 +451,16 @@ def test_build_persona_artifact_and_roundtrip(tmp_path: Path):
         fixed_axis_count=2,
         task_axis_count=1,
     )
-    judge_card = build_judge_card(dataset="aime25", raw_task=raw_task, question=config.question)
-    artifact = build_persona_artifact(config=config, judge_card=judge_card)
+    engine = _FakeEngine()
+    judge_card = build_judge_card(
+        dataset="aime25",
+        raw_task=raw_task,
+        question=config.question,
+        engine=engine,
+        generator_model="fake-judge-generator",
+        backend="llm",
+    )
+    artifact = build_persona_artifact(config=config, judge_card=judge_card, generator_engine=engine)
     assert artifact.item_uid == "aime25:h:test"
     assert len(artifact.cards) == 3
     path = save_artifact(artifacts_dir=tmp_path, artifact=artifact)
@@ -426,7 +470,15 @@ def test_build_persona_artifact_and_roundtrip(tmp_path: Path):
 
 def test_save_artifact_keys_path_by_generation_config(tmp_path: Path):
     raw_task = {"problem": "What is 1+1?", "answer": "2"}
-    judge_card = build_judge_card(dataset="aime25", raw_task=raw_task, question="What is 1+1?")
+    engine = _FakeEngine()
+    judge_card = build_judge_card(
+        dataset="aime25",
+        raw_task=raw_task,
+        question="What is 1+1?",
+        engine=engine,
+        generator_model="fake-judge-generator",
+        backend="llm",
+    )
     config_a = PersonaGenerationConfig(
         dataset="aime25",
         question="What is 1+1?",
@@ -453,8 +505,8 @@ def test_save_artifact_keys_path_by_generation_config(tmp_path: Path):
         fixed_axis_count=2,
         task_axis_count=1,
     )
-    artifact_a = build_persona_artifact(config=config_a, judge_card=judge_card)
-    artifact_b = build_persona_artifact(config=config_b, judge_card=judge_card)
+    artifact_a = build_persona_artifact(config=config_a, judge_card=judge_card, generator_engine=engine)
+    artifact_b = build_persona_artifact(config=config_b, judge_card=judge_card, generator_engine=engine)
 
     path_a = save_artifact(artifacts_dir=tmp_path, artifact=artifact_a)
     path_b = save_artifact(artifacts_dir=tmp_path, artifact=artifact_b)
@@ -504,11 +556,11 @@ def test_resolve_persona_artifact_replay_falls_back_to_legacy_path(tmp_path: Pat
         task_axis_count=1,
         sampling_method="maximin",
         judge_persona_mode="task_family_generated",
-        backend="heuristic",
-        generator_model=None,
-        judge_generator_model=None,
-        generator_engine=None,
-        judge_engine=None,
+        backend="llm",
+        generator_model="fake-generator",
+        judge_generator_model="fake-judge-generator",
+        generator_engine=_FakeEngine(),
+        judge_engine=_FakeEngine(),
         axes_file=None,
         save_artifact=False,
         replay=False,
@@ -534,9 +586,9 @@ def test_resolve_persona_artifact_replay_falls_back_to_legacy_path(tmp_path: Pat
         task_axis_count=1,
         sampling_method="maximin",
         judge_persona_mode="task_family_generated",
-        backend="heuristic",
-        generator_model=None,
-        judge_generator_model=None,
+        backend="llm",
+        generator_model="fake-generator",
+        judge_generator_model="fake-judge-generator",
         generator_engine=None,
         judge_engine=None,
         axes_file=None,
@@ -728,27 +780,56 @@ def test_expand_cards_regenerates_only_weaker_duplicates(monkeypatch: pytest.Mon
         ),
     ]
 
-    def _duplicate_card(descriptor: PersonaDescriptor) -> PersonaCard:
+    class _DuplicateCardEngine:
+        model_name = "fake-generator"
+        provider_name = "fake"
+
+        def generate_batch(self, contexts, batch_size=None, sampling_kwargs=None, progress_callback=None, model_role=None):
+            del batch_size, sampling_kwargs, model_role
+            outputs = []
+            for _ctx in contexts:
+                outputs.append(
+                    json.dumps(
+                        {
+                            "persona_id": "persona_1",
+                            "title": "Shared",
+                            "core_reasoning_strategy": "shared strategy",
+                            "priorities": ["track constraints"],
+                            "distrusts": ["unsupported jumps"],
+                            "decomposition_style": "shared decomposition",
+                            "revision_policy": "revise on concrete evidence",
+                            "confidence_policy": "state uncertainty directly",
+                            "failure_mode_to_avoid": "do not leak hints",
+                            "system_prompt": "Shared operational prompt",
+                        }
+                    )
+                )
+            if progress_callback is not None:
+                progress_callback(len(outputs))
+            return outputs
+
+    def _regenerated_llm_card(*, descriptor: PersonaDescriptor, question: str, question_media, engine) -> tuple[PersonaCard, dict[str, Any]]:
+        del question, question_media, engine
         return PersonaCard(
             persona_id=descriptor.persona_id,
             title=descriptor.name,
-            core_reasoning_strategy="shared strategy",
-            priorities=["track constraints"],
+            core_reasoning_strategy=descriptor.reasoning_summary,
+            priorities=[descriptor.short_rule],
             distrusts=["unsupported jumps"],
-            decomposition_style="shared decomposition",
+            decomposition_style=descriptor.short_rule,
             revision_policy="revise on concrete evidence",
             confidence_policy="state uncertainty directly",
             failure_mode_to_avoid="do not leak hints",
-            system_prompt="Shared operational prompt",
+            system_prompt=f"Distinct prompt for {descriptor.persona_id}",
             card_version="test",
-        )
+        ), {"token_counts": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
 
-    monkeypatch.setattr("debate_v_majority.personas.generator._heuristic_card", _duplicate_card)
+    monkeypatch.setattr("debate_v_majority.personas.generator._llm_card", _regenerated_llm_card)
 
-    cards, meta = expand_cards(descriptors, question="What is 1+1?")
+    cards, meta = expand_cards(descriptors, question="What is 1+1?", engine=_DuplicateCardEngine())
     assert meta["card_duplicates"] == []
     assert cards[0].system_prompt == "Shared operational prompt"
-    # Regenerated card uses _heuristic_card_distinctive which produces a different system prompt
+    # Duplicate regeneration should make the second card distinctive on retry.
     assert cards[1].system_prompt != "Shared operational prompt"
     assert "persona_2" in cards[1].system_prompt
     # Core strategy preserved from descriptor
@@ -767,7 +848,7 @@ def test_generate_descriptors_retries_after_validator_retry(monkeypatch: pytest.
         persona_seed=9,
         axis_mode="fixed",
         fixed_axis_count=1,
-        backend="heuristic",
+        backend="llm",
     )
     statuses = iter(["retry", "accept", "accept", "accept"])
     call_count = {"n": 0}
@@ -779,7 +860,7 @@ def test_generate_descriptors_retries_after_validator_retry(monkeypatch: pytest.
 
     monkeypatch.setattr("debate_v_majority.personas.generator.validate_descriptor", _fake_validate_descriptor)
 
-    descriptors, meta = generate_descriptors(config=config)
+    descriptors, meta = generate_descriptors(config=config, engine=_FakeEngine())
     assert len(descriptors) == 2
     assert call_count["n"] == 4
     assert meta["validator_metadata"]["descriptor_validations"][-1]["attempt"] == 1
@@ -797,7 +878,7 @@ def test_generate_descriptors_retry_keeps_axes_and_sampled_points_stable(monkeyp
         persona_seed=7,
         axis_mode="fixed",
         fixed_axis_count=1,
-        backend="heuristic",
+        backend="llm",
     )
     statuses = iter(["retry", "accept", "accept", "accept"])
     axis_calls = {"n": 0}
@@ -830,7 +911,7 @@ def test_generate_descriptors_retry_keeps_axes_and_sampled_points_stable(monkeyp
     monkeypatch.setattr("debate_v_majority.personas.generator.sample_axis_points", _fake_sample_axis_points)
     monkeypatch.setattr("debate_v_majority.personas.generator.validate_descriptor", _fake_validate_descriptor)
 
-    descriptors, meta = generate_descriptors(config=config)
+    descriptors, meta = generate_descriptors(config=config, engine=_FakeEngine())
     expected_points = sample_axis_points(
         axes=get_fixed_axes(1),
         num_personas=2,
@@ -1097,7 +1178,7 @@ def test_expand_cards_retry_cap_raises_after_exhaustion(monkeypatch: pytest.Monk
     monkeypatch.setattr("debate_v_majority.personas.generator.validate_card", _always_retry)
 
     with pytest.raises(ValueError, match="Card generation exhausted retries"):
-        expand_cards(descriptors, question="What is 1+1?")
+        expand_cards(descriptors, question="What is 1+1?", engine=_FakeEngine(), backend="llm")
 
     assert call_count["n"] == MAX_GENERATION_RETRIES + 1
 
@@ -1115,6 +1196,8 @@ def test_arg_parser_accepts_debater_model_alias():
 
 
 def test_persona_mode_main_generates_and_replays(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from debate_v_majority.cli.stage_state import make_stage_entry
+
     dataset_path = tmp_path / "dataset.jsonl"
     rows = [
         {
@@ -1129,8 +1212,60 @@ def test_persona_mode_main_generates_and_replays(tmp_path: Path, monkeypatch: py
     _write_jsonl(dataset_path, rows)
     out_dir = tmp_path / "out"
     artifact_dir = tmp_path / "artifacts"
+    artifact_path_value = artifact_dir / "gpqa" / "gpqa__gpqa-item-1--fake.json"
+    artifact_path_value.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path_value.write_text(json.dumps({"item_uid": "gpqa:gpqa-item-1"}) + "\n", encoding="utf-8")
+    fake_records = [
+        {
+            "schema_version": "phase0.v2",
+            "mode": "personas",
+            "dataset": "gpqa",
+            "item_uid": "gpqa:gpqa-item-1",
+            "dataset_revision": None,
+            "item_display_id": "gpqa-item-1",
+            "artifact_version": "test-artifact.v1",
+            "persona_seed": 0,
+            "generator_model": "fake-generator",
+            "judge_generator_model": "fake-judge-generator",
+            "axes": {"mode": "hybrid", "axes": []},
+            "sampled_points": [],
+            "descriptors": [],
+            "cards": [],
+                "judge_card": {
+                    "judge_id": "judge_1",
+                    "judge_family": "physics",
+                    "domain_scope": "physics",
+                    "evaluation_priorities": ["score transcript support"],
+                    "tie_break_policy": "prefer explicit support",
+                    "independent_resolve_policy": "limited_check_only",
+                    "answer_format_policy": "strict",
+                    "confidence_policy": "optional",
+                    "system_prompt": "Judge prompt",
+                    "card_version": "test-card.v1",
+                    "source": {},
+                },
+            "prompt_versions": {},
+            "created_at": "2026-03-20T00:00:00Z",
+            "validator_metadata": {},
+            "artifact_path": str(artifact_path_value),
+        }
+    ]
 
     monkeypatch.setattr(cli_main_impl, "_default_dataset_test_path", lambda dataset, **_kw: dataset_path)
+    monkeypatch.setattr(cli_main_impl, "build_sampling_config", lambda model_name: SimpleNamespace(max_tokens=128, temperature=1.0, top_p=0.95, top_k=-1))
+    monkeypatch.setattr(cli_main_impl, "set_sampling_config", lambda cfg: None)
+    monkeypatch.setattr(
+        cli_main_impl,
+        "run_persona_generation_staged",
+        lambda **kwargs: make_stage_entry(
+            stage_type="persona",
+            completed_stage="judge_card",
+            dataset="gpqa",
+            items=[],
+            persona_data={},
+        ),
+    )
+    monkeypatch.setattr(cli_main_impl, "persona_rows_from_stage_entry", lambda entry: list(fake_records))
     monkeypatch.setattr(
         sys,
         "argv",
@@ -1141,7 +1276,11 @@ def test_persona_mode_main_generates_and_replays(tmp_path: Path, monkeypatch: py
             "--mode",
             "personas",
             "--persona_backend",
-            "heuristic",
+            "llm",
+            "--generator_model",
+            "fake-generator",
+            "--judge_generator_model",
+            "fake-judge-generator",
             "--subset_ids",
             "0",
             "--out_dir",
@@ -1171,7 +1310,11 @@ def test_persona_mode_main_generates_and_replays(tmp_path: Path, monkeypatch: py
             "--mode",
             "personas",
             "--persona_backend",
-            "heuristic",
+            "llm",
+            "--generator_model",
+            "fake-generator",
+            "--judge_generator_model",
+            "fake-judge-generator",
             "--subset_ids",
             "0",
             "--out_dir",
@@ -1212,11 +1355,11 @@ def test_persona_generation_emits_benchmark_bank_judge_card(tmp_path: Path):
         task_axis_count=0,
         sampling_method="maximin",
         judge_persona_mode="benchmark_family_bank",
-        backend="heuristic",
-        generator_model=None,
-        judge_generator_model=None,
-        generator_engine=None,
-        judge_engine=None,
+        backend="llm",
+        generator_model="fake-generator",
+        judge_generator_model="fake-judge-generator",
+        generator_engine=_FakeEngine(),
+        judge_engine=_FakeEngine(),
         axes_file=None,
         judge_bank_dir=tmp_path / "judge_bank",
         judge_bank_refresh=False,
@@ -1238,6 +1381,69 @@ def test_arg_parser_defaults_persona_backend_to_llm():
     parser = cli_main_impl._build_arg_parser()
     args = parser.parse_args(["--dataset", "gpqa", "--mode", "personas"])
     assert args.persona_backend == "llm"
+
+
+def test_generate_task_axes_llm_backend_requires_engine():
+    with pytest.raises(ValueError, match="requires a generator engine"):
+        generate_task_axes(
+            dataset="hle",
+            question="Which option is correct?",
+            raw_task={"category": "Physics"},
+            benchmark_family="physical_sciences",
+            count=2,
+            generator_model="gemini-3-flash-preview",
+            engine=None,
+            backend="llm",
+        )
+
+
+def test_generate_task_axes_llm_backend_does_not_fallback():
+    class _BadAxisEngine:
+        model_name = "gemini-3-flash-preview"
+        provider_name = "fake-provider"
+
+        def generate_batch_results(self, contexts, batch_size=None, sampling_kwargs=None, progress_callback=None, model_role=None):
+            from debate_v_majority.engines.base import make_text_result
+
+            return [make_text_result("{}", model_name=self.model_name, provider_name=self.provider_name, model_role=model_role)]
+
+    with pytest.raises(AxisGenerationExhaustedError, match="Task-axis generation exhausted retries"):
+        generate_task_axes(
+            dataset="hle",
+            question="Which option is correct?",
+            raw_task={"category": "Physics"},
+            benchmark_family="physical_sciences",
+            count=2,
+            generator_model="gemini-3-flash-preview",
+            engine=_BadAxisEngine(),
+            backend="llm",
+        )
+
+
+def test_build_judge_card_llm_backend_requires_engine():
+    with pytest.raises(ValueError, match="requires a judge generator engine"):
+        build_judge_card(
+            dataset="hle",
+            raw_task={"category": "Physics"},
+            question="Which option is correct?",
+            mode="question_conditioned_generated",
+            engine=None,
+            backend="llm",
+        )
+
+
+def test_ensure_judge_bank_card_llm_backend_does_not_reuse_non_llm_cache(tmp_path: Path):
+    judge_bank_dir = tmp_path / "judge_banks"
+    with pytest.raises(ValueError, match="requires a judge generator engine"):
+        ensure_judge_bank_card(
+            judge_bank_dir=judge_bank_dir,
+            dataset="hle",
+            judge_family="physical_sciences",
+            engine=None,
+            generator_model="gemini-3-flash-preview",
+            backend="llm",
+            refresh=False,
+        )
 
 
 def test_prompt_templates_emphasize_support_coverage_and_operational_behavior():
@@ -1298,3 +1504,4 @@ def test_prompt_templates_emphasize_support_coverage_and_operational_behavior():
     assert "superficial consensus" in judge_user
     assert "multi-agent compatible" in judge_user
     assert "majority-vs-best-argument conflicts" in judge_user
+

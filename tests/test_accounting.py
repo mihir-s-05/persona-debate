@@ -137,3 +137,4 @@ def test_cost_tracker_raises_on_invalid_ledger_cost_field(tmp_path: Path):
     ledger_path.write_text('{"estimated_cost_usd":"oops"}\n', encoding="utf-8")
     with pytest.raises(ValueError, match="Invalid ledger cost .* estimated_cost_usd='oops'"):
         CostTracker(ledger_path=ledger_path, session_name="bad-ledger")
+

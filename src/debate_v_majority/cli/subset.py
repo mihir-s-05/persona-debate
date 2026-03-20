@@ -172,6 +172,20 @@ def _ensure_dataset_test_jsonl(
     adapter.materialize(test_path, variant=str(hle_variant))
 
 
+def _matches_hle_modality(task_item: Any, *, hle_modality: str) -> bool:
+    mode = str(hle_modality or "any").strip().lower()
+    if mode == "any":
+        return True
+    from ..datasets import hle as hle_dataset
+
+    has_images = bool(hle_dataset.has_images(getattr(task_item, "raw_task", {}) or {}))
+    if mode == "text_only":
+        return not has_images
+    if mode == "image_only":
+        return has_images
+    raise ValueError(f"Unsupported HLE modality filter: {hle_modality}")
+
+
 def _make_dataset_subset(
     *,
     dataset: DatasetName,
@@ -181,6 +195,7 @@ def _make_dataset_subset(
     ids: list[int] | None,
     range_str: str | None,
     hle_variant: str = "verified",
+    hle_modality: str = "any",
     exclude_id_map: dict[str, str | None] | None = None,
     exclude_ids_path: Path | None = None,
 ) -> tuple[list[SubsetItem], dict[str, Any]]:
@@ -199,6 +214,13 @@ def _make_dataset_subset(
         },
     )
     all_items = load_result.items
+    total_before_modality = len(all_items)
+    if dataset == "hle":
+        all_items = [
+            task_item
+            for task_item in all_items
+            if _matches_hle_modality(task_item, hle_modality=hle_modality)
+        ]
     total = len(all_items)
     dataset_revision = load_result.dataset_revision
     canonical_identifiers = {
@@ -267,11 +289,13 @@ def _make_dataset_subset(
         "dataset": dataset,
         "dataset_revision": dataset_revision,
         "dataset_variant": hle_variant if dataset == "hle" else None,
+        "hle_modality": hle_modality if dataset == "hle" else None,
         "dataset_config": registry_entry.source_dataset_config,
         "source_dataset_id": registry_entry.source_dataset_id,
         "source_dataset_split": registry_entry.source_dataset_split,
         "source_dataset_revision": registry_entry.source_dataset_revision,
         "total_available": total,
+        "total_available_before_modality": total_before_modality if dataset == "hle" else total,
         "available_after_exclusion": len(eligible_orig_ids),
         "subset_size": 0,
         "seed": seed,

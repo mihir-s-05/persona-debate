@@ -85,7 +85,7 @@ def test_append_and_load(tmp_path: Path):
     assert latest.completed_stage == "descriptors"
 
 
-def test_append_stage_entry_writes_new_v2_trace_file_per_stage(tmp_path: Path):
+def test_append_stage_entry_keeps_latest_v2_trace_per_stage(tmp_path: Path):
     path = tmp_path / "state.jsonl"
     e1 = make_stage_entry(
         stage_type="persona",
@@ -127,6 +127,65 @@ def test_append_stage_entry_writes_new_v2_trace_file_per_stage(tmp_path: Path):
     assert STAGE_TRACE_SCHEMA_VERSION in trace_files[0].read_text(encoding="utf-8")
     assert "Completed stage: `axes`" in trace_files[0].read_text(encoding="utf-8")
     assert "Completed stage: `descriptors`" in trace_files[1].read_text(encoding="utf-8")
+
+
+def test_append_stage_entry_replaces_older_trace_for_same_stage(tmp_path: Path):
+    path = tmp_path / "state.jsonl"
+    first = make_stage_entry(
+        stage_type="debate",
+        completed_stage="round_0",
+        dataset="aime25",
+        items=[{"item_uid": "aime25:1"}],
+        debate_data={
+            "n_agents": 1,
+            "n_rounds": 1,
+            "judge_rounds": [],
+            "agent_round_outputs_by_q": [
+                [
+                    [
+                        {
+                            "final_answer": "A",
+                            "visible_output": "first snapshot",
+                            "scoring_result": {"correct": 0},
+                        }
+                    ]
+                ]
+            ],
+            "results_by_round": {},
+        },
+    )
+    second = make_stage_entry(
+        stage_type="debate",
+        completed_stage="round_0",
+        dataset="aime25",
+        items=[{"item_uid": "aime25:1"}],
+        debate_data={
+            "n_agents": 1,
+            "n_rounds": 1,
+            "judge_rounds": [],
+            "agent_round_outputs_by_q": [
+                [
+                    [
+                        {
+                            "final_answer": "B",
+                            "visible_output": "latest snapshot",
+                            "scoring_result": {"correct": 1},
+                        }
+                    ]
+                ]
+            ],
+            "results_by_round": {},
+        },
+    )
+
+    append_stage_entry(path, first)
+    append_stage_entry(path, second)
+
+    trace_files = list(tmp_path.glob("state.trace.debate.round_0.v2.*.md"))
+    assert len(trace_files) == 1
+    trace_text = trace_files[0].read_text(encoding="utf-8")
+    assert "latest snapshot" in trace_text
+    assert "first snapshot" not in trace_text
 
 
 def test_append_stage_entry_writes_human_readable_debate_trace(tmp_path: Path):
@@ -548,6 +607,17 @@ class _FakeEngine:
         return outputs
 
 
+def _llm_persona_runtime_kwargs(fake_engine: _FakeEngine | None = None) -> dict[str, Any]:
+    engine = fake_engine or _FakeEngine()
+    return {
+        "backend": "llm",
+        "generator_model": "fake-generator",
+        "judge_generator_model": "fake-judge-generator",
+        "generator_engine": engine,
+        "judge_engine": engine,
+    }
+
+
 def test_staged_persona_axes_only(tmp_path: Path):
     from debate_v_majority.cli.persona_runtime import run_persona_generation_staged
     from debate_v_majority.cli.subset import SubsetItem
@@ -561,6 +631,7 @@ def test_staged_persona_axes_only(tmp_path: Path):
     state_file = tmp_path / "state.jsonl"
     artifacts_dir = tmp_path / "artifacts"
     summary = StringIO()
+    fake_engine = _FakeEngine()
     entry = run_persona_generation_staged(
         dataset="aime25",
         items=[item],
@@ -574,11 +645,7 @@ def test_staged_persona_axes_only(tmp_path: Path):
         task_axis_count=0,
         sampling_method="maximin",
         judge_persona_mode="neutral_baseline",
-        backend="heuristic",
-        generator_model=None,
-        judge_generator_model=None,
-        generator_engine=None,
-        judge_engine=None,
+        **_llm_persona_runtime_kwargs(fake_engine),
         axes_file=None,
         summary_file=summary,
     )
@@ -605,15 +672,14 @@ def test_staged_persona_resume_from_axes(tmp_path: Path):
     state_file = tmp_path / "state.jsonl"
     artifacts_dir = tmp_path / "artifacts"
     summary = StringIO()
+    fake_engine = _FakeEngine()
 
     run_persona_generation_staged(
         dataset="aime25", items=[item], artifacts_dir=artifacts_dir, stage_state_file=state_file,
         persona_stage="axes", n_personas=2, persona_seed=0,
         axis_mode="fixed", fixed_axis_count=2, task_axis_count=0,
         sampling_method="maximin", judge_persona_mode="neutral_baseline",
-        backend="heuristic", generator_model=None,
-        judge_generator_model=None, generator_engine=None,
-        judge_engine=None, axes_file=None, summary_file=summary,
+        **_llm_persona_runtime_kwargs(fake_engine), axes_file=None, summary_file=summary,
     )
 
     entry = run_persona_generation_staged(
@@ -621,9 +687,7 @@ def test_staged_persona_resume_from_axes(tmp_path: Path):
         persona_stage="descriptors", n_personas=2, persona_seed=0,
         axis_mode="fixed", fixed_axis_count=2, task_axis_count=0,
         sampling_method="maximin", judge_persona_mode="neutral_baseline",
-        backend="heuristic", generator_model=None,
-        judge_generator_model=None, generator_engine=None,
-        judge_engine=None, axes_file=None, summary_file=summary,
+        **_llm_persona_runtime_kwargs(fake_engine), axes_file=None, summary_file=summary,
     )
     assert entry.completed_stage == "descriptors"
     all_entries = load_all_stage_entries(state_file)
@@ -633,8 +697,8 @@ def test_staged_persona_resume_from_axes(tmp_path: Path):
     assert len(item_data["descriptors"]) == 2
 
 
-def test_staged_persona_full_heuristic_pipeline(tmp_path: Path):
-    """Run all four stages sequentially through heuristic backend."""
+def test_staged_persona_full_llm_pipeline(tmp_path: Path):
+    """Run all four stages sequentially through the fake LLM backend."""
     from debate_v_majority.cli.persona_runtime import run_persona_generation_staged
     from debate_v_majority.cli.subset import SubsetItem
 
@@ -647,6 +711,7 @@ def test_staged_persona_full_heuristic_pipeline(tmp_path: Path):
     state_file = tmp_path / "state.jsonl"
     artifacts_dir = tmp_path / "artifacts"
     summary = StringIO()
+    fake_engine = _FakeEngine()
 
     for stage in ("axes", "descriptors", "cards", "judge_card"):
         entry = run_persona_generation_staged(
@@ -654,9 +719,7 @@ def test_staged_persona_full_heuristic_pipeline(tmp_path: Path):
             persona_stage=stage, n_personas=2, persona_seed=0,
             axis_mode="fixed", fixed_axis_count=2, task_axis_count=0,
             sampling_method="maximin", judge_persona_mode="neutral_baseline",
-            backend="heuristic", generator_model=None,
-            judge_generator_model=None, generator_engine=None,
-            judge_engine=None, axes_file=None, summary_file=summary,
+            **_llm_persona_runtime_kwargs(fake_engine), axes_file=None, summary_file=summary,
         )
 
     assert entry.completed_stage == "judge_card"
@@ -684,6 +747,7 @@ def test_staged_persona_judge_card_saves_artifact(tmp_path: Path):
     state_file = tmp_path / "state.jsonl"
     artifacts_dir = tmp_path / "artifacts"
     summary = StringIO()
+    fake_engine = _FakeEngine()
 
     for stage in ("axes", "descriptors", "cards", "judge_card"):
         entry = run_persona_generation_staged(
@@ -691,9 +755,7 @@ def test_staged_persona_judge_card_saves_artifact(tmp_path: Path):
             stage_state_file=state_file, persona_stage=stage, n_personas=2,
             persona_seed=0, axis_mode="fixed", fixed_axis_count=2,
             task_axis_count=0, sampling_method="maximin",
-            judge_persona_mode="neutral_baseline", backend="heuristic",
-            generator_model=None, judge_generator_model=None,
-            generator_engine=None, judge_engine=None, axes_file=None,
+            judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
             save_artifacts=True,
             summary_file=summary,
         )
@@ -736,8 +798,13 @@ def test_staged_persona_llm_pipeline_with_fake_engine(tmp_path: Path):
         )
 
     item_data = entry.persona_data["aime25:test_0"]
-    assert [call["model_role"] for call in fake_engine.call_log] == ["generator", "generator", "generator"]
-    assert [call["batch_size"] for call in fake_engine.call_log] == [1, 1, 1]
+    assert [call["model_role"] for call in fake_engine.call_log] == [
+        "generator",
+        "generator",
+        "generator",
+        "judge_generator",
+    ]
+    assert [call["batch_size"] for call in fake_engine.call_log] == [1, 1, 1, 1]
     assert len(item_data["descriptors"]) == 2
     assert len(item_data["cards"]) == 2
     assert item_data["cards"][0]["title"] == "Card persona_1"
@@ -762,6 +829,7 @@ def test_staged_persona_descriptors_preserve_validator_retry(tmp_path: Path, mon
     state_file = tmp_path / "state.jsonl"
     artifacts_dir = tmp_path / "artifacts"
     summary = StringIO()
+    fake_engine = _FakeEngine()
     statuses = iter(["retry", "accept", "accept", "accept"])
 
     def _fake_validate_descriptor(_descriptor):
@@ -777,9 +845,7 @@ def test_staged_persona_descriptors_preserve_validator_retry(tmp_path: Path, mon
         stage_state_file=state_file, persona_stage="descriptors", n_personas=2,
         persona_seed=0, axis_mode="fixed", fixed_axis_count=2,
         task_axis_count=0, sampling_method="maximin",
-        judge_persona_mode="neutral_baseline", backend="heuristic",
-        generator_model=None, judge_generator_model=None,
-        generator_engine=None, judge_engine=None, axes_file=None,
+        judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
         summary_file=summary,
     )
 
@@ -802,6 +868,7 @@ def test_staged_persona_descriptors_retry_after_reject_hard(tmp_path: Path, monk
     state_file = tmp_path / "state.jsonl"
     artifacts_dir = tmp_path / "artifacts"
     summary = StringIO()
+    fake_engine = _FakeEngine()
     statuses = iter(["reject_hard", "accept", "accept", "accept"])
 
     def _fake_validate_descriptor(_descriptor):
@@ -815,9 +882,7 @@ def test_staged_persona_descriptors_retry_after_reject_hard(tmp_path: Path, monk
         stage_state_file=state_file, persona_stage="descriptors", n_personas=2,
         persona_seed=0, axis_mode="fixed", fixed_axis_count=2,
         task_axis_count=0, sampling_method="maximin",
-        judge_persona_mode="neutral_baseline", backend="heuristic",
-        generator_model=None, judge_generator_model=None,
-        generator_engine=None, judge_engine=None, axes_file=None,
+        judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
         summary_file=summary,
     )
 
@@ -870,6 +935,7 @@ def test_staged_persona_descriptor_failure_writes_audit_file(tmp_path: Path, mon
     state_file = tmp_path / "state.jsonl"
     artifacts_dir = tmp_path / "artifacts"
     summary = StringIO()
+    fake_engine = _FakeEngine()
 
     def _always_reject(_descriptor):
         return ValidationResult(status="reject_hard", reasons=["contains answer-oriented leakage indicators"])
@@ -912,8 +978,54 @@ def test_staged_persona_cards_preserve_duplicate_regeneration(tmp_path: Path, mo
     state_file = tmp_path / "state.jsonl"
     artifacts_dir = tmp_path / "artifacts"
     summary = StringIO()
+    class _DuplicateCardEngine(_FakeEngine):
+        def generate_batch(self, contexts, batch_size=None, sampling_kwargs=None, progress_callback=None, model_role=None):
+            outputs = []
+            for ctx in contexts:
+                all_content = " ".join(str(m.get("content", "")) for m in ctx)
+                prompt = str(ctx[-1].get("content", ""))
+                if "Generate the full persona population jointly" in all_content:
+                    outputs.append(
+                        json.dumps(
+                            {
+                                "descriptors": [
+                                    {
+                                        "persona_id": f"persona_{i+1}",
+                                        "name": f"P{i+1}",
+                                        "axis_interpretation": {"x": f"interp_{i}"},
+                                        "short_rule": f"rule_{i}",
+                                        "reasoning_summary": f"unique summary {i}",
+                                    }
+                                    for i in range(2)
+                                ]
+                            }
+                        )
+                    )
+                elif "Expand each descriptor into a compact" in prompt:
+                    outputs.append(
+                        json.dumps(
+                            {
+                                "persona_id": "persona_1",
+                                "title": "Shared",
+                                "core_reasoning_strategy": "shared strategy",
+                                "priorities": ["track constraints"],
+                                "distrusts": ["unsupported jumps"],
+                                "decomposition_style": "shared decomposition",
+                                "revision_policy": "revise on evidence",
+                                "confidence_policy": "be explicit",
+                                "failure_mode_to_avoid": "avoid duplication",
+                                "system_prompt": "Shared operational prompt",
+                            }
+                        )
+                    )
+                else:
+                    outputs.append("{}")
+            if progress_callback is not None:
+                progress_callback(len(outputs))
+            return outputs
 
-    def _duplicate_card(descriptor):
+    def _regenerated_llm_card(*, descriptor, question, question_media, engine):
+        del question, question_media, engine
         return PersonaCard(
             persona_id=descriptor.persona_id,
             title=descriptor.name,
@@ -924,20 +1036,19 @@ def test_staged_persona_cards_preserve_duplicate_regeneration(tmp_path: Path, mo
             revision_policy="revise on evidence",
             confidence_policy="be explicit",
             failure_mode_to_avoid="avoid duplication",
-            system_prompt="Shared operational prompt",
+            system_prompt=f"Distinct prompt for {descriptor.persona_id}",
             card_version="v0",
-        )
+        ), {"token_counts": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
 
-    monkeypatch.setattr("debate_v_majority.personas.generator._heuristic_card", _duplicate_card)
+    fake_engine = _DuplicateCardEngine()
+    monkeypatch.setattr("debate_v_majority.personas.generator._llm_card", _regenerated_llm_card)
 
     entry = run_persona_generation_staged(
         dataset="aime25", items=[item], artifacts_dir=artifacts_dir,
         stage_state_file=state_file, persona_stage="cards", n_personas=2,
         persona_seed=0, axis_mode="fixed", fixed_axis_count=2,
         task_axis_count=0, sampling_method="maximin",
-        judge_persona_mode="neutral_baseline", backend="heuristic",
-        generator_model=None, judge_generator_model=None,
-        generator_engine=None, judge_engine=None, axes_file=None,
+        judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
         summary_file=summary,
     )
 
@@ -961,6 +1072,7 @@ def test_staged_persona_replay_uses_saved_artifact_without_regeneration(tmp_path
     artifacts_dir = tmp_path / "artifacts"
     state_file = tmp_path / "state.jsonl"
     summary = StringIO()
+    fake_engine = _FakeEngine()
     question = "What is 2+2?"
     raw_task = {"question": "What is 2+2?", "answer": "4"}
     artifact, artifact_path = _resolve_persona_artifact(
@@ -976,11 +1088,7 @@ def test_staged_persona_replay_uses_saved_artifact_without_regeneration(tmp_path
         task_axis_count=0,
         sampling_method="maximin",
         judge_persona_mode="neutral_baseline",
-        backend="heuristic",
-        generator_model=None,
-        judge_generator_model=None,
-        generator_engine=None,
-        judge_engine=None,
+        **_llm_persona_runtime_kwargs(fake_engine),
         axes_file=None,
         save_artifact=True,
         replay=False,
@@ -1004,9 +1112,7 @@ def test_staged_persona_replay_uses_saved_artifact_without_regeneration(tmp_path
         stage_state_file=state_file, persona_stage="judge_card", n_personas=2,
         persona_seed=0, axis_mode="replay", fixed_axis_count=2,
         task_axis_count=0, sampling_method="maximin",
-        judge_persona_mode="neutral_baseline", backend="heuristic",
-        generator_model=None, judge_generator_model=None,
-        generator_engine=None, judge_engine=None, axes_file=None,
+        judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
         replay=True,
         summary_file=summary,
     )
@@ -1031,6 +1137,7 @@ def test_staged_persona_completed_stage_is_noop(tmp_path: Path):
     state_file = tmp_path / "state.jsonl"
     artifacts_dir = tmp_path / "artifacts"
     summary = StringIO()
+    fake_engine = _FakeEngine()
 
     for stage in ("axes", "descriptors", "cards", "judge_card"):
         run_persona_generation_staged(
@@ -1038,9 +1145,7 @@ def test_staged_persona_completed_stage_is_noop(tmp_path: Path):
             stage_state_file=state_file, persona_stage=stage, n_personas=2,
             persona_seed=0, axis_mode="fixed", fixed_axis_count=2,
             task_axis_count=0, sampling_method="maximin",
-            judge_persona_mode="neutral_baseline", backend="heuristic",
-            generator_model=None, judge_generator_model=None,
-            generator_engine=None, judge_engine=None, axes_file=None,
+            judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
             summary_file=summary,
         )
 
@@ -1050,9 +1155,7 @@ def test_staged_persona_completed_stage_is_noop(tmp_path: Path):
         stage_state_file=state_file, persona_stage="judge_card", n_personas=2,
         persona_seed=0, axis_mode="fixed", fixed_axis_count=2,
         task_axis_count=0, sampling_method="maximin",
-        judge_persona_mode="neutral_baseline", backend="heuristic",
-        generator_model=None, judge_generator_model=None,
-        generator_engine=None, judge_engine=None, axes_file=None,
+        judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
         summary_file=summary,
     )
     entries_after = load_all_stage_entries(state_file)
@@ -1072,6 +1175,7 @@ def test_staged_persona_completed_stage_is_noop_before_replay_lookup(tmp_path: P
     )
     state_file = tmp_path / "state.jsonl"
     summary = StringIO()
+    fake_engine = _FakeEngine()
     append_stage_entry(
         state_file,
         make_stage_entry(
@@ -1085,15 +1189,16 @@ def test_staged_persona_completed_stage_is_noop_before_replay_lookup(tmp_path: P
                         "n_personas": 2,
                         "persona_seed": 0,
                         "axis_mode": "replay",
-                    "fixed_axis_count": 2,
-                    "task_axis_count": 0,
-                    "sampling_method": "maximin",
-                    "judge_persona_mode": "neutral_baseline",
-                    "backend": "heuristic",
-                        "generator_model": None,
-                        "judge_generator_model": None,
+                        "fixed_axis_count": 2,
+                        "task_axis_count": 0,
+                        "sampling_method": "maximin",
+                        "judge_persona_mode": "neutral_baseline",
+                        "backend": "llm",
+                        "generator_model": "fake-generator",
+                        "judge_generator_model": "fake-judge-generator",
                         "axes_file": None,
-                        "effective_backend": "heuristic",
+                        "n_plain_agents": 0,
+                        "effective_backend": "llm",
                     }
                 },
             ),
@@ -1104,9 +1209,13 @@ def test_staged_persona_completed_stage_is_noop_before_replay_lookup(tmp_path: P
         stage_state_file=state_file, persona_stage="judge_card", n_personas=2,
         persona_seed=0, axis_mode="replay", fixed_axis_count=2,
         task_axis_count=0, sampling_method="maximin",
-        judge_persona_mode="neutral_baseline", backend="heuristic",
-        generator_model=None, judge_generator_model=None,
-        generator_engine=None, judge_engine=None, axes_file=None,
+        judge_persona_mode="neutral_baseline",
+        backend="llm",
+        generator_model="fake-generator",
+        judge_generator_model="fake-judge-generator",
+        generator_engine=fake_engine,
+        judge_engine=fake_engine,
+        axes_file=None,
         replay=True, summary_file=summary,
     )
 
@@ -1126,15 +1235,14 @@ def test_staged_persona_resume_rejects_mismatched_generation_settings(tmp_path: 
     state_file = tmp_path / "state.jsonl"
     artifacts_dir = tmp_path / "artifacts"
     summary = StringIO()
+    fake_engine = _FakeEngine()
 
     run_persona_generation_staged(
         dataset="aime25", items=[item], artifacts_dir=artifacts_dir,
         stage_state_file=state_file, persona_stage="axes", n_personas=2,
         persona_seed=0, axis_mode="fixed", fixed_axis_count=2,
         task_axis_count=0, sampling_method="maximin",
-        judge_persona_mode="neutral_baseline", backend="heuristic",
-        generator_model=None, judge_generator_model=None,
-        generator_engine=None, judge_engine=None, axes_file=None,
+        judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
         summary_file=summary,
     )
 
@@ -1144,9 +1252,7 @@ def test_staged_persona_resume_rejects_mismatched_generation_settings(tmp_path: 
             stage_state_file=state_file, persona_stage="judge_card", n_personas=5,
             persona_seed=0, axis_mode="fixed", fixed_axis_count=2,
             task_axis_count=0, sampling_method="maximin",
-            judge_persona_mode="neutral_baseline", backend="heuristic",
-            generator_model=None, judge_generator_model=None,
-            generator_engine=None, judge_engine=None, axes_file=None,
+            judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
             summary_file=summary,
         )
 
@@ -1170,15 +1276,14 @@ def test_staged_persona_resume_rejects_mismatched_items(tmp_path: Path):
     state_file = tmp_path / "state.jsonl"
     artifacts_dir = tmp_path / "artifacts"
     summary = StringIO()
+    fake_engine = _FakeEngine()
 
     run_persona_generation_staged(
         dataset="aime25", items=[item_a], artifacts_dir=artifacts_dir,
         stage_state_file=state_file, persona_stage="axes", n_personas=2,
         persona_seed=0, axis_mode="fixed", fixed_axis_count=2,
         task_axis_count=0, sampling_method="maximin",
-        judge_persona_mode="neutral_baseline", backend="heuristic",
-        generator_model=None, judge_generator_model=None,
-        generator_engine=None, judge_engine=None, axes_file=None,
+        judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
         summary_file=summary,
     )
 
@@ -1188,9 +1293,7 @@ def test_staged_persona_resume_rejects_mismatched_items(tmp_path: Path):
             stage_state_file=state_file, persona_stage="descriptors", n_personas=2,
             persona_seed=0, axis_mode="fixed", fixed_axis_count=2,
             task_axis_count=0, sampling_method="maximin",
-            judge_persona_mode="neutral_baseline", backend="heuristic",
-            generator_model=None, judge_generator_model=None,
-            generator_engine=None, judge_engine=None, axes_file=None,
+            judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
             summary_file=summary,
         )
 
@@ -1214,14 +1317,13 @@ def test_full_persona_generation_unchanged(tmp_path: Path):
     artifacts_dir = tmp_path / "artifacts"
     artifacts_dir.mkdir()
     summary = StringIO()
+    fake_engine = _FakeEngine()
 
     rows = run_persona_generation(
         dataset="aime25", items=[item], artifacts_dir=artifacts_dir,
         n_personas=2, persona_seed=0, axis_mode="fixed",
         fixed_axis_count=2, task_axis_count=0, sampling_method="maximin",
-        judge_persona_mode="neutral_baseline", backend="heuristic",
-        generator_model=None, judge_generator_model=None,
-        generator_engine=None, judge_engine=None, axes_file=None,
+        judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
         save_artifacts=False, replay=False, dump_cards=False,
         summary_file=summary,
     )
@@ -1250,6 +1352,8 @@ def test_debate_append_state(tmp_path: Path):
     _debate_append_state(
         stage_state_file=state_file,
         completed_stage="round_0",
+        active_stage="round_0",
+        active_stage_complete=True,
         dataset="aime25",
         items=[item],
         all_contexts=[[
@@ -1277,7 +1381,7 @@ def test_debate_append_state(tmp_path: Path):
             "persona_task_axis_count": 0,
             "persona_sampling_method": "maximin",
             "persona_judge_mode": "neutral_baseline",
-            "persona_backend": "heuristic",
+            "persona_backend": "llm",
             "generator_model": None,
             "judge_generator_model": None,
             "persona_axes_file": None,
@@ -1305,6 +1409,8 @@ def test_debate_append_state(tmp_path: Path):
     entry = load_latest_stage_entry(state_file)
     assert entry.stage_type == "debate"
     assert entry.completed_stage == "round_0"
+    assert entry.debate_data["active_stage"] == "round_0"
+    assert entry.debate_data["active_stage_complete"] is True
     assert entry.debate_data["n_agents"] == 1
     assert entry.debate_data["judge_rounds"] == [1]
     assert entry.debate_data["persona_settings"]["use_personas"] is False
@@ -1384,6 +1490,36 @@ def test_debate_uses_precomputed_personas_without_regenerating(tmp_path: Path, m
     assert results[1][0]["persona_ids"] == ["persona_1"]
 
 
+def test_debate_rejects_mixed_plain_runs_with_legacy_precomputed_artifact(tmp_path: Path):
+    from debate_v_majority.cli.debate_runner import run_debate
+    from debate_v_majority.cli.subset import SubsetItem
+
+    item = SubsetItem(
+        subset_id=0, orig_id=0, item_uid="aime25:test_0",
+        dataset_revision=None, item_display_id=0,
+        raw_task={"question": "What is 2+2?", "answer": "4"},
+        dataset_meta={},
+    )
+    artifact = _sample_persona_artifact(item_uid=item.item_uid, n_personas=3)
+
+    with pytest.raises(ValueError, match="missing slot_layout"):
+        run_debate(
+            dataset="aime25",
+            items=[item],
+            engine=_ResumeEngine(),
+            n_agents=5,
+            n_rounds=1,
+            judge_rounds=[1],
+            batch_size=None,
+            judge_engine=_ResumeEngine(),
+            use_personas=True,
+            artifacts_dir=tmp_path / "artifacts",
+            persona_artifacts_by_item={item.item_uid: artifact},
+            persona_plain_agents=2,
+            progress_file=StringIO(),
+        )
+
+
 def test_debate_defaults_debater_max_output_tokens_to_32768():
     from debate_v_majority.cli.debate_runner import run_debate
     from debate_v_majority.cli.subset import SubsetItem
@@ -1411,6 +1547,175 @@ def test_debate_defaults_debater_max_output_tokens_to_32768():
     debater_calls = [call for call in engine.call_log if call["model_role"] == "debater"]
     assert debater_calls
     assert all(call["sampling_kwargs"]["max_tokens"] == 32768 for call in debater_calls)
+
+
+def test_debate_batches_full_round_across_items():
+    from debate_v_majority.cli.debate_runner import _DebateStopped, run_debate
+    from debate_v_majority.cli.subset import SubsetItem
+    from debate_v_majority.engines import make_text_result
+
+    items = [
+        SubsetItem(
+            subset_id=idx, orig_id=idx, item_uid=f"aime25:test_{idx}",
+            dataset_revision=None, item_display_id=idx,
+            raw_task={"question": f"What is {idx}+{idx}?", "answer": str(idx + idx)},
+            dataset_meta={},
+        )
+        for idx in range(2)
+    ]
+
+    class _BatchingEngine:
+        model_name = "fake-model"
+        provider_name = "fake"
+
+        def __init__(self) -> None:
+            self.call_log: list[dict[str, Any]] = []
+
+        def generate_batch_results(
+            self,
+            contexts,
+            batch_size=None,
+            *,
+            sampling_kwargs=None,
+            progress_callback=None,
+            result_callback=None,
+            model_role=None,
+        ):
+            del batch_size
+            self.call_log.append(
+                {
+                    "model_role": model_role,
+                    "n_contexts": len(contexts),
+                    "sampling_kwargs": None if sampling_kwargs is None else dict(sampling_kwargs),
+                }
+            )
+            outputs = []
+            for idx, _ctx in enumerate(contexts):
+                result = make_text_result(
+                    "Initial solve. Final answer \\boxed{4}",
+                    model_name=self.model_name,
+                    provider_name=self.provider_name,
+                    model_role=model_role,
+                    usage={"prompt_token_count": 11, "total_token_count": 17},
+                    latency_ms=13,
+                )
+                outputs.append(result)
+                if result_callback is not None:
+                    result_callback(idx, result)
+                if progress_callback is not None:
+                    progress_callback(1)
+            return outputs
+
+        def count_prompt_tokens(self, messages):
+            del messages
+            return 64
+
+        def shutdown(self):
+            return None
+
+    engine = _BatchingEngine()
+    with pytest.raises(_DebateStopped):
+        run_debate(
+            dataset="aime25",
+            items=items,
+            engine=engine,
+            n_agents=2,
+            n_rounds=1,
+            judge_rounds=[1],
+            batch_size=None,
+            judge_engine=engine,
+            progress_file=StringIO(),
+            debate_stop_after="round_0",
+        )
+
+    debater_calls = [call for call in engine.call_log if call["model_role"] == "debater"]
+    assert debater_calls == [
+        {
+            "model_role": "debater",
+            "n_contexts": 4,
+            "sampling_kwargs": {"max_tokens": 32768},
+        }
+    ]
+
+
+def test_debate_judge_round_records_all_items():
+    from debate_v_majority.cli.debate_runner import run_debate
+    from debate_v_majority.cli.subset import SubsetItem
+    from debate_v_majority.engines import make_text_result
+
+    items = [
+        SubsetItem(
+            subset_id=idx, orig_id=idx, item_uid=f"aime25:test_{idx}",
+            dataset_revision=None, item_display_id=idx,
+            raw_task={"question": f"What is {idx}+{idx}?", "answer": "4"},
+            dataset_meta={},
+        )
+        for idx in range(2)
+    ]
+
+    class _JudgeAllItemsEngine:
+        model_name = "fake-model"
+        provider_name = "fake"
+
+        def __init__(self) -> None:
+            self.call_log: list[dict[str, Any]] = []
+
+        def generate_batch_results(
+            self,
+            contexts,
+            batch_size=None,
+            *,
+            sampling_kwargs=None,
+            progress_callback=None,
+            result_callback=None,
+            model_role=None,
+        ):
+            del batch_size, sampling_kwargs
+            self.call_log.append({"model_role": model_role, "n_contexts": len(contexts)})
+            outputs = []
+            for idx, _ctx in enumerate(contexts):
+                text = (
+                    "Initial solve. Final answer \\boxed{4}"
+                    if model_role == "debater"
+                    else "Decision: \\boxed{4}"
+                )
+                result = make_text_result(
+                    text,
+                    model_name=self.model_name,
+                    provider_name=self.provider_name,
+                    model_role=model_role,
+                    usage={"prompt_token_count": 11, "total_token_count": 17},
+                    latency_ms=13,
+                )
+                outputs.append(result)
+                if result_callback is not None:
+                    result_callback(idx, result)
+                if progress_callback is not None:
+                    progress_callback(1)
+            return outputs
+
+        def count_prompt_tokens(self, messages):
+            del messages
+            return 64
+
+        def shutdown(self):
+            return None
+
+    engine = _JudgeAllItemsEngine()
+    results = run_debate(
+        dataset="aime25",
+        items=items,
+        engine=engine,
+        n_agents=1,
+        n_rounds=1,
+        judge_rounds=[1],
+        batch_size=None,
+        judge_engine=engine,
+        progress_file=StringIO(),
+    )
+
+    assert len(results[1]) == 2
+    assert {row["item_uid"] for row in results[1]} == {"aime25:test_0", "aime25:test_1"}
 
 
 def test_debate_resume_after_round_0(tmp_path: Path):
@@ -1456,8 +1761,125 @@ def test_debate_resume_after_round_0(tmp_path: Path):
     )
 
     entries = load_all_stage_entries(state_file)
-    assert [entry.completed_stage for entry in entries] == ["round_0", "round_1", "round_1_judge"]
+    assert entries[-1].completed_stage == "round_1_judge"
+    assert [entry.completed_stage for entry in entries if entry.debate_data.get("active_stage_complete") is True][-3:] == [
+        "round_0",
+        "round_1",
+        "round_1_judge",
+    ]
     assert [call["model_role"] for call in resume_engine.call_log] == ["debater", "judge"]
+    assert len(results[1]) == 1
+
+
+def test_debate_resume_after_partial_round_checkpoint(tmp_path: Path):
+    from debate_v_majority.cli.debate_runner import run_debate
+    from debate_v_majority.cli.subset import SubsetItem
+    from debate_v_majority.engines import make_text_result
+
+    item = SubsetItem(
+        subset_id=0, orig_id=0, item_uid="aime25:test_0",
+        dataset_revision=None, item_display_id=0,
+        raw_task={"question": "What is 2+2?", "answer": "4"},
+        dataset_meta={},
+    )
+    state_file = tmp_path / "debate_state_partial.jsonl"
+
+    class _PartialRoundEngine(_ResumeEngine):
+        def __init__(self, *, fail_once: bool) -> None:
+            super().__init__()
+            self.fail_once = fail_once
+            self._failed = False
+
+        def generate_batch_results(
+            self,
+            contexts,
+            batch_size=None,
+            *,
+            sampling_kwargs=None,
+            progress_callback=None,
+            result_callback=None,
+            model_role=None,
+        ):
+            del batch_size
+            self.call_log.append(
+                {
+                    "model_role": model_role,
+                    "n_contexts": len(contexts),
+                    "sampling_kwargs": None if sampling_kwargs is None else dict(sampling_kwargs),
+                }
+            )
+            if model_role == "debater" and self.fail_once and not self._failed:
+                self._failed = True
+                first = make_text_result(
+                    "Initial solve. Final answer \\boxed{4}",
+                    model_name=self.model_name,
+                    provider_name=self.provider_name,
+                    model_role=model_role,
+                    usage={"prompt_token_count": 11, "total_token_count": 17},
+                    latency_ms=13,
+                )
+                if result_callback is not None:
+                    result_callback(0, first)
+                if progress_callback is not None:
+                    progress_callback(1)
+                raise RuntimeError("transient provider failure")
+            outputs = []
+            for idx, _ctx in enumerate(contexts):
+                result = make_text_result(
+                    "Initial solve. Final answer \\boxed{4}" if model_role == "debater" else "Decision: \\boxed{4}",
+                    model_name=self.model_name,
+                    provider_name=self.provider_name,
+                    model_role=model_role,
+                    usage={"prompt_token_count": 11, "total_token_count": 17},
+                    latency_ms=13,
+                )
+                outputs.append(result)
+                if result_callback is not None:
+                    result_callback(idx, result)
+                if progress_callback is not None:
+                    progress_callback(1)
+            return outputs
+
+    first_engine = _PartialRoundEngine(fail_once=True)
+    with pytest.raises(RuntimeError, match="transient provider failure"):
+        run_debate(
+            dataset="aime25",
+            items=[item],
+            engine=first_engine,
+            n_agents=2,
+            n_rounds=1,
+            judge_rounds=[1],
+            batch_size=None,
+            judge_engine=first_engine,
+            progress_file=StringIO(),
+            stage_state_file=state_file,
+        )
+
+    partial_entry = load_latest_stage_entry(state_file)
+    assert partial_entry.debate_data["active_stage"] == "round_0"
+    assert partial_entry.debate_data["active_stage_complete"] is False
+    restored_outputs = partial_entry.debate_data["agent_round_outputs_by_q"]
+    assert len(restored_outputs[0][0]) == 1
+    assert len(restored_outputs[0][1]) == 0
+
+    resume_engine = _PartialRoundEngine(fail_once=False)
+    results = run_debate(
+        dataset="aime25",
+        items=[item],
+        engine=resume_engine,
+        n_agents=2,
+        n_rounds=1,
+        judge_rounds=[1],
+        batch_size=None,
+        judge_engine=resume_engine,
+        progress_file=StringIO(),
+        stage_state_file=state_file,
+    )
+
+    entries = load_all_stage_entries(state_file)
+    assert entries[-1].debate_data["active_stage_complete"] is True
+    assert [call["model_role"] for call in resume_engine.call_log] == ["debater", "debater", "judge"]
+    assert resume_engine.call_log[0]["n_contexts"] == 1
     assert len(results[1]) == 1
 
 
@@ -1504,7 +1926,12 @@ def test_debate_resume_pending_judge_step(tmp_path: Path):
     )
 
     entries = load_all_stage_entries(state_file)
-    assert [entry.completed_stage for entry in entries] == ["round_0", "round_1", "round_1_judge"]
+    assert entries[-1].completed_stage == "round_1_judge"
+    assert [entry.completed_stage for entry in entries if entry.debate_data.get("active_stage_complete") is True][-3:] == [
+        "round_0",
+        "round_1",
+        "round_1_judge",
+    ]
     assert [call["model_role"] for call in resume_engine.call_log] == ["judge"]
     assert len(results[1]) == 1
 
@@ -1523,6 +1950,8 @@ def test_debate_resume_rejects_mismatched_persona_settings(tmp_path: Path):
     _debate_append_state(
         stage_state_file=state_file,
         completed_stage="round_0",
+        active_stage="round_0",
+        active_stage_complete=True,
         dataset="aime25",
         items=[item],
         all_contexts=[[[{"role": "user", "content": "question"}]]],
@@ -1543,7 +1972,7 @@ def test_debate_resume_rejects_mismatched_persona_settings(tmp_path: Path):
             "persona_task_axis_count": 0,
             "persona_sampling_method": "maximin",
             "persona_judge_mode": "neutral_baseline",
-            "persona_backend": "heuristic",
+            "persona_backend": "llm",
             "generator_model": None,
             "judge_generator_model": None,
             "persona_axes_file": None,
@@ -1586,7 +2015,7 @@ def test_debate_resume_rejects_mismatched_persona_settings(tmp_path: Path):
             persona_task_axis_count=0,
             persona_sampling_method="maximin",
             persona_judge_mode="neutral_baseline",
-            persona_backend="heuristic",
+            persona_backend="llm",
             progress_file=StringIO(),
             stage_state_file=state_file,
         )
@@ -1654,15 +2083,14 @@ def test_staged_persona_resume_rejects_changed_item_payload(tmp_path: Path):
     state_file = tmp_path / "state.jsonl"
     artifacts_dir = tmp_path / "artifacts"
     summary = StringIO()
+    fake_engine = _FakeEngine()
 
     run_persona_generation_staged(
         dataset="aime25", items=[original_item], artifacts_dir=artifacts_dir,
         stage_state_file=state_file, persona_stage="axes", n_personas=2,
         persona_seed=0, axis_mode="fixed", fixed_axis_count=2,
         task_axis_count=0, sampling_method="maximin",
-        judge_persona_mode="neutral_baseline", backend="heuristic",
-        generator_model=None, judge_generator_model=None,
-        generator_engine=None, judge_engine=None, axes_file=None,
+        judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
         summary_file=summary,
     )
 
@@ -1672,9 +2100,7 @@ def test_staged_persona_resume_rejects_changed_item_payload(tmp_path: Path):
             stage_state_file=state_file, persona_stage="descriptors", n_personas=2,
             persona_seed=0, axis_mode="fixed", fixed_axis_count=2,
             task_axis_count=0, sampling_method="maximin",
-            judge_persona_mode="neutral_baseline", backend="heuristic",
-            generator_model=None, judge_generator_model=None,
-            generator_engine=None, judge_engine=None, axes_file=None,
+            judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
             summary_file=summary,
         )
 
@@ -1692,15 +2118,14 @@ def test_staged_persona_resume_allows_judge_bank_flag_changes(tmp_path: Path):
     state_file = tmp_path / "state.jsonl"
     artifacts_dir = tmp_path / "artifacts"
     summary = StringIO()
+    fake_engine = _FakeEngine()
 
     run_persona_generation_staged(
         dataset="aime25", items=[item], artifacts_dir=artifacts_dir,
         stage_state_file=state_file, persona_stage="cards", n_personas=2,
         persona_seed=0, axis_mode="fixed", fixed_axis_count=2,
         task_axis_count=0, sampling_method="maximin",
-        judge_persona_mode="neutral_baseline", backend="heuristic",
-        generator_model=None, judge_generator_model=None,
-        generator_engine=None, judge_engine=None, axes_file=None,
+        judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
         judge_bank_dir=tmp_path / "judge_bank_a",
         gpqa_family_cache_path=tmp_path / "gpqa_a.json",
         summary_file=summary,
@@ -1711,9 +2136,7 @@ def test_staged_persona_resume_allows_judge_bank_flag_changes(tmp_path: Path):
         stage_state_file=state_file, persona_stage="cards", n_personas=2,
         persona_seed=0, axis_mode="fixed", fixed_axis_count=2,
         task_axis_count=0, sampling_method="maximin",
-        judge_persona_mode="neutral_baseline", backend="heuristic",
-        generator_model=None, judge_generator_model=None,
-        generator_engine=None, judge_engine=None, axes_file=None,
+        judge_persona_mode="neutral_baseline", **_llm_persona_runtime_kwargs(fake_engine), axes_file=None,
         judge_bank_dir=tmp_path / "judge_bank_b",
         judge_bank_refresh=True,
         gpqa_family_cache_path=tmp_path / "gpqa_b.json",
@@ -1996,7 +2419,7 @@ def test_main_skips_persona_output_for_staged_runs(tmp_path: Path, monkeypatch):
             "--mode",
             "personas",
             "--persona_backend",
-            "heuristic",
+            "llm",
             "--subset_ids",
             "0",
             "--out_dir",
@@ -2057,7 +2480,7 @@ def test_main_writes_persona_output_after_final_staged_run(tmp_path: Path, monke
             "--mode",
             "personas",
             "--persona_backend",
-            "heuristic",
+            "llm",
             "--subset_ids",
             "0",
             "--out_dir",
@@ -2116,7 +2539,7 @@ def test_main_interactive_persona_staging_advances_without_rerun(tmp_path: Path,
             "--mode",
             "personas",
             "--persona_backend",
-            "heuristic",
+            "llm",
             "--subset_ids",
             "0",
             "--out_dir",
@@ -2142,7 +2565,7 @@ def test_main_runs_personas_then_debate_in_one_flow(tmp_path: Path, monkeypatch)
         raw_task={"question": "What is 2+2?", "answer": "4"},
         dataset_meta={},
     )
-    call_order: list[str] = []
+    persona_stage_calls: list[str] = []
     debate_calls: list[dict[str, Any]] = []
 
     monkeypatch.setattr(cli_main_impl, "_default_dataset_test_path", lambda *args, **kwargs: tmp_path / "dataset.jsonl")
@@ -2165,11 +2588,21 @@ def test_main_runs_personas_then_debate_in_one_flow(tmp_path: Path, monkeypatch)
     )
     monkeypatch.setattr(
         cli_main_impl,
-        "run_persona_generation",
+        "run_persona_generation_staged",
         lambda **kwargs: (
-            call_order.append("personas")
-            or [{"item_uid": "aime25:test_0", "cards": [], "judge_card": None}]
+            persona_stage_calls.append(str(kwargs["persona_stage"]))
+            or make_stage_entry(
+                stage_type="persona",
+                completed_stage=str(kwargs["persona_stage"]),
+                dataset="aime25",
+                items=[asdict(item)],
+            )
         ),
+    )
+    monkeypatch.setattr(
+        cli_main_impl,
+        "persona_rows_from_stage_entry",
+        lambda entry: [{"item_uid": "aime25:test_0", "cards": [], "judge_card": None}],
     )
     monkeypatch.setattr(
         cli_main_impl,
@@ -2180,8 +2613,7 @@ def test_main_runs_personas_then_debate_in_one_flow(tmp_path: Path, monkeypatch)
         cli_main_impl,
         "run_debate",
         lambda **kwargs: (
-            call_order.append("debate")
-            or debate_calls.append(kwargs)
+            debate_calls.append(kwargs)
             or {3: [{"final_correct": 1}]}
         ),
     )
@@ -2210,12 +2642,222 @@ def test_main_runs_personas_then_debate_in_one_flow(tmp_path: Path, monkeypatch)
 
     cli_main_impl.main()
 
-    assert call_order == ["personas", "debate"]
+    assert persona_stage_calls == ["axes", "descriptors", "cards", "judge_card"]
     assert len(debate_calls) == 1
     assert debate_calls[0]["use_personas"] is True
     assert debate_calls[0]["persona_artifacts_by_item"] == {"aime25:test_0": "persona-sentinel"}
     assert list(tmp_path.glob("personas_*.jsonl"))
     assert list(tmp_path.glob("debate_*.jsonl"))
+
+
+def test_main_personas_then_debate_uses_persona_slot_count_for_mixed_runs(tmp_path: Path, monkeypatch):
+    from debate_v_majority.cli import main_impl as cli_main_impl
+    from debate_v_majority.cli.subset import SubsetItem
+
+    item = SubsetItem(
+        subset_id=0, orig_id=0, item_uid="aime25:test_0",
+        dataset_revision=None, item_display_id=0,
+        raw_task={"question": "What is 2+2?", "answer": "4"},
+        dataset_meta={},
+    )
+    persona_generation_calls: list[dict[str, Any]] = []
+    debate_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(cli_main_impl, "_default_dataset_test_path", lambda *args, **kwargs: tmp_path / "dataset.jsonl")
+    monkeypatch.setattr(
+        cli_main_impl,
+        "_make_dataset_subset",
+        lambda **kwargs: ([item], {"subset_size": 1, "seed": 0}),
+    )
+    monkeypatch.setattr(
+        cli_main_impl,
+        "build_sampling_config",
+        lambda model_name: SimpleNamespace(max_tokens=128, temperature=1.0, top_p=0.95, top_k=-1),
+    )
+    monkeypatch.setattr(cli_main_impl, "set_sampling_config", lambda cfg: None)
+    monkeypatch.setattr(cli_main_impl, "_create_role_engine", lambda **kwargs: _ResumeEngine())
+    monkeypatch.setattr(
+        cli_main_impl,
+        "_reuse_or_create_role_engine",
+        lambda **kwargs: kwargs["existing_engine"],
+    )
+
+    def _fake_stage_runner(**kwargs):
+        persona_generation_calls.append(
+            {
+                "persona_stage": str(kwargs["persona_stage"]),
+                "n_personas": int(kwargs["n_personas"]),
+                "n_plain_agents": int(kwargs.get("n_plain_agents", 0)),
+            }
+        )
+        return make_stage_entry(
+            stage_type="persona",
+            completed_stage=str(kwargs["persona_stage"]),
+            dataset="aime25",
+            items=[asdict(item)],
+        )
+
+    monkeypatch.setattr(cli_main_impl, "run_persona_generation_staged", _fake_stage_runner)
+    monkeypatch.setattr(
+        cli_main_impl,
+        "persona_rows_from_stage_entry",
+        lambda entry: [{"item_uid": "aime25:test_0", "cards": [], "judge_card": None}],
+    )
+    monkeypatch.setattr(
+        cli_main_impl,
+        "persona_artifacts_from_rows",
+        lambda rows: {"aime25:test_0": "persona-sentinel"},
+    )
+    monkeypatch.setattr(
+        cli_main_impl,
+        "run_debate",
+        lambda **kwargs: (
+            debate_calls.append(kwargs)
+            or {2: [{"final_correct": 1}]}
+        ),
+    )
+    monkeypatch.setattr(cli_main_impl, "_augment_output_rows", lambda records, **kwargs: records)
+    monkeypatch.setattr(cli_main_impl, "_timestamp_tag", lambda: "20260311_120101")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "debate-v-majority",
+            "--dataset",
+            "aime25",
+            "--mode",
+            "personas,debate",
+            "--model_name",
+            "gemini-3-flash-preview",
+            "--provider",
+            "gemini",
+            "--subset_ids",
+            "0",
+            "--n_agents",
+            "5",
+            "--n_rounds",
+            "2",
+            "--persona_plain_agents",
+            "2",
+            "--out_dir",
+            str(tmp_path),
+            "--quiet",
+        ],
+    )
+
+    cli_main_impl.main()
+
+    assert persona_generation_calls
+    assert all(call["n_personas"] == 3 for call in persona_generation_calls)
+    assert all(call["n_plain_agents"] == 2 for call in persona_generation_calls)
+    assert len(debate_calls) == 1
+    assert debate_calls[0]["persona_plain_agents"] == 2
+    assert debate_calls[0]["persona_artifacts_by_item"] == {"aime25:test_0": "persona-sentinel"}
+
+
+def test_main_personas_then_debate_full_flow_prints_persona_stage_costs(
+    tmp_path: Path, monkeypatch, capfd: pytest.CaptureFixture[str]
+):
+    from debate_v_majority.cli import main_impl as cli_main_impl
+    from debate_v_majority.cli.subset import SubsetItem
+
+    item = SubsetItem(
+        subset_id=0,
+        orig_id=0,
+        item_uid="aime25:test_0",
+        dataset_revision=None,
+        item_display_id=0,
+        raw_task={"question": "What is 2+2?", "answer": "4"},
+        dataset_meta={},
+    )
+    persona_stage_calls: list[str] = []
+    debate_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(cli_main_impl, "_default_dataset_test_path", lambda *args, **kwargs: tmp_path / "dataset.jsonl")
+    monkeypatch.setattr(
+        cli_main_impl,
+        "_make_dataset_subset",
+        lambda **kwargs: ([item], {"subset_size": 1, "seed": 0}),
+    )
+    monkeypatch.setattr(
+        cli_main_impl,
+        "build_sampling_config",
+        lambda model_name: SimpleNamespace(max_tokens=128, temperature=1.0, top_p=0.95, top_k=-1),
+    )
+    monkeypatch.setattr(cli_main_impl, "set_sampling_config", lambda cfg: None)
+    monkeypatch.setattr(cli_main_impl, "_create_role_engine", lambda **kwargs: _ResumeEngine())
+    monkeypatch.setattr(
+        cli_main_impl,
+        "_reuse_or_create_role_engine",
+        lambda **kwargs: kwargs["existing_engine"],
+    )
+
+    def _fake_stage_runner(**kwargs):
+        persona_stage_calls.append(str(kwargs["persona_stage"]))
+        return make_stage_entry(
+            stage_type="persona",
+            completed_stage=str(kwargs["persona_stage"]),
+            dataset="aime25",
+            items=[asdict(item)],
+        )
+
+    monkeypatch.setattr(cli_main_impl, "run_persona_generation_staged", _fake_stage_runner)
+    monkeypatch.setattr(
+        cli_main_impl,
+        "persona_rows_from_stage_entry",
+        lambda entry: [{"item_uid": "aime25:test_0", "cards": [], "judge_card": None}],
+    )
+    monkeypatch.setattr(
+        cli_main_impl,
+        "persona_artifacts_from_rows",
+        lambda rows: {"aime25:test_0": "persona-sentinel"},
+    )
+    monkeypatch.setattr(
+        cli_main_impl,
+        "run_debate",
+        lambda **kwargs: (
+            debate_calls.append(kwargs)
+            or {1: [{"final_correct": 1}]}
+        ),
+    )
+    monkeypatch.setattr(cli_main_impl, "_augment_output_rows", lambda records, **kwargs: records)
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(isatty=lambda: False))
+    monkeypatch.setattr(cli_main_impl, "_timestamp_tag", lambda: "20260313_140000")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "debate-v-majority",
+            "--dataset",
+            "aime25",
+            "--mode",
+            "personas,debate",
+            "--model_name",
+            "gemini-3-flash-preview",
+            "--provider",
+            "gemini",
+            "--subset_ids",
+            "0",
+            "--persona_backend",
+            "llm",
+            "--out_dir",
+            str(tmp_path),
+            "--token_ledger_path",
+            str(tmp_path / "token-ledger.jsonl"),
+            "--quiet",
+        ],
+    )
+
+    cli_main_impl.main()
+    captured = capfd.readouterr()
+
+    assert persona_stage_calls == ["axes", "descriptors", "cards", "judge_card"]
+    assert len(debate_calls) == 1
+    assert debate_calls[0]["persona_artifacts_by_item"] == {"aime25:test_0": "persona-sentinel"}
+    assert "[cost] persona:axes=" in captured.out
+    assert "[cost] persona:descriptors=" in captured.out
+    assert "[cost] persona:cards=" in captured.out
+    assert "[cost] persona:judge_card=" in captured.out
 
 
 def test_main_interactive_persona_then_debate_staging_in_one_flow(tmp_path: Path, monkeypatch):
@@ -2738,3 +3380,9 @@ def test_main_discards_auto_debate_stage_file_on_settings_mismatch(tmp_path: Pat
     assert stage_state_calls[1] == first_stage_state_file
     assert stage_state_calls[2] is None
     assert not (tmp_path / "stage_state_aime_debate.latest").exists()
+
+
+
+
+
+

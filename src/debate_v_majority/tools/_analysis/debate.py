@@ -322,7 +322,13 @@ def compute_debate_row_metrics(
     revision_rate_by_persona: list[dict[str, Any]] = []
     for agent_idx in range(n_agents):
         outputs_for_agent = outputs[agent_idx] if agent_idx < len(outputs) else []
-        persona_summary = persona_summaries[agent_idx] if agent_idx < len(persona_summaries) else {}
+        persona_summary_raw = persona_summaries[agent_idx] if agent_idx < len(persona_summaries) else None
+        persona_summary = persona_summary_raw if isinstance(persona_summary_raw, dict) else None
+        persona_id = None
+        if persona_summary is not None:
+            persona_id = persona_summary.get("persona_id")
+        elif agent_idx >= len(persona_summaries) and agent_idx < len(persona_ids):
+            persona_id = persona_ids[agent_idx]
         change_row = answer_changes[agent_idx] if agent_idx < len(answer_changes) else {}
         changed_flags = list(change_row.get("changed_from_prior_round") or [])
         change_count = sum(1 for flag in changed_flags if flag)
@@ -331,9 +337,9 @@ def compute_debate_row_metrics(
         revision_rate_by_persona.append(
             {
                 "agent_index": agent_idx,
-                "persona_id": persona_summary.get("persona_id") or (persona_ids[agent_idx] if agent_idx < len(persona_ids) else None),
-                "title": persona_summary.get("title"),
-                "short_rule": persona_summary.get("short_rule"),
+                "persona_id": persona_id,
+                "title": None if persona_summary is None else persona_summary.get("title"),
+                "short_rule": None if persona_summary is None else persona_summary.get("short_rule"),
                 "answers_by_round": [output.get("final_answer") for output in outputs_for_agent],
                 "change_count": change_count,
                 "revision_opportunities": revision_opportunities,

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import struct
+import threading
 from typing import Any
 
 
@@ -98,23 +100,38 @@ def _messages_cache_key(messages: list[dict[str, Any]]) -> tuple[int, int, str]:
 class PromptTokenCounter:
     """Token counter for chat messages with lazy tokenizer loading and caching."""
 
-    _token_cache: dict[tuple, int] = {}
-    _cache_max_size: int = 4096
-
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, model_name: str, *, cache_max_size: int = 4096) -> None:
         self._model_name = model_name
         self._tokenizer = None
+        self._token_cache: dict[tuple, int] = {}
+        self._cache_max_size = cache_max_size
+        self._cache_lock = threading.Lock()
 
     def _get_tokenizer(self):
         if self._tokenizer is not None:
             return self._tokenizer
-        from transformers import AutoTokenizer
 
-        self._tokenizer = AutoTokenizer.from_pretrained(
-            self._model_name,
-            trust_remote_code=True,
-            use_fast=True,
-        )
+        class _FallbackTokenizer:
+            @staticmethod
+            def encode(text: str) -> list[str]:
+                tokens = re.findall(r"\w+|[^\w\s]", str(text), flags=re.UNICODE)
+                return tokens or [str(text)]
+
+            @staticmethod
+            def decode(tokens: list[str], skip_special_tokens: bool = True) -> str:
+                del skip_special_tokens
+                return " ".join(str(token) for token in tokens)
+
+        try:
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self._model_name,
+                trust_remote_code=True,
+                use_fast=True,
+            )
+        except Exception:
+            self._tokenizer = _FallbackTokenizer()
         return self._tokenizer
 
     def _cache_key(self, messages: list[dict[str, Any]]) -> tuple:
@@ -128,11 +145,12 @@ class PromptTokenCounter:
 
     def _set_cached(self, key: tuple, count: int) -> None:
         """Cache token count with simple LRU-style eviction."""
-        if len(self._token_cache) >= self._cache_max_size:
-            keys_to_remove = list(self._token_cache.keys())[: self._cache_max_size // 2]
-            for old_key in keys_to_remove:
-                self._token_cache.pop(old_key, None)
-        self._token_cache[key] = count
+        with self._cache_lock:
+            if len(self._token_cache) >= self._cache_max_size:
+                keys_to_remove = list(self._token_cache.keys())[: self._cache_max_size // 2]
+                for old_key in keys_to_remove:
+                    self._token_cache.pop(old_key, None)
+            self._token_cache[key] = count
 
     def count_chat_tokens(self, messages: list[dict[str, Any]]) -> int:
         """Exact token count for chat messages (cached)."""

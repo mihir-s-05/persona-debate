@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from .. import DatasetName
 from ..engines import InferenceEngine, ensure_inference_results, infer_native_context_len
-from ..personas import JudgeCard, PersonaArtifact
+from ..personas import JudgeCard, PersonaArtifact, build_slot_layout
 from ..shared import PrevJudgeInfo, PromptTokenCounter
 from .dataset_eval import (
     _build_initial_user_message,
@@ -18,8 +18,6 @@ from .dataset_eval import (
     _parse_question_answer,
 )
 from .engine_runtime import (
-    _build_gemini_judge_cache_context,
-    _build_gemini_debate_cache_context,
     _default_judge_max_tokens,
     _engine_backend_name,
     _inference_result_meta,
@@ -59,6 +57,8 @@ from .subset import SubsetItem
 
 
 DEBATE_DEFAULT_MAX_OUTPUT_TOKENS = 32768
+DEBATE_PARTIAL_CHECKPOINT_DEBATER_FLUSH_EVERY = 10
+DEBATE_PARTIAL_CHECKPOINT_JUDGE_FLUSH_EVERY = 10
 
 
 class _DebateStopped(Exception):
@@ -111,14 +111,19 @@ def _build_initial_agent_contexts(
     persona_artifacts: list[PersonaArtifact | None],
     n_agents: int,
 ) -> list[list[list[dict[str, Any]]]]:
+    def _system_msgs(q_idx: int, agent_idx: int) -> list[dict[str, Any]]:
+        artifact = persona_artifacts[q_idx]
+        if artifact is None:
+            return []
+        card = artifact.card_for_agent(agent_idx)
+        if card is None:
+            return []
+        return [{"role": "system", "content": card.system_prompt}]
+
     return [
         [
             [
-                *(
-                    [{"role": "system", "content": persona_artifacts[q_idx].cards[agent_idx].system_prompt}]
-                    if persona_artifacts[q_idx] is not None
-                    else []
-                ),
+                *_system_msgs(q_idx, agent_idx),
                 _build_initial_user_message(
                     dataset=dataset,
                     question=question,
@@ -145,9 +150,11 @@ def _build_agent_debate_message(
         if idx != agent_idx
     ]
     debate_msg = _construct_debate_message(dataset, other_answers)
-    if persona_artifact is None or agent_idx >= len(persona_artifact.cards):
+    if persona_artifact is None:
         return debate_msg
-    card = persona_artifact.cards[agent_idx]
+    card = persona_artifact.card_for_agent(agent_idx)
+    if card is None:
+        return debate_msg
     return {
         **debate_msg,
         "content": (
@@ -175,6 +182,7 @@ def _debate_persona_settings(
     judge_bank_dir: Path | None,
     judge_bank_refresh: bool,
     gpqa_family_cache_path: Path | None,
+    persona_plain_agents: int = 0,
 ) -> dict[str, Any]:
     return {
         "use_personas": bool(use_personas),
@@ -192,6 +200,7 @@ def _debate_persona_settings(
         "judge_bank_dir": path_setting(judge_bank_dir),
         "judge_bank_refresh": bool(judge_bank_refresh),
         "gpqa_family_cache_path": path_setting(gpqa_family_cache_path),
+        "persona_plain_agents": int(persona_plain_agents),
     }
 
 
@@ -228,6 +237,39 @@ def _validate_resume_runtime_settings(
     saved_settings = resume_state.get("runtime_settings")
     if not isinstance(saved_settings, dict) or dict(saved_settings) != current_settings:
         raise ValueError("Debate state runtime settings mismatch")
+
+
+def _validate_precomputed_persona_artifact(
+    *,
+    artifact: PersonaArtifact,
+    item_uid: str,
+    n_agents: int,
+    persona_plain_agents: int,
+) -> None:
+    expected_n_personas = int(n_agents) - int(persona_plain_agents)
+    if len(artifact.cards) != expected_n_personas:
+        raise ValueError(
+            f"Precomputed persona artifact for {item_uid!r} has {len(artifact.cards)} cards; expected {expected_n_personas}"
+        )
+    if artifact.slot_layout is None:
+        if int(persona_plain_agents) > 0:
+            raise ValueError(
+                f"Precomputed persona artifact for {item_uid!r} is missing slot_layout for mixed plain/persona debate"
+            )
+        return
+    expected_slot_layout = (
+        ["persona"] * int(n_agents)
+        if int(persona_plain_agents) == 0
+        else build_slot_layout(n_agents=int(n_agents), n_plain_agents=int(persona_plain_agents))
+    )
+    if artifact.n_total_agents != int(n_agents):
+        raise ValueError(
+            f"Precomputed persona artifact for {item_uid!r} has slot layout for {artifact.n_total_agents} agents; expected {n_agents}"
+        )
+    if list(artifact.slot_layout) != list(expected_slot_layout):
+        raise ValueError(
+            f"Precomputed persona artifact for {item_uid!r} has slot_layout {artifact.slot_layout}; expected {expected_slot_layout}"
+        )
 
 
 def _normalise_judge_rounds(judge_rounds: list[int]) -> list[int]:
@@ -295,12 +337,15 @@ def run_debate(
     progress_file: TextIO = sys.stdout,
     debate_stop_after: str | None = None,
     stage_state_file: Path | None = None,
+    persona_plain_agents: int = 0,
 ) -> dict[int, list[dict[str, Any]]]:
     judge_rounds = _normalise_judge_rounds(judge_rounds)
     debate_update_rounds = max(0, int(n_rounds))
     total_answer_rounds = debate_update_rounds + 1
     runtime_judge_persona_enabled = bool(use_personas) if enable_runtime_judge_persona is None else bool(enable_runtime_judge_persona)
     effective_judge_engine = judge_engine or engine
+    effective_persona_generator_engine = persona_generator_engine or (engine if use_personas else None)
+    effective_persona_judge_engine = persona_judge_engine or effective_persona_generator_engine or effective_judge_engine
     current_persona_settings = _debate_persona_settings(
         use_personas=bool(use_personas),
         runtime_judge_persona_enabled=runtime_judge_persona_enabled,
@@ -317,6 +362,7 @@ def run_debate(
         judge_bank_dir=judge_bank_dir,
         judge_bank_refresh=judge_bank_refresh,
         gpqa_family_cache_path=gpqa_family_cache_path,
+        persona_plain_agents=persona_plain_agents,
     )
     current_runtime_settings = _debate_runtime_settings(
         engine=engine,
@@ -399,13 +445,14 @@ def run_debate(
                 artifact = None if persona_artifacts_by_item is None else persona_artifacts_by_item.get(item.item_uid)
                 artifact_path = None
                 if artifact is None:
+                    expected_n_personas = int(n_agents) - int(persona_plain_agents)
                     artifact, artifact_path = _resolve_persona_artifact(
                         dataset=dataset,
                         item=item,
                         question=question,
                         raw_task=raw_task,
                         artifacts_dir=artifacts_dir,
-                        n_personas=n_agents,
+                        n_personas=expected_n_personas,
                         persona_seed=persona_seed,
                         axis_mode=persona_axis_mode,
                         fixed_axis_count=persona_fixed_axis_count,
@@ -415,18 +462,22 @@ def run_debate(
                         backend=persona_backend,
                         generator_model=generator_model,
                         judge_generator_model=judge_generator_model,
-                        generator_engine=persona_generator_engine,
-                        judge_engine=persona_judge_engine or judge_engine or engine,
+                        generator_engine=effective_persona_generator_engine,
+                        judge_engine=effective_persona_judge_engine,
                         axes_file=persona_axes_file,
                         judge_bank_dir=judge_bank_dir,
                         judge_bank_refresh=judge_bank_refresh,
                         gpqa_family_cache_path=gpqa_family_cache_path,
                         save_artifact=persona_save_artifacts,
                         replay=persona_replay,
+                        n_plain_agents=persona_plain_agents,
                     )
-                elif len(artifact.cards) != int(n_agents):
-                    raise ValueError(
-                        f"Precomputed persona artifact for {item.item_uid!r} has {len(artifact.cards)} cards; expected {n_agents}"
+                else:
+                    _validate_precomputed_persona_artifact(
+                        artifact=artifact,
+                        item_uid=item.item_uid,
+                        n_agents=int(n_agents),
+                        persona_plain_agents=int(persona_plain_agents),
                     )
                 persona_artifacts.append(artifact)
                 persona_artifact_paths.append(artifact_path)
@@ -450,7 +501,7 @@ def run_debate(
                     judge_persona_mode=persona_judge_mode,
                     persona_backend=persona_backend,
                     judge_generator_model=judge_generator_model,
-                    judge_engine=persona_judge_engine or judge_engine or engine,
+                    judge_engine=effective_persona_judge_engine,
                 )
             runtime_judge_cards.append(runtime_judge_card)
             runtime_judge_bank_meta.append(runtime_judge_meta)
@@ -570,23 +621,34 @@ def run_debate(
     start_round_idx = 0
     pending_judge_round: int | None = None
     if resume_entry is not None:
-        parsed_stage = _parse_debate_stage_name(resume_entry.completed_stage)
-        if parsed_stage is not None:
-            completed_round, completed_judge = parsed_stage
-            if completed_judge:
-                start_round_idx = completed_round + 1
-            elif completed_round in judge_rounds:
-                start_round_idx = completed_round
-                pending_judge_round = completed_round
-            else:
-                start_round_idx = completed_round + 1
+        active_stage = str(resume_state.get("active_stage") or "").strip() or None
+        active_stage_complete = bool(resume_state.get("active_stage_complete", True))
+        if active_stage is not None and not active_stage_complete:
+            parsed_stage = _parse_debate_stage_name(active_stage)
+            if parsed_stage is not None:
+                active_round, active_judged = parsed_stage
+                start_round_idx = active_round
+                pending_judge_round = active_round if active_judged else None
+        else:
+            parsed_stage = _parse_debate_stage_name(resume_entry.completed_stage)
+            if parsed_stage is not None:
+                completed_round, completed_judge = parsed_stage
+                if completed_judge:
+                    start_round_idx = completed_round + 1
+                elif completed_round in judge_rounds:
+                    start_round_idx = completed_round
+                    pending_judge_round = completed_round
+                else:
+                    start_round_idx = completed_round + 1
 
-    def _append_state(completed_stage: str) -> None:
+    def _append_state(completed_stage: str, *, active_stage: str | None = None, active_stage_complete: bool = True) -> None:
         if stage_state_file is None:
             return
         _debate_append_state(
             stage_state_file=stage_state_file,
             completed_stage=completed_stage,
+            active_stage=active_stage,
+            active_stage_complete=active_stage_complete,
             dataset=str(dataset),
             items=items,
             all_contexts=all_contexts,
@@ -617,6 +679,10 @@ def run_debate(
                 agent_contexts = all_contexts[q_idx]
                 previous_round_outputs = [agent_round_outputs_by_q[q_idx][agent_idx][-1] for agent_idx in range(n_agents)]
                 for agent_idx, agent_ctx in enumerate(agent_contexts):
+                    if len(agent_round_outputs_by_q[q_idx][agent_idx]) >= round_idx + 1:
+                        continue
+                    if agent_ctx and agent_ctx[-1].get("role") == "user":
+                        continue
                     agent_ctx.append(
                         _build_agent_debate_message(
                             dataset=dataset,
@@ -629,33 +695,15 @@ def run_debate(
         current_round_num = round_idx + 1
         current_debate_round = max(0, current_round_num - 1)
         if not skip_debater:
-            flat_contexts = [
-                all_contexts[q_idx][agent_idx]
+            pending_debater_checkpoint_count = 0
+            pending_agent_total = sum(
+                1
                 for q_idx in range(len(parsed_items))
                 for agent_idx in range(n_agents)
-            ]
-            flat_request_contexts = flat_contexts
-            if round_idx > 0 and _provider_is_gemini(_engine_backend_name(engine)):
-                flat_request_contexts = []
-                for q_idx in range(len(parsed_items)):
-                    artifact = persona_artifacts[q_idx]
-                    for agent_idx in range(n_agents):
-                        persona_id = None
-                        if artifact is not None and agent_idx < len(artifact.cards):
-                            persona_id = artifact.cards[agent_idx].persona_id
-                        flat_request_contexts.append(
-                            _build_gemini_debate_cache_context(
-                                messages=all_contexts[q_idx][agent_idx],
-                                dataset=dataset,
-                                item_uid=parsed_items[q_idx][0].item_uid,
-                                agent_idx=agent_idx,
-                                round_idx=round_idx,
-                                persona_id=persona_id,
-                            )
-                        )
-
+                if len(agent_round_outputs_by_q[q_idx][agent_idx]) < current_round_num
+            )
             round_pbar = tqdm(
-                total=len(flat_request_contexts),
+                total=pending_agent_total,
                 desc=f"round {round_idx + 1}",
                 unit="call",
                 leave=False,
@@ -667,39 +715,73 @@ def run_debate(
             if debater_sampling_kwargs is None:
                 debater_sampling_kwargs = {}
             debater_sampling_kwargs.setdefault("max_tokens", DEBATE_DEFAULT_MAX_OUTPUT_TOKENS)
+            flat_request_contexts: list[list[dict[str, Any]]] = []
+            flat_request_meta: list[tuple[int, int]] = []
+            for q_idx in range(len(parsed_items)):
+                for agent_idx in range(n_agents):
+                    if len(agent_round_outputs_by_q[q_idx][agent_idx]) >= current_round_num:
+                        continue
+                    flat_request_contexts.append(all_contexts[q_idx][agent_idx])
+                    flat_request_meta.append((q_idx, agent_idx))
+
+            def _persist_debater_result(flat_idx: int, inference_result: Any) -> None:
+                nonlocal pending_debater_checkpoint_count
+                q_idx, agent_idx = flat_request_meta[flat_idx]
+                if len(agent_round_outputs_by_q[q_idx][agent_idx]) >= current_round_num:
+                    return
+                raw_completion = str(inference_result.text)
+                all_contexts[q_idx][agent_idx].append({"role": "assistant", "content": raw_completion})
+                round_output = _build_round_output(
+                    dataset=dataset,
+                    raw_response=raw_completion,
+                    raw_task=parsed_items[q_idx][3],
+                    gt_answer=parsed_items[q_idx][2],
+                    public_rationale_max_tokens=public_rationale_max_tokens,
+                    inference_result=inference_result,
+                    request_messages=flat_request_contexts[flat_idx],
+                    request_engine=engine,
+                    prompt_token_counter=debater_token_counter,
+                )
+                agent_round_outputs_by_q[q_idx][agent_idx].append(round_output)
+                pending_debater_checkpoint_count += 1
+                if pending_debater_checkpoint_count >= DEBATE_PARTIAL_CHECKPOINT_DEBATER_FLUSH_EVERY:
+                    _append_state(
+                        f"round_{current_debate_round}",
+                        active_stage=f"round_{current_debate_round}",
+                        active_stage_complete=False,
+                    )
+                    pending_debater_checkpoint_count = 0
+
             try:
-                flat_results = ensure_inference_results(
+                debater_results = ensure_inference_results(
                     engine,
                     flat_request_contexts,
                     batch_size=batch_size,
                     sampling_kwargs=debater_sampling_kwargs,
                     progress_callback=round_pbar.update,
+                    result_callback=_persist_debater_result,
                     model_role="debater",
                 )
+                for flat_idx, inference_result in enumerate(debater_results):
+                    _persist_debater_result(flat_idx, inference_result)
+            except Exception:
+                if pending_debater_checkpoint_count > 0:
+                    _append_state(
+                        f"round_{current_debate_round}",
+                        active_stage=f"round_{current_debate_round}",
+                        active_stage_complete=False,
+                    )
+                    pending_debater_checkpoint_count = 0
+                raise
             finally:
                 round_pbar.close()
-            flat_completions = [result.text for result in flat_results]
-
-            for q_idx in range(len(parsed_items)):
-                for agent_idx in range(n_agents):
-                    flat_idx = q_idx * n_agents + agent_idx
-                    raw_completion = str(flat_completions[flat_idx])
-                    all_contexts[q_idx][agent_idx].append({"role": "assistant", "content": raw_completion})
-                    round_output = _build_round_output(
-                        dataset=dataset,
-                        raw_response=raw_completion,
-                        raw_task=parsed_items[q_idx][3],
-                        gt_answer=parsed_items[q_idx][2],
-                        public_rationale_max_tokens=public_rationale_max_tokens,
-                        inference_result=flat_results[flat_idx],
-                        request_messages=flat_request_contexts[flat_idx],
-                        request_engine=engine,
-                        prompt_token_counter=debater_token_counter,
-                    )
-                    agent_round_outputs_by_q[q_idx][agent_idx].append(round_output)
 
             debater_step_name = f"round_{current_debate_round}"
-            _append_state(debater_step_name)
+            _append_state(
+                debater_step_name,
+                active_stage=debater_step_name,
+                active_stage_complete=True,
+            )
             if debate_stop_after == debater_step_name:
                 is_final_unjudged_stage = (
                     round_idx == total_answer_rounds - 1
@@ -727,9 +809,6 @@ def run_debate(
             continue
 
         block_end = current_round_num
-        used_start_rounds: list[int] = [1 for _ in parsed_items]
-        used_prev_texts: list[str | None] = [None for _ in parsed_items]
-
         ctx_len = int(getattr(judge_engine, "context_len_tokens", 0) or 0) or (
             infer_native_context_len(getattr(judge_engine, "model_name", engine.model_name)) or 32768
         )
@@ -748,17 +827,22 @@ def run_debate(
         ) or {}
         judge_request_sampling_kwargs.setdefault("max_tokens", int(judge_max_new_tokens))
 
-        def _build_contexts_for_round() -> list[list[dict[str, Any]]]:
-            judge_contexts: list[list[dict[str, Any]]] = []
-            for q_idx, (_item, question, _gt_answer, raw_task) in enumerate(parsed_items):
+        judge_step_name = f"round_{current_debate_round}_judge"
+        completed_judge_count = len(results_by_round[current_debate_round])
+        pending_judge_q_idxs = list(range(completed_judge_count, len(parsed_items)))
+        pending_judge_checkpoint_count = 0
+
+        try:
+            for q_idx in pending_judge_q_idxs:
+                item, question, gt_answer, raw_task = parsed_items[q_idx]
                 judge_system_prompt = (
                     runtime_judge_cards[q_idx].system_prompt
                     if runtime_judge_cards[q_idx] is not None
                     else None
                 )
-                block_start = 1
-                prev_text = None
-                ctx_msgs = _build_judge_context(
+                used_start_round = 1
+                used_prev_text = None
+                judge_context = _build_judge_context(
                     dataset=dataset,
                     question=question,
                     raw_task=raw_task,
@@ -775,10 +859,10 @@ def run_debate(
                 prompt_tokens = _count_prompt_tokens(
                     engine=judge_engine,
                     counter=judge_token_counter,
-                    messages=ctx_msgs,
+                    messages=judge_context,
                 )
                 if prompt_tokens is not None and prompt_tokens > budget:
-                    block_start, prev_text, ctx_msgs = _build_judge_round_context(
+                    used_start_round, used_prev_text, judge_context = _build_judge_round_context(
                         dataset=dataset,
                         question=question,
                         raw_task=raw_task,
@@ -793,422 +877,382 @@ def run_debate(
                         context_len_tokens=ctx_len,
                         judge_max_new_tokens=judge_max_new_tokens,
                     )
-                used_start_rounds[q_idx] = block_start
-                used_prev_texts[q_idx] = prev_text
-                judge_contexts.append(ctx_msgs)
-            return judge_contexts
 
-        judge_contexts = _build_contexts_for_round()
-        judge_request_contexts = judge_contexts
-        if _provider_is_gemini(_engine_backend_name(judge_engine)):
-            judge_request_contexts = [
-                _build_gemini_judge_cache_context(
-                    messages=judge_contexts[q_idx],
+                judge_request_context = judge_context
+                judge_raw_result = ensure_inference_results(
+                    judge_engine,
+                    [judge_request_context],
+                    batch_size=1,
+                    sampling_kwargs=judge_request_sampling_kwargs,
+                    model_role="judge",
+                )[0]
+                judge_raw_output = str(judge_raw_result.text)
+
+                judge_retry_raw_output: str | None = None
+                judge_retry_result: Any | None = None
+                judge_retry_context: list[dict[str, Any]] | None = None
+                judge_parse_failed = False
+                judge_used_fallback = False
+                judge_parse_mode = "none"
+                judge_parse_source = "none"
+                judge_retry_reason: str | None = None
+                judge_finish_state = "raw_pending"
+                judge_raw_had_strict_final = False
+                judge_retry_had_strict_final = False
+
+                raw_strict_probe = _parse_judge_output(
                     dataset=dataset,
-                    item_uid=parsed_items[q_idx][0].item_uid,
-                    round_idx=round_idx,
-                    phase="raw",
-                )
-                for q_idx in range(len(parsed_items))
-            ]
-        judge_raw_results = ensure_inference_results(
-            judge_engine,
-            judge_request_contexts,
-            batch_size=batch_size,
-            sampling_kwargs=judge_request_sampling_kwargs,
-            model_role="judge",
-        )
-        judge_raw_outputs = [result.text for result in judge_raw_results]
-
-        judged_answers: list[str | None] = [None for _ in parsed_items]
-        judge_retry_raw_outputs: list[str | None] = [None for _ in parsed_items]
-        judge_retry_results: list[Any | None] = [None for _ in parsed_items]
-        judge_retry_contexts: list[list[dict[str, Any]] | None] = [None for _ in parsed_items]
-        judge_parse_failed: list[bool] = [False for _ in parsed_items]
-        judge_used_fallback: list[bool] = [False for _ in parsed_items]
-        judge_parse_mode: list[str] = ["none" for _ in parsed_items]
-        judge_parse_source: list[str] = ["none" for _ in parsed_items]
-        judge_retry_reason: list[str | None] = [None for _ in parsed_items]
-        judge_finish_state: list[str] = ["raw_pending" for _ in parsed_items]
-        judge_raw_had_strict_final: list[bool] = [False for _ in parsed_items]
-        judge_retry_had_strict_final: list[bool] = [False for _ in parsed_items]
-        allow_recovery_on_retry = bool(judge_recovery_parse_enabled)
-
-        needs_retry_idxs: list[int] = []
-        for q_idx, (raw_out, (_item, _question, _gt_answer, raw_task)) in enumerate(zip(judge_raw_outputs, parsed_items)):
-            raw_strict_probe = _parse_judge_output(
-                dataset=dataset,
-                text=raw_out,
-                raw_task=raw_task,
-                source_prefix="raw",
-                strict_enabled=True,
-                recovery_enabled=False,
-            )
-            judge_raw_had_strict_final[q_idx] = bool(raw_strict_probe.strict_success)
-
-            parsed = _parse_judge_output(
-                dataset=dataset,
-                text=raw_out,
-                raw_task=raw_task,
-                source_prefix="raw",
-                strict_enabled=True,
-                recovery_enabled=bool(judge_recovery_parse_enabled),
-            )
-            if parsed.answer is None:
-                needs_retry_idxs.append(q_idx)
-                judge_retry_reason[q_idx] = "parse_none"
-                judge_finish_state[q_idx] = "retry_needed"
-            else:
-                judged_answers[q_idx] = parsed.answer
-                judge_parse_mode[q_idx] = parsed.mode
-                judge_parse_source[q_idx] = parsed.source
-                judge_used_fallback[q_idx] = parsed.mode == "recover"
-                judge_finish_state[q_idx] = "raw_parsed"
-
-        if needs_retry_idxs:
-            retry_sampling = dict(judge_request_sampling_kwargs)
-            if not _provider_is_gemini(_engine_backend_name(judge_engine)):
-                retry_sampling["temperature"] = 0.0
-                retry_sampling["top_p"] = 1.0
-            retry_sampling["max_tokens"] = int(judge_max_new_tokens)
-
-            retry_contexts: list[list[dict[str, str]]] = []
-            for q_idx in needs_retry_idxs:
-                retry_ctx = list(judge_contexts[q_idx]) + [
-                    {"role": "assistant", "content": str(judge_raw_outputs[q_idx])},
-                    {"role": "user", "content": JUDGE_RETRY_NUDGE},
-                ]
-                retry_contexts.append(retry_ctx)
-                judge_retry_contexts[q_idx] = retry_ctx
-            retry_request_contexts = retry_contexts
-            if _provider_is_gemini(_engine_backend_name(judge_engine)):
-                retry_request_contexts = [
-                    _build_gemini_judge_cache_context(
-                        messages=retry_contexts[i],
-                        dataset=dataset,
-                        item_uid=parsed_items[q_idx][0].item_uid,
-                        round_idx=round_idx,
-                        phase="retry",
-                    )
-                    for i, q_idx in enumerate(needs_retry_idxs)
-                ]
-
-            retry_results_batch = ensure_inference_results(
-                judge_engine,
-                retry_request_contexts,
-                batch_size=batch_size,
-                sampling_kwargs=retry_sampling,
-                model_role="judge",
-            )
-            retry_outputs = [result.text for result in retry_results_batch]
-
-            for i, q_idx in enumerate(needs_retry_idxs):
-                _item, _question, _gt_answer, raw_task = parsed_items[q_idx]
-                retry_out = retry_outputs[i]
-                judge_retry_raw_outputs[q_idx] = str(retry_out)
-                if i < len(retry_results_batch):
-                    judge_retry_results[q_idx] = retry_results_batch[i]
-
-                retry_strict_probe = _parse_judge_output(
-                    dataset=dataset,
-                    text=retry_out,
+                    text=judge_raw_output,
                     raw_task=raw_task,
-                    source_prefix="retry",
+                    source_prefix="raw",
                     strict_enabled=True,
                     recovery_enabled=False,
                 )
-                judge_retry_had_strict_final[q_idx] = bool(retry_strict_probe.strict_success)
-                parsed_retry = _parse_judge_output(
+                judge_raw_had_strict_final = bool(raw_strict_probe.strict_success)
+                parsed = _parse_judge_output(
                     dataset=dataset,
-                    text=retry_out,
+                    text=judge_raw_output,
                     raw_task=raw_task,
-                    source_prefix="retry",
+                    source_prefix="raw",
                     strict_enabled=True,
-                    recovery_enabled=allow_recovery_on_retry,
+                    recovery_enabled=bool(judge_recovery_parse_enabled),
                 )
-                judged = parsed_retry.answer
-                if judged is not None:
-                    judge_parse_mode[q_idx] = parsed_retry.mode
-                    judge_parse_source[q_idx] = parsed_retry.source
-                    judge_used_fallback[q_idx] = parsed_retry.mode == "recover"
-                    judge_finish_state[q_idx] = "retry_parsed"
-                else:
-                    judge_finish_state[q_idx] = "retry_unparsed"
-
-                judged_answers[q_idx] = judged
-
-        for q_idx, (item, _question, _gt_answer, _raw_task) in enumerate(parsed_items):
-            if judged_answers[q_idx] is None:
-                judge_parse_failed[q_idx] = True
-                judge_finish_state[q_idx] = "failed_unparsed"
-                print(
-                    f"[warn] Judge output unparsable after retry: "
-                    f"subset_id={item.subset_id} orig_id={item.orig_id} round={current_round_num}",
-                    file=sys.stderr,
-                )
-
-        for q_idx, (raw_out, judged) in enumerate(zip(judge_raw_outputs, judged_answers)):
-            if judged is None or judge_parse_mode[q_idx] != "strict":
-                continue
-            cache_raw_output = raw_out
-            if (
-                str(judge_parse_source[q_idx]).startswith("retry_")
-                and judge_retry_raw_outputs[q_idx] is not None
-            ):
-                cache_raw_output = judge_retry_raw_outputs[q_idx]
-            prev_judge_by_q[q_idx] = PrevJudgeInfo(
-                start_round=int(used_start_rounds[q_idx]),
-                end_round=block_end,
-                parsed_answer=str(judged),
-                raw_output=str(cache_raw_output),
-            )
-
-        for q_idx, (item, question, gt_answer, raw_task) in enumerate(parsed_items):
-            agent_contexts = all_contexts[q_idx]
-            judged = judged_answers[q_idx]
-            agent_round_outputs = [
-                [dict(round_output) for round_output in agent_round_outputs_by_q[q_idx][agent_idx][:current_round_num]]
-                for agent_idx in range(n_agents)
-            ]
-            agent_round_parsed_answers = [
-                [round_output.get("final_answer") for round_output in agent_outputs]
-                for agent_outputs in agent_round_outputs
-            ]
-            round1_majority_result = round1_majority_by_q[q_idx] or _vote_result_payload(
-                answers=[
-                    agent_outputs[0].get("final_answer") if agent_outputs else None
-                    for agent_outputs in agent_round_outputs
-                ],
-                dataset=dataset,
-                gt_answer=gt_answer,
-                raw_task=raw_task,
-                result_kind="debate_round1_majority",
-                result_origin="shared_debate_round1",
-            )
-            round1_majority_answer = round1_majority_result["majority_answer"]
-            round1_majority_correct = round1_majority_result["majority_correct"]
-            final_round_answers = [answers[-1] if answers else None for answers in agent_round_parsed_answers]
-            final_round_majority_result = _vote_result_payload(
-                answers=final_round_answers,
-                dataset=dataset,
-                gt_answer=gt_answer,
-                raw_task=raw_task,
-                result_kind="debate_final_round_majority",
-                result_origin="debate_final_round",
-            )
-            final_majority_answer = final_round_majority_result["majority_answer"]
-            final_majority_correct = final_round_majority_result["majority_correct"]
-            convergence_per_round = _compute_round_convergence(
-                agent_round_outputs,
-                n_rounds=current_round_num,
-            )
-            answer_changes_per_agent = _compute_answer_changes(agent_round_outputs)
-            persona_fidelity_metrics = _compute_persona_fidelity_metrics(
-                agent_round_outputs,
-                answer_changes=answer_changes_per_agent,
-                convergence=convergence_per_round,
-            )
-
-            final_judge_answer = judged
-            judge_extraction = _extract_output_details(
-                dataset=dataset,
-                raw_response=str(judge_raw_outputs[q_idx]),
-                raw_task=raw_task,
-                gt_answer=gt_answer,
-                parse_mode=judge_parse_mode[q_idx] if judge_parse_mode[q_idx] in {"default", "strict", "recover"} else "default",
-            )
-            judge_retry_extraction = (
-                _extract_output_details(
-                    dataset=dataset,
-                    raw_response=str(judge_retry_raw_outputs[q_idx]),
-                    raw_task=raw_task,
-                    gt_answer=gt_answer,
-                    parse_mode=judge_parse_mode[q_idx] if judge_parse_mode[q_idx] in {"default", "strict", "recover"} else "recover",
-                )
-                if judge_retry_raw_outputs[q_idx] is not None
-                else None
-            )
-            accepted_judge_extraction = judge_extraction
-            accepted_judge_scoring = judge_extraction["scoring_result"]
-            accepted_judge_trace_source = "raw"
-            if str(judge_parse_source[q_idx]).startswith("retry_") and judge_retry_extraction is not None:
-                accepted_judge_extraction = judge_retry_extraction
-                accepted_judge_scoring = judge_retry_extraction["scoring_result"]
-                accepted_judge_trace_source = "retry"
-            final_judge_correct = _check_answer_correctness(dataset, final_judge_answer, gt_answer, raw_task)
-            judge_raw_call_meta = _inference_result_meta(
-                judge_raw_results[q_idx],
-                request_messages=judge_contexts[q_idx],
-                engine=judge_engine,
-                prompt_token_counter=judge_token_counter,
-            )
-            judge_retry_call_meta = _inference_result_meta(
-                judge_retry_results[q_idx],
-                request_messages=judge_retry_contexts[q_idx],
-                engine=judge_engine,
-                prompt_token_counter=judge_token_counter,
-            )
-            debater_round_token_usage = _compute_round_token_usage(agent_round_outputs)
-            judge_token_usage = {
-                    "round": current_debate_round,
-                "raw_call": None if judge_raw_call_meta is None else judge_raw_call_meta["token_counts"],
-                "retry_call": None if judge_retry_call_meta is None else judge_retry_call_meta["token_counts"],
-                "aggregate": _merge_token_counts(
-                    [
-                        None if judge_raw_call_meta is None else judge_raw_call_meta["token_counts"],
-                        None if judge_retry_call_meta is None else judge_retry_call_meta["token_counts"],
+                judged = parsed.answer
+                if judged is None:
+                    judge_retry_reason = "parse_none"
+                    judge_finish_state = "retry_needed"
+                    retry_sampling = dict(judge_request_sampling_kwargs)
+                    if not _provider_is_gemini(_engine_backend_name(judge_engine)):
+                        retry_sampling["temperature"] = 0.0
+                        retry_sampling["top_p"] = 1.0
+                    retry_sampling["max_tokens"] = int(judge_max_new_tokens)
+                    judge_retry_context = list(judge_context) + [
+                        {"role": "assistant", "content": judge_raw_output},
+                        {"role": "user", "content": JUDGE_RETRY_NUDGE},
                     ]
-                ),
-            }
-            runtime_judge_meta = runtime_judge_bank_meta[q_idx] or {}
-            judge_family_assignment = (
-                runtime_judge_meta.get("judge_family_assignment")
-                if isinstance(runtime_judge_meta, dict)
-                else None
-            )
-            judge_bank_meta = (
-                runtime_judge_meta
-                if isinstance(runtime_judge_meta, dict) and runtime_judge_meta.get("judge_bank_path")
-                else None
-            )
-            judge_trace = {
-                "judge_backend": _engine_backend_name(judge_engine),
-                "judge_model": getattr(judge_engine, "model_name", engine.model_name),
-                "judge_trace_mode": _judge_trace_mode_enabled(judge_trace_mode),
-                "judge_context_start_round": used_start_rounds[q_idx],
-                "judge_context_end_round": block_end,
-                "judge_context_is_full_transcript": used_start_rounds[q_idx] == 1 and used_prev_texts[q_idx] is None,
-                "judge_context": judge_contexts[q_idx],
-                "judge_raw_response": judge_raw_outputs[q_idx],
-                "judge_raw_call_metadata": judge_raw_call_meta,
-                "judge_retry_raw_response": judge_retry_raw_outputs[q_idx],
-                "judge_retry_call_metadata": judge_retry_call_meta,
-                "judge_parsed_answer": judged,
-                "judge_extractor_trace": accepted_judge_extraction["extractor_trace"],
-                "judge_extractor_trace_source": accepted_judge_trace_source,
-                "judge_raw_extractor_trace": judge_extraction["extractor_trace"],
-                "judge_retry_extractor_trace": None if judge_retry_extraction is None else judge_retry_extraction["extractor_trace"],
-                "judge_scoring_result": accepted_judge_scoring,
-                "judge_raw_scoring_result": judge_extraction["scoring_result"],
-                "judge_retry_scoring_result": None if judge_retry_extraction is None else judge_retry_extraction["scoring_result"],
-                "judge_parse_failed": bool(judge_parse_failed[q_idx]),
-                "judge_used_fallback": bool(judge_used_fallback[q_idx]),
-                "judge_parse_mode": judge_parse_mode[q_idx],
-                "judge_parse_source": judge_parse_source[q_idx],
-                "judge_retry_reason": judge_retry_reason[q_idx],
-                "judge_finish_state": judge_finish_state[q_idx],
-                "judge_raw_had_strict_final": bool(judge_raw_had_strict_final[q_idx]),
-                "judge_retry_had_strict_final": bool(judge_retry_had_strict_final[q_idx]),
-                "judge_card": None if runtime_judge_cards[q_idx] is None else asdict(runtime_judge_cards[q_idx]),
-                "judge_family_assignment": judge_family_assignment,
-                "judge_bank": judge_bank_meta,
-                "judge_previous_summary": used_prev_texts[q_idx],
-                "judge_correct": final_judge_correct,
-                "judge_token_usage": judge_token_usage,
-            }
-            judge_summary = _judge_summary_from_card(runtime_judge_cards[q_idx])
-            persona_summary_rows = _persona_summaries(persona_artifacts[q_idx]) or []
-            revision_profiles = persona_fidelity_metrics.get("revision_rate_by_persona") or []
-            if isinstance(revision_profiles, list):
-                for agent_idx, profile in enumerate(revision_profiles):
-                    if not isinstance(profile, dict):
-                        continue
-                    summary = persona_summary_rows[agent_idx] if agent_idx < len(persona_summary_rows) else {}
-                    if isinstance(summary, dict):
-                        profile.setdefault("persona_id", summary.get("persona_id"))
-                        profile.setdefault("title", summary.get("title"))
-                        profile.setdefault("short_rule", summary.get("short_rule"))
-            artifact_path = persona_artifact_paths[q_idx]
-            persona_meta = _persona_runtime_meta(
-                persona_artifacts[q_idx],
-                artifact_path=artifact_path,
-                allow_missing_artifact_path=bool(persona_replay or persona_save_artifacts),
-                persona_sampling_method=persona_sampling_method,
-                persona_backend=persona_backend,
-                public_rationale_max_tokens=public_rationale_max_tokens,
-            )
-            judge_meta = {
-                "judge_model": getattr(judge_engine, "model_name", engine.model_name),
-                "judge_persona_mode": persona_judge_mode if runtime_judge_cards[q_idx] is not None else None,
-                "judge_trace_mode": _judge_trace_mode_enabled(judge_trace_mode),
-                "judge_summary": judge_summary,
-                "judge_family_assignment": judge_family_assignment,
-                "judge_bank": judge_bank_meta,
-            }
-            judge_result = {
-                "result_kind": "debate_judge_selection",
-                "result_origin": "debate_judge",
-                "answer": final_judge_answer,
-                "correct": final_judge_correct,
-            }
+                    retry_request_context = judge_retry_context
+                    judge_retry_result = ensure_inference_results(
+                        judge_engine,
+                        [retry_request_context],
+                        batch_size=1,
+                        sampling_kwargs=retry_sampling,
+                        model_role="judge",
+                    )[0]
+                    judge_retry_raw_output = str(judge_retry_result.text)
+                    retry_strict_probe = _parse_judge_output(
+                        dataset=dataset,
+                        text=judge_retry_raw_output,
+                        raw_task=raw_task,
+                        source_prefix="retry",
+                        strict_enabled=True,
+                        recovery_enabled=False,
+                    )
+                    judge_retry_had_strict_final = bool(retry_strict_probe.strict_success)
+                    parsed_retry = _parse_judge_output(
+                        dataset=dataset,
+                        text=judge_retry_raw_output,
+                        raw_task=raw_task,
+                        source_prefix="retry",
+                        strict_enabled=True,
+                        recovery_enabled=bool(judge_recovery_parse_enabled),
+                    )
+                    judged = parsed_retry.answer
+                    if judged is not None:
+                        judge_parse_mode = parsed_retry.mode
+                        judge_parse_source = parsed_retry.source
+                        judge_used_fallback = parsed_retry.mode == "recover"
+                        judge_finish_state = "retry_parsed"
+                    else:
+                        judge_finish_state = "retry_unparsed"
+                else:
+                    judge_parse_mode = parsed.mode
+                    judge_parse_source = parsed.source
+                    judge_used_fallback = parsed.mode == "recover"
+                    judge_finish_state = "raw_parsed"
 
-            is_final_round = current_round_num == total_answer_rounds
-            agent_responses = agent_contexts if is_final_round else [ctx[:] for ctx in agent_contexts]
+                if judged is None:
+                    judge_parse_failed = True
+                    judge_finish_state = "failed_unparsed"
+                    print(
+                        f"[warn] Judge output unparsable after retry: "
+                        f"subset_id={item.subset_id} orig_id={item.orig_id} round={current_round_num}",
+                        file=sys.stderr,
+                    )
 
-            results_by_round[current_debate_round].append(
-                {
-                    "schema_version": "phase2.debate.v1",
-                    "mode": "debate",
-                    "row_origin": "debate_judge",
-                    "debater_model": getattr(engine, "model_name", None),
-                    "debater_backend": _engine_backend_name(engine),
-                    "n_agents": n_agents,
-                    "n_rounds": current_debate_round,
-                    "total_answer_rounds": current_round_num,
-                    "persona_meta": persona_meta,
-                    "judge_meta": judge_meta,
-                    "persona_ids": [card.persona_id for card in persona_artifacts[q_idx].cards] if persona_artifacts[q_idx] is not None else None,
-                    "persona_summaries": persona_summary_rows,
-                    "judge_summary": judge_summary,
-                    "agent_responses": agent_responses,
-                    "agent_round_outputs": agent_round_outputs,
-                    "agent_round_parsed_answers": agent_round_parsed_answers,
-                    "debater_round_token_usage": debater_round_token_usage,
-                    "judge_round_token_usage": judge_token_usage,
-                    "token_usage_summary": {
-                        "debater": _merge_token_counts(debater_round_token_usage),
-                        "judge": judge_token_usage["aggregate"],
-                        "all": _merge_token_counts(
-                            debater_round_token_usage + [judge_token_usage["aggregate"]]
-                        ),
-                    },
-                    "round1_majority_result": round1_majority_result,
-                    "round1_majority_origin": round1_majority_result["result_origin"],
-                    "round1_vote_counts": round1_majority_result["vote_counts"],
-                    "round1_strict_majority_answer": round1_majority_result["strict_majority_answer"],
-                    "round1_plurality_answer": round1_majority_result["plurality_answer"],
-                    "round1_majority_answer": round1_majority_answer,
-                    "round1_majority_correct": round1_majority_correct,
-                    "final_round_majority_result": final_round_majority_result,
-                    "final_round_majority_answer": final_majority_answer,
-                    "final_round_majority_correct": final_majority_correct,
-                    "judge_result": judge_result,
-                    "judge_final_answer": final_judge_answer,
-                    "judge_final_correct": final_judge_correct,
-                    "convergence_per_round": convergence_per_round,
-                    "answer_changes_per_agent": answer_changes_per_agent,
-                    "persona_fidelity_metrics": persona_fidelity_metrics,
-                    "final_majority_answer": final_majority_answer,
-                    "final_majority_correct": final_majority_correct,
-                    "judge_trace": judge_trace,
-                    "final_judge_answer": final_judge_answer,
-                    "final_judge_correct": final_judge_correct,
-                    "final_answer": final_judge_answer,
-                    "final_correct": final_judge_correct,
-                    "final_answer_source": "judge",
-                }
-            )
-            results_by_round[current_debate_round][-1].update(
-                _base_row_fields(
+                if judged is not None and judge_parse_mode == "strict":
+                    cache_raw_output = judge_raw_output
+                    if (
+                        str(judge_parse_source).startswith("retry_")
+                        and judge_retry_raw_output is not None
+                    ):
+                        cache_raw_output = judge_retry_raw_output
+                    prev_judge_by_q[q_idx] = PrevJudgeInfo(
+                        start_round=int(used_start_round),
+                        end_round=block_end,
+                        parsed_answer=str(judged),
+                        raw_output=str(cache_raw_output),
+                    )
+
+                agent_contexts = all_contexts[q_idx]
+                agent_round_outputs = [
+                    [dict(round_output) for round_output in agent_round_outputs_by_q[q_idx][agent_idx][:current_round_num]]
+                    for agent_idx in range(n_agents)
+                ]
+                agent_round_parsed_answers = [
+                    [round_output.get("final_answer") for round_output in agent_outputs]
+                    for agent_outputs in agent_round_outputs
+                ]
+                round1_majority_result = round1_majority_by_q[q_idx] or _vote_result_payload(
+                    answers=[
+                        agent_outputs[0].get("final_answer") if agent_outputs else None
+                        for agent_outputs in agent_round_outputs
+                    ],
                     dataset=dataset,
-                    item=item,
-                    question=question,
                     gt_answer=gt_answer,
                     raw_task=raw_task,
+                    result_kind="debate_round1_majority",
+                    result_origin="shared_debate_round1",
                 )
-            )
+                round1_majority_answer = round1_majority_result["majority_answer"]
+                round1_majority_correct = round1_majority_result["majority_correct"]
+                final_round_answers = [answers[-1] if answers else None for answers in agent_round_parsed_answers]
+                final_round_majority_result = _vote_result_payload(
+                    answers=final_round_answers,
+                    dataset=dataset,
+                    gt_answer=gt_answer,
+                    raw_task=raw_task,
+                    result_kind="debate_final_round_majority",
+                    result_origin="debate_final_round",
+                )
+                final_majority_answer = final_round_majority_result["majority_answer"]
+                final_majority_correct = final_round_majority_result["majority_correct"]
+                convergence_per_round = _compute_round_convergence(
+                    agent_round_outputs,
+                    n_rounds=current_round_num,
+                )
+                answer_changes_per_agent = _compute_answer_changes(agent_round_outputs)
+                persona_fidelity_metrics = _compute_persona_fidelity_metrics(
+                    agent_round_outputs,
+                    answer_changes=answer_changes_per_agent,
+                    convergence=convergence_per_round,
+                )
 
-        judge_step_name = f"round_{current_debate_round}_judge"
+                final_judge_answer = judged
+                judge_extraction = _extract_output_details(
+                    dataset=dataset,
+                    raw_response=str(judge_raw_output),
+                    raw_task=raw_task,
+                    gt_answer=gt_answer,
+                    parse_mode=judge_parse_mode if judge_parse_mode in {"default", "strict", "recover"} else "default",
+                )
+                judge_retry_extraction = (
+                    _extract_output_details(
+                        dataset=dataset,
+                        raw_response=str(judge_retry_raw_output),
+                        raw_task=raw_task,
+                        gt_answer=gt_answer,
+                        parse_mode=judge_parse_mode if judge_parse_mode in {"default", "strict", "recover"} else "recover",
+                    )
+                    if judge_retry_raw_output is not None
+                    else None
+                )
+                accepted_judge_extraction = judge_extraction
+                accepted_judge_scoring = judge_extraction["scoring_result"]
+                accepted_judge_trace_source = "raw"
+                if str(judge_parse_source).startswith("retry_") and judge_retry_extraction is not None:
+                    accepted_judge_extraction = judge_retry_extraction
+                    accepted_judge_scoring = judge_retry_extraction["scoring_result"]
+                    accepted_judge_trace_source = "retry"
+                final_judge_correct = _check_answer_correctness(dataset, final_judge_answer, gt_answer, raw_task)
+                judge_raw_call_meta = _inference_result_meta(
+                    judge_raw_result,
+                    request_messages=judge_context,
+                    engine=judge_engine,
+                    prompt_token_counter=judge_token_counter,
+                )
+                judge_retry_call_meta = _inference_result_meta(
+                    judge_retry_result,
+                    request_messages=judge_retry_context,
+                    engine=judge_engine,
+                    prompt_token_counter=judge_token_counter,
+                )
+                debater_round_token_usage = _compute_round_token_usage(agent_round_outputs)
+                judge_token_usage = {
+                        "round": current_debate_round,
+                    "raw_call": None if judge_raw_call_meta is None else judge_raw_call_meta["token_counts"],
+                    "retry_call": None if judge_retry_call_meta is None else judge_retry_call_meta["token_counts"],
+                    "aggregate": _merge_token_counts(
+                        [
+                            None if judge_raw_call_meta is None else judge_raw_call_meta["token_counts"],
+                            None if judge_retry_call_meta is None else judge_retry_call_meta["token_counts"],
+                        ]
+                    ),
+                }
+                runtime_judge_meta = runtime_judge_bank_meta[q_idx] or {}
+                judge_family_assignment = (
+                    runtime_judge_meta.get("judge_family_assignment")
+                    if isinstance(runtime_judge_meta, dict)
+                    else None
+                )
+                judge_bank_meta = (
+                    runtime_judge_meta
+                    if isinstance(runtime_judge_meta, dict) and runtime_judge_meta.get("judge_bank_path")
+                    else None
+                )
+                judge_trace = {
+                    "judge_backend": _engine_backend_name(judge_engine),
+                    "judge_model": getattr(judge_engine, "model_name", engine.model_name),
+                    "judge_trace_mode": _judge_trace_mode_enabled(judge_trace_mode),
+                    "judge_context_start_round": used_start_round,
+                    "judge_context_end_round": block_end,
+                    "judge_context_is_full_transcript": used_start_round == 1 and used_prev_text is None,
+                    "judge_context": judge_context,
+                    "judge_raw_response": judge_raw_output,
+                    "judge_raw_call_metadata": judge_raw_call_meta,
+                    "judge_retry_raw_response": judge_retry_raw_output,
+                    "judge_retry_call_metadata": judge_retry_call_meta,
+                    "judge_parsed_answer": judged,
+                    "judge_extractor_trace": accepted_judge_extraction["extractor_trace"],
+                    "judge_extractor_trace_source": accepted_judge_trace_source,
+                    "judge_raw_extractor_trace": judge_extraction["extractor_trace"],
+                    "judge_retry_extractor_trace": None if judge_retry_extraction is None else judge_retry_extraction["extractor_trace"],
+                    "judge_scoring_result": accepted_judge_scoring,
+                    "judge_raw_scoring_result": judge_extraction["scoring_result"],
+                    "judge_retry_scoring_result": None if judge_retry_extraction is None else judge_retry_extraction["scoring_result"],
+                    "judge_parse_failed": bool(judge_parse_failed),
+                    "judge_used_fallback": bool(judge_used_fallback),
+                    "judge_parse_mode": judge_parse_mode,
+                    "judge_parse_source": judge_parse_source,
+                    "judge_retry_reason": judge_retry_reason,
+                    "judge_finish_state": judge_finish_state,
+                    "judge_raw_had_strict_final": bool(judge_raw_had_strict_final),
+                    "judge_retry_had_strict_final": bool(judge_retry_had_strict_final),
+                    "judge_card": None if runtime_judge_cards[q_idx] is None else asdict(runtime_judge_cards[q_idx]),
+                    "judge_family_assignment": judge_family_assignment,
+                    "judge_bank": judge_bank_meta,
+                    "judge_previous_summary": used_prev_text,
+                    "judge_correct": final_judge_correct,
+                    "judge_token_usage": judge_token_usage,
+                }
+                judge_summary = _judge_summary_from_card(runtime_judge_cards[q_idx])
+                persona_summary_rows = _persona_summaries(persona_artifacts[q_idx]) or []
+                revision_profiles = persona_fidelity_metrics.get("revision_rate_by_persona") or []
+                if isinstance(revision_profiles, list):
+                    for agent_idx, profile in enumerate(revision_profiles):
+                        if not isinstance(profile, dict):
+                            continue
+                        summary = persona_summary_rows[agent_idx] if agent_idx < len(persona_summary_rows) else {}
+                        if isinstance(summary, dict):
+                            profile.setdefault("persona_id", summary.get("persona_id"))
+                            profile.setdefault("title", summary.get("title"))
+                            profile.setdefault("short_rule", summary.get("short_rule"))
+                artifact_path = persona_artifact_paths[q_idx]
+                persona_meta = _persona_runtime_meta(
+                    persona_artifacts[q_idx],
+                    artifact_path=artifact_path,
+                    allow_missing_artifact_path=bool(persona_replay or persona_save_artifacts),
+                    persona_sampling_method=persona_sampling_method,
+                    persona_backend=persona_backend,
+                    public_rationale_max_tokens=public_rationale_max_tokens,
+                )
+                judge_meta = {
+                    "judge_model": getattr(judge_engine, "model_name", engine.model_name),
+                    "judge_persona_mode": persona_judge_mode if runtime_judge_cards[q_idx] is not None else None,
+                    "judge_trace_mode": _judge_trace_mode_enabled(judge_trace_mode),
+                    "judge_summary": judge_summary,
+                    "judge_family_assignment": judge_family_assignment,
+                    "judge_bank": judge_bank_meta,
+                }
+                judge_result = {
+                    "result_kind": "debate_judge_selection",
+                    "result_origin": "debate_judge",
+                    "answer": final_judge_answer,
+                    "correct": final_judge_correct,
+                }
+
+                is_final_round = current_round_num == total_answer_rounds
+                agent_responses = agent_contexts if is_final_round else [ctx[:] for ctx in agent_contexts]
+
+                results_by_round[current_debate_round].append(
+                    {
+                        "schema_version": "phase2.debate.v1",
+                        "mode": "debate",
+                        "row_origin": "debate_judge",
+                        "debater_model": getattr(engine, "model_name", None),
+                        "debater_backend": _engine_backend_name(engine),
+                        "n_agents": n_agents,
+                        "n_rounds": current_debate_round,
+                        "total_answer_rounds": current_round_num,
+                        "persona_meta": persona_meta,
+                        "judge_meta": judge_meta,
+                        "persona_ids": [card.persona_id for card in persona_artifacts[q_idx].cards] if persona_artifacts[q_idx] is not None else None,
+                        "persona_summaries": persona_summary_rows,
+                        "judge_summary": judge_summary,
+                        "agent_responses": agent_responses,
+                        "agent_round_outputs": agent_round_outputs,
+                        "agent_round_parsed_answers": agent_round_parsed_answers,
+                        "debater_round_token_usage": debater_round_token_usage,
+                        "judge_round_token_usage": judge_token_usage,
+                        "token_usage_summary": {
+                            "debater": _merge_token_counts(debater_round_token_usage),
+                            "judge": judge_token_usage["aggregate"],
+                            "all": _merge_token_counts(
+                                debater_round_token_usage + [judge_token_usage["aggregate"]]
+                            ),
+                        },
+                        "round1_majority_result": round1_majority_result,
+                        "round1_majority_origin": round1_majority_result["result_origin"],
+                        "round1_vote_counts": round1_majority_result["vote_counts"],
+                        "round1_strict_majority_answer": round1_majority_result["strict_majority_answer"],
+                        "round1_plurality_answer": round1_majority_result["plurality_answer"],
+                        "round1_majority_answer": round1_majority_answer,
+                        "round1_majority_correct": round1_majority_correct,
+                        "final_round_majority_result": final_round_majority_result,
+                        "final_round_majority_answer": final_majority_answer,
+                        "final_round_majority_correct": final_majority_correct,
+                        "judge_result": judge_result,
+                        "judge_final_answer": final_judge_answer,
+                        "judge_final_correct": final_judge_correct,
+                        "convergence_per_round": convergence_per_round,
+                        "answer_changes_per_agent": answer_changes_per_agent,
+                        "persona_fidelity_metrics": persona_fidelity_metrics,
+                        "final_majority_answer": final_majority_answer,
+                        "final_majority_correct": final_majority_correct,
+                        "judge_trace": judge_trace,
+                        "final_judge_answer": final_judge_answer,
+                        "final_judge_correct": final_judge_correct,
+                        "final_answer": final_judge_answer,
+                        "final_correct": final_judge_correct,
+                        "final_answer_source": "judge",
+                    }
+                )
+                results_by_round[current_debate_round][-1].update(
+                    _base_row_fields(
+                        dataset=dataset,
+                        item=item,
+                        question=question,
+                        gt_answer=gt_answer,
+                        raw_task=raw_task,
+                    )
+                )
+                pending_judge_checkpoint_count += 1
+                if pending_judge_checkpoint_count >= DEBATE_PARTIAL_CHECKPOINT_JUDGE_FLUSH_EVERY:
+                    _append_state(
+                        judge_step_name,
+                        active_stage=judge_step_name,
+                        active_stage_complete=False,
+                    )
+                    pending_judge_checkpoint_count = 0
+        except Exception:
+            if pending_judge_checkpoint_count > 0:
+                _append_state(
+                    judge_step_name,
+                    active_stage=judge_step_name,
+                    active_stage_complete=False,
+                )
+                pending_judge_checkpoint_count = 0
+            raise
+
         _append_state(judge_step_name)
         if debate_stop_after == judge_step_name:
             is_final_judge_stage = round_idx == total_answer_rounds - 1
@@ -1222,6 +1266,8 @@ def _debate_append_state(
     *,
     stage_state_file: Path,
     completed_stage: str,
+    active_stage: str | None,
+    active_stage_complete: bool,
     dataset: str,
     items: list[SubsetItem],
     all_contexts: list[list[list[dict[str, Any]]]],
@@ -1249,6 +1295,8 @@ def _debate_append_state(
         dataset=dataset,
         items=[asdict(it) for it in items],
         debate_data={
+            "active_stage": None if active_stage is None else str(active_stage),
+            "active_stage_complete": bool(active_stage_complete),
             "all_contexts": all_contexts,
             "agent_round_outputs_by_q": serialised_outputs,
             "results_by_round": {str(k): v for k, v in results_by_round.items()},

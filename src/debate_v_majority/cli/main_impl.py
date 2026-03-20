@@ -92,6 +92,21 @@ from .engine_runtime import (
     _merge_token_counts,
     _reuse_or_create_role_engine,
 )
+from .hle_experiment import (
+    HLE_EXPERIMENT_ARMS,
+    HLE_EXPERIMENT_STAGE_TYPE,
+    additional_debate_round_path,
+    arm_results_path,
+    arm_traces_dir,
+    build_manifest as _build_hle_experiment_manifest,
+    completed_arms as _completed_hle_experiment_arms,
+    default_experiment_root,
+    default_manifest_path as _default_hle_experiment_manifest_path,
+    load_manifest,
+    update_manifest_for_arm,
+    write_manifest as _write_hle_experiment_manifest,
+    write_readable_traces,
+)
 from .output import (
     FINAL_OUTPUT_SCHEMA_VERSION,
     _accuracy,
@@ -114,7 +129,13 @@ from .persona_runtime import (
     run_persona_generation,
     run_persona_generation_staged,
 )
-from .stage_state import load_latest_stage_entry_of_type, subset_item_resume_signature
+from .stage_state import (
+    append_stage_entry,
+    load_latest_stage_entry_of_type,
+    make_stage_entry,
+    path_setting,
+    subset_item_resume_signature,
+)
 from . import subset as _subset
 from .subset import (
     SubsetItem,
@@ -202,12 +223,11 @@ class _QuietOutput:
         return False
 
 def _effective_persona_backend(*, requested_backend: str, generator_model_name: str | None) -> str:
+    _ = generator_model_name
     backend = str(requested_backend).strip().lower()
-    if backend == "auto":
-        return "llm" if generator_model_name else "heuristic"
-    if backend in {"heuristic", "llm"}:
-        return backend
-    raise ValueError(f"Unsupported persona backend: {requested_backend}")
+    if backend != "llm":
+        raise ValueError(f"Unsupported persona backend: {requested_backend}")
+    return "llm"
 
 
 def run_sampled(*args, **kwargs):
@@ -437,6 +457,31 @@ def _prompt_continue_to_debate(*, status_file: TextIO) -> bool:
     return str(response).strip().lower() not in {"q", "quit"}
 
 
+def _prompt_continue_experiment_arm(*, next_arm: str, status_file: TextIO) -> bool:
+    prompt = (
+        f"[staged] Press Enter to continue to experiment arm '{next_arm}', "
+        "or type 'q' to save and stop: "
+    )
+    previous_handler = None
+    try:
+        previous_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+    except (AttributeError, ValueError):
+        previous_handler = None
+    try:
+        response = input(prompt)
+    except KeyboardInterrupt:
+        print("\n[staged] Interrupted. Progress has been saved.", file=status_file)
+        return False
+    finally:
+        if previous_handler is not None:
+            try:
+                signal.signal(signal.SIGINT, previous_handler)
+            except ValueError:
+                pass
+    return str(response).strip().lower() not in {"q", "quit"}
+
+
 def _cost_summary_snapshot(cost_tracker: CostTracker | None) -> dict[str, Any] | None:
     if cost_tracker is None:
         return None
@@ -528,6 +573,341 @@ def _default_dataset_test_path(
     return candidates[0]
 
 
+def _hle_experiment_resume_settings(
+    *,
+    dataset: DatasetName,
+    items: list[SubsetItem],
+    hle_variant: str,
+    hle_modality: str,
+    model_name: str | None,
+    provider_name: str | None,
+    generator_model_name: str | None,
+    generator_provider_name: str | None,
+    judge_runtime_model_name: str | None,
+    judge_provider_name: str | None,
+    judge_generator_model_name: str | None,
+    judge_generator_provider_name: str | None,
+    persona_backend: str,
+    n_agents: int,
+    n_rounds: int,
+    judge_rounds: list[int],
+    judge_block_size: int | None,
+    judge_sampling_kwargs: dict[str, Any] | None,
+    judge_strict_final_only: bool,
+    judge_recovery_parse_enabled: bool,
+    persona_seed: int,
+    persona_axes_mode: str,
+    persona_fixed_axis_count: int,
+    persona_task_axis_count: int,
+    persona_sampling_method: str,
+    judge_persona_mode: str,
+    persona_axes_file: Path | None,
+    judge_bank_dir: Path | None,
+    judge_bank_refresh: bool,
+    gpqa_family_cache_path: Path | None,
+    judge_trace_mode: str,
+    public_rationale_max_tokens: int,
+    persona_save_artifacts: bool,
+    persona_replay: bool,
+    emit_trace_level: str,
+    persona_plain_agents: int = 0,
+) -> dict[str, Any]:
+    return {
+        "dataset": str(dataset),
+        "hle_variant": str(hle_variant),
+        "hle_modality": str(hle_modality),
+        "item_signatures": [subset_item_resume_signature(item) for item in items],
+        "models": {
+            "debater": model_name,
+            "debater_provider": provider_name,
+            "generator": generator_model_name,
+            "generator_provider": generator_provider_name,
+            "judge_runtime": judge_runtime_model_name,
+            "judge_provider": judge_provider_name,
+            "judge_generator": judge_generator_model_name,
+            "judge_generator_provider": judge_generator_provider_name,
+        },
+        "n_agents": int(n_agents),
+        "n_rounds": int(n_rounds),
+        "judge_rounds": [int(round_num) for round_num in judge_rounds],
+        "persona_generation": {
+            "n_personas": int(n_agents) - int(persona_plain_agents),
+            "n_plain_agents": int(persona_plain_agents),
+            "persona_seed": int(persona_seed),
+            "axis_mode": str(persona_axes_mode),
+            "fixed_axis_count": int(persona_fixed_axis_count),
+            "task_axis_count": int(persona_task_axis_count),
+            "sampling_method": str(persona_sampling_method),
+            "judge_persona_mode": str(judge_persona_mode),
+            "requested_backend": str(persona_backend),
+            "effective_backend": str(persona_backend),
+            "generator_model": generator_model_name,
+            "judge_generator_model": judge_generator_model_name,
+            "axes_file": path_setting(persona_axes_file),
+            "save_artifacts": bool(persona_save_artifacts),
+            "replay": bool(persona_replay),
+        },
+        "debate_plain": {
+            "persona_settings": {
+                "use_personas": False,
+                "runtime_judge_persona_enabled": False,
+                "persona_seed": int(persona_seed),
+                "persona_axis_mode": str(persona_axes_mode),
+                "persona_fixed_axis_count": int(persona_fixed_axis_count),
+                "persona_task_axis_count": int(persona_task_axis_count),
+                "persona_sampling_method": str(persona_sampling_method),
+                "persona_judge_mode": str(judge_persona_mode),
+                "persona_backend": str(persona_backend),
+                "generator_model": generator_model_name,
+                "judge_generator_model": judge_generator_model_name,
+                "persona_axes_file": path_setting(persona_axes_file),
+                "judge_bank_dir": path_setting(judge_bank_dir),
+                "judge_bank_refresh": bool(judge_bank_refresh),
+                "gpqa_family_cache_path": path_setting(gpqa_family_cache_path),
+            },
+            "runtime_settings": {
+                "debater_model": model_name,
+                "debater_backend": provider_name,
+                "judge_model": judge_runtime_model_name,
+                "judge_backend": judge_provider_name,
+                "judge_block_size": None if judge_block_size is None else int(judge_block_size),
+                "judge_sampling_kwargs": dict(judge_sampling_kwargs or {}),
+                "judge_strict_final_only": bool(judge_strict_final_only),
+                "judge_recovery_parse_enabled": bool(judge_recovery_parse_enabled),
+                "judge_trace_mode": str(judge_trace_mode),
+                "public_rationale_max_tokens": int(public_rationale_max_tokens),
+            },
+        },
+        "persona_debate": {
+            "persona_settings": {
+                "use_personas": True,
+                "runtime_judge_persona_enabled": True,
+                "persona_seed": int(persona_seed),
+                "persona_axis_mode": str(persona_axes_mode),
+                "persona_fixed_axis_count": int(persona_fixed_axis_count),
+                "persona_task_axis_count": int(persona_task_axis_count),
+                "persona_sampling_method": str(persona_sampling_method),
+                "persona_judge_mode": str(judge_persona_mode),
+                "persona_backend": str(persona_backend),
+                "generator_model": generator_model_name,
+                "judge_generator_model": judge_generator_model_name,
+                "persona_axes_file": path_setting(persona_axes_file),
+                "judge_bank_dir": path_setting(judge_bank_dir),
+                "judge_bank_refresh": bool(judge_bank_refresh),
+                "gpqa_family_cache_path": path_setting(gpqa_family_cache_path),
+                "persona_plain_agents": int(persona_plain_agents),
+            },
+            "runtime_settings": {
+                "debater_model": model_name,
+                "debater_backend": provider_name,
+                "judge_model": judge_runtime_model_name,
+                "judge_backend": judge_provider_name,
+                "judge_block_size": None if judge_block_size is None else int(judge_block_size),
+                "judge_sampling_kwargs": dict(judge_sampling_kwargs or {}),
+                "judge_strict_final_only": bool(judge_strict_final_only),
+                "judge_recovery_parse_enabled": bool(judge_recovery_parse_enabled),
+                "judge_trace_mode": str(judge_trace_mode),
+                "public_rationale_max_tokens": int(public_rationale_max_tokens),
+            },
+        },
+        "persona_backend": str(persona_backend),
+        "emit_trace_level": str(emit_trace_level),
+    }
+
+
+def _load_hle_experiment_resume_state(
+    *,
+    stage_state_file: Path | None,
+    resume_settings: dict[str, Any],
+) -> dict[str, Any] | None:
+    if stage_state_file is None or not stage_state_file.exists():
+        return None
+    entry = load_latest_stage_entry_of_type(stage_state_file, HLE_EXPERIMENT_STAGE_TYPE)
+    if entry is None:
+        return None
+    saved_settings = dict(entry.meta.get("resume_settings") or {})
+    if saved_settings != resume_settings:
+        raise ValueError("HLE experiment state settings mismatch")
+    experiment_state = dict(entry.meta.get("experiment_state") or {})
+    if not experiment_state:
+        raise ValueError("HLE experiment state missing experiment_state payload")
+    return experiment_state
+
+
+def _append_hle_experiment_stage(
+    *,
+    stage_state_file: Path | None,
+    dataset: DatasetName,
+    items: list[SubsetItem],
+    completed_stage: str,
+    experiment_state: dict[str, Any],
+    resume_settings: dict[str, Any],
+) -> None:
+    if stage_state_file is None:
+        return
+    entry = make_stage_entry(
+        stage_type=HLE_EXPERIMENT_STAGE_TYPE,
+        completed_stage=completed_stage,
+        dataset=str(dataset),
+        items=[subset_item_resume_signature(item) for item in items],
+        meta={
+            "resume_settings": dict(resume_settings),
+            "experiment_state": dict(experiment_state),
+        },
+    )
+    append_stage_entry(stage_state_file, entry)
+
+
+def _annotate_hle_experiment_rows(
+    rows: list[dict[str, Any]],
+    *,
+    arm_name: str,
+    run_meta: dict[str, Any],
+    experiment_root: Path,
+    manifest_path: Path,
+    runtime_judge_persona_enabled: bool,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        updated = dict(row)
+        run_meta_block = dict(updated.get("run_meta") or run_meta)
+        run_meta_block["experiment_arm"] = arm_name
+        updated["run_meta"] = run_meta_block
+        updated["experiment_arm"] = arm_name
+        updated["experiment_meta"] = {
+            "experiment_root": str(experiment_root),
+            "manifest_path": str(manifest_path),
+            "runtime_judge_persona_enabled": bool(runtime_judge_persona_enabled),
+        }
+        out.append(updated)
+    return out
+
+
+def _generate_readable_transcripts(
+    *,
+    trace_paths: list[str],
+    experiment_root: Path,
+    arm_name: str,
+) -> None:
+    """Generate readable transcript files with persona card headers for each trace."""
+    from ..tools.extract_transcripts import extract_from_trace_file, find_artifact_for_uid
+    import re as _re
+
+    transcript_dir = experiment_root / arm_name / "transcripts"
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+
+    artifact_search_dirs = [
+        str(experiment_root / "persona_artifacts" / "hle"),
+        str(experiment_root / arm_name / "artifacts_llm" / "hle"),
+    ]
+
+    for trace_path in trace_paths:
+        uid_match = _re.search(r'hle_([a-f0-9]+)\.txt', trace_path)
+        uid_short = uid_match.group(1) if uid_match else None
+        art_path = find_artifact_for_uid(uid_short, artifact_search_dirs) if uid_short else None
+        extract_from_trace_file(trace_path, art_path, str(transcript_dir))
+
+
+def _write_hle_experiment_arm_outputs(
+    *,
+    records: list[dict[str, Any]],
+    arm_name: str,
+    experiment_root: Path,
+    manifest_path: Path,
+    run_tag: str,
+    dataset: DatasetName,
+    meta: dict[str, Any],
+    mode: str,
+    use_personas: bool,
+    runtime_judge_persona_enabled: bool,
+    emit_trace_level: str,
+    judge_trace_mode: str | None,
+    public_rationale_max_tokens: int | None,
+    results_by_round: dict[int, list[dict[str, Any]]] | None = None,
+    judge_rounds: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    out_path = arm_results_path(experiment_root=experiment_root, arm_name=arm_name)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    run_meta = _run_meta_block(
+        run_tag=run_tag,
+        dataset=dataset,
+        meta=meta,
+        manifest_path=manifest_path,
+        output_path=out_path,
+        emit_trace_level=emit_trace_level,
+    )
+    run_meta["experiment_arm"] = arm_name
+    augmented = _augment_output_rows(
+        records,
+        run_meta=run_meta,
+        mode=mode,
+        use_personas=use_personas,
+        judge_trace_mode=judge_trace_mode,
+        public_rationale_max_tokens=public_rationale_max_tokens,
+        emit_trace_level=emit_trace_level,
+    )
+    augmented = _annotate_hle_experiment_rows(
+        augmented,
+        arm_name=arm_name,
+        run_meta=run_meta,
+        experiment_root=experiment_root,
+        manifest_path=manifest_path,
+        runtime_judge_persona_enabled=runtime_judge_persona_enabled,
+    )
+    additional_output_paths: list[str] = []
+    if results_by_round is not None and judge_rounds:
+        final_round = max(int(round_num) for round_num in judge_rounds)
+        for round_num in sorted(int(x) for x in judge_rounds):
+            if round_num == final_round:
+                continue
+            round_path = additional_debate_round_path(
+                experiment_root=experiment_root,
+                arm_name=arm_name,
+                round_num=round_num,
+            )
+            round_run_meta = _run_meta_block(
+                run_tag=run_tag,
+                dataset=dataset,
+                meta=meta,
+                manifest_path=manifest_path,
+                output_path=round_path,
+                emit_trace_level=emit_trace_level,
+            )
+            round_run_meta["experiment_arm"] = arm_name
+            round_rows = _augment_output_rows(
+                results_by_round[round_num],
+                run_meta=round_run_meta,
+                mode=mode,
+                use_personas=use_personas,
+                judge_trace_mode=judge_trace_mode,
+                public_rationale_max_tokens=public_rationale_max_tokens,
+                emit_trace_level=emit_trace_level,
+            )
+            round_rows = _annotate_hle_experiment_rows(
+                round_rows,
+                arm_name=arm_name,
+                run_meta=round_run_meta,
+                experiment_root=experiment_root,
+                manifest_path=manifest_path,
+                runtime_judge_persona_enabled=runtime_judge_persona_enabled,
+            )
+            _write_jsonl(round_path, round_rows)
+            additional_output_paths.append(str(round_path))
+    _write_jsonl(out_path, augmented)
+    traces_dir = arm_traces_dir(experiment_root=experiment_root, arm_name=arm_name)
+    trace_paths = write_readable_traces(
+        rows=augmented,
+        traces_dir=traces_dir,
+    )
+    if mode == "debate" and trace_paths:
+        _generate_readable_transcripts(
+            trace_paths=trace_paths,
+            experiment_root=experiment_root,
+            arm_name=arm_name,
+        )
+    return augmented, additional_output_paths, trace_paths
+
+
 
 def main() -> None:
     """Main CLI entry point."""
@@ -543,21 +923,60 @@ def main() -> None:
 
         batch_size = int(args.batch_size) if args.batch_size is not None else 128
 
-        modes: list[str] = []
-        for m in args.mode.split(","):
-            m = m.strip().lower()
-            if m in ("single", "majority", "debate", "personas"):
-                if m not in modes:
-                    modes.append(m)
-        if not modes:
-            print("No valid modes specified", file=status_file)
-            sys.exit(1)
-        infer_modes = [m for m in modes if m in ("single", "majority", "debate")]
+        experiment_enabled = bool(getattr(args, "hle_experiment", False))
+        if experiment_enabled:
+            modes = ["single", "debate"]
+            infer_modes = list(modes)
+            if str(args.dataset).strip().lower() != "hle":
+                print("--hle_experiment currently supports only --dataset hle", file=status_file)
+                sys.exit(2)
+            if args.output:
+                print("--output is not supported with --hle_experiment because it writes multiple arm outputs", file=status_file)
+                sys.exit(2)
+            if bool(args.use_personas):
+                print("--use_personas is managed internally by --hle_experiment", file=status_file)
+                sys.exit(2)
+            if str(args.persona_stage) != "full":
+                print("--persona_stage is not supported with --hle_experiment; use --hle_experiment_stop_after for staged runs", file=status_file)
+                sys.exit(2)
+            if getattr(args, "debate_stop_after", None) is not None:
+                print("--debate_stop_after is not supported with --hle_experiment; use --hle_experiment_stop_after for staged runs", file=status_file)
+                sys.exit(2)
+            if getattr(args, "hle_experiment_stop_after", None) is not None and not args.stage_state_file:
+                print("--hle_experiment_stop_after requires --stage_state_file so the experiment can be resumed", file=status_file)
+                sys.exit(2)
+            if bool(args.final_run):
+                print("--final_run is not supported with --hle_experiment", file=status_file)
+                sys.exit(2)
+        else:
+            modes = []
+            for m in args.mode.split(","):
+                m = m.strip().lower()
+                if m in ("single", "majority", "debate", "personas"):
+                    if m not in modes:
+                        modes.append(m)
+            if not modes:
+                print("No valid modes specified", file=status_file)
+                sys.exit(1)
+            infer_modes = [m for m in modes if m in ("single", "majority", "debate")]
+            if "personas" in modes and any(m in infer_modes for m in ("single", "majority")):
+                print("personas mode can only be combined with debate", file=status_file)
+                sys.exit(2)
+            if bool(args.use_personas) and not any(m in modes for m in ("debate", "majority")):
+                print("--use_personas currently applies to debate or majority mode only", file=status_file)
+                sys.exit(2)
+            if "personas" in modes and "debate" in modes:
+                args.use_personas = True
+                modes = [m for m in modes if m not in {"personas", "debate"}]
+                modes = ["personas", "debate", *modes]
+            if (bool(args.persona_replay) or bool(args.persona_save_artifacts)) and "personas" not in modes and not bool(args.use_personas):
+                print("persona replay/save flags require either personas mode or --use_personas", file=status_file)
+                sys.exit(2)
+            if args.output and len(modes) != 1:
+                print("--output requires exactly one mode", file=status_file)
+                sys.exit(2)
         if infer_modes and not args.model_name:
             print("--model_name is required for single/majority/debate modes", file=status_file)
-            sys.exit(2)
-        if "personas" in modes and any(m in infer_modes for m in ("single", "majority")):
-            print("personas mode can only be combined with debate", file=status_file)
             sys.exit(2)
         if str(args.persona_axes_mode) == "replay" and not bool(args.persona_replay):
             print("--persona_axes_mode replay requires --persona_replay", file=status_file)
@@ -567,24 +986,25 @@ def main() -> None:
             sys.exit(2)
         if bool(args.persona_replay) and str(args.persona_axes_mode) != "replay":
             args.persona_axes_mode = "replay"
-        if bool(args.use_personas) and not any(m in modes for m in ("debate", "majority")):
-            print("--use_personas currently applies to debate or majority mode only", file=status_file)
-            sys.exit(2)
-        if "personas" in modes and "debate" in modes:
-            args.use_personas = True
-            modes = [m for m in modes if m not in {"personas", "debate"}]
-            modes = ["personas", "debate", *modes]
-        if (bool(args.persona_replay) or bool(args.persona_save_artifacts)) and "personas" not in modes and not bool(args.use_personas):
-            print("persona replay/save flags require either personas mode or --use_personas", file=status_file)
-            sys.exit(2)
+        if args.persona_seed is None:
+            args.persona_seed = int(args.subset_seed) if args.subset_seed is not None else 0
         if int(args.public_rationale_max_tokens) <= 0:
             print("--public_rationale_max_tokens must be > 0", file=status_file)
             sys.exit(2)
+        persona_plain_agents = int(getattr(args, "persona_plain_agents", 0) or 0)
+        persona_backed_debate_enabled = bool(experiment_enabled or ("debate" in modes and bool(args.use_personas)))
+        if persona_plain_agents < 0:
+            print("--persona_plain_agents must be >= 0", file=status_file)
+            sys.exit(2)
+        if persona_plain_agents > 0:
+            if persona_plain_agents >= int(args.n_agents):
+                print("--persona_plain_agents must be less than --n_agents so at least one persona slot remains", file=status_file)
+                sys.exit(2)
+            if not persona_backed_debate_enabled:
+                print("--persona_plain_agents currently applies only to persona-backed debate or --hle_experiment", file=status_file)
+                sys.exit(2)
         if bool(args.final_run) and not args.final_manifest:
             print("--final_run requires --final_manifest", file=status_file)
-            sys.exit(2)
-        if args.output and len(modes) != 1:
-            print("--output requires exactly one mode", file=status_file)
             sys.exit(2)
         raw_generator_model_name = str(getattr(args, "generator_model", "") or "").strip() or None
         raw_judge_generator_model_name = str(getattr(args, "judge_generator_model", "") or "").strip() or None
@@ -664,6 +1084,7 @@ def main() -> None:
             ids=ids,
             range_str=subset_range,
             hle_variant=str(args.hle_variant),
+            hle_modality=str(args.hle_modality),
             exclude_id_map=exclude_id_map,
             exclude_ids_path=exclude_ids_path,
         )
@@ -701,39 +1122,165 @@ def main() -> None:
             try:
                 out_dir = Path(args.out_dir) if args.out_dir else _default_out_dir(dataset)
                 out_dir.mkdir(parents=True, exist_ok=True)
-                persona_artifacts_dir = Path(args.persona_artifacts_dir) if args.persona_artifacts_dir else (out_dir / "persona_artifacts")
-
-                ts = _timestamp_tag()
-                model_tag = _model_tag(args.model_name or "persona")
                 dataset_tag = _dataset_tag(dataset)
+                model_tag = _model_tag(args.model_name or "persona")
+                persona_axes_path = Path(args.persona_axes_file) if args.persona_axes_file else None
+                judge_bank_path = Path(args.judge_bank_dir) if args.judge_bank_dir else None
+                gpqa_family_cache_path = Path(args.gpqa_family_cache_path) if args.gpqa_family_cache_path else None
+                cli_stage_state_path = Path(args.stage_state_file) if args.stage_state_file else None
+                experiment_judge_rounds = _parse_judge_rounds(args.debate_judge_rounds, args.n_rounds)
+                experiment_judge_sampling_kwargs: dict[str, Any] | None = None
+                if args.judge_max_tokens is not None or args.judge_temperature is not None:
+                    main_sampling = judge_runtime_sampling_config or sampling_config
+                    experiment_judge_sampling_kwargs = {
+                        "max_tokens": int(args.judge_max_tokens) if args.judge_max_tokens is not None else (
+                            int(main_sampling.max_tokens) if main_sampling and main_sampling.max_tokens is not None else None
+                        ),
+                    }
+                    if args.judge_temperature is not None:
+                        experiment_judge_sampling_kwargs["temperature"] = float(args.judge_temperature)
                 if subset_range and str(subset_range).strip().lower() == "all":
                     subset_spec_tag = "all"
                 else:
                     subset_spec_tag = _ids_tag(ids) if ids else _range_tag(subset_range)
-                run_tag = _build_run_tag(tag=args.tag, meta=meta, subset_spec_tag=subset_spec_tag, timestamp_tag=ts)
-                manifest_path = Path(args.final_manifest) if args.final_manifest else None
-                manifest = _build_final_manifest(
-                    args=args,
+                resume_settings = _hle_experiment_resume_settings(
                     dataset=dataset,
-                    meta=meta,
                     items=items,
+                    hle_variant=str(args.hle_variant),
+                    hle_modality=str(args.hle_modality),
+                    model_name=args.model_name,
                     provider_name=provider_name,
-                    generator_provider_name=generator_provider_name,
-                    judge_provider_name=judge_provider_name,
-                    judge_generator_provider_name=judge_generator_provider_name,
                     generator_model_name=generator_model_name,
-                    judge_generator_model_name=judge_generator_model_name,
+                    generator_provider_name=generator_provider_name,
                     judge_runtime_model_name=judge_runtime_model_name,
+                    judge_provider_name=judge_provider_name,
+                    judge_generator_model_name=judge_generator_model_name,
+                    judge_generator_provider_name=judge_generator_provider_name,
                     persona_backend=persona_backend,
-                    modes=modes,
+                    n_agents=int(args.n_agents),
+                    n_rounds=int(args.n_rounds),
+                    judge_rounds=experiment_judge_rounds,
+                    judge_block_size=args.judge_block_size,
+                    judge_sampling_kwargs=experiment_judge_sampling_kwargs,
+                    judge_strict_final_only=bool(args.judge_strict_final_only),
+                    judge_recovery_parse_enabled=bool(args.judge_recovery_parse_enabled),
+                    persona_seed=int(args.persona_seed),
+                    persona_axes_mode=str(args.persona_axes_mode),
+                    persona_fixed_axis_count=int(args.persona_fixed_axis_count),
+                    persona_task_axis_count=int(args.persona_task_axis_count),
+                    persona_sampling_method=str(args.persona_sampling_method),
+                    judge_persona_mode=str(args.judge_persona_mode),
+                    persona_axes_file=persona_axes_path,
+                    judge_bank_dir=judge_bank_path,
+                    judge_bank_refresh=bool(args.judge_bank_refresh),
+                    gpqa_family_cache_path=gpqa_family_cache_path,
+                    judge_trace_mode=str(args.judge_trace_mode),
+                    public_rationale_max_tokens=int(args.public_rationale_max_tokens),
+                    persona_save_artifacts=bool(args.persona_save_artifacts),
+                    persona_replay=bool(args.persona_replay),
                     emit_trace_level=str(args.emit_trace_level),
-                )
-                if manifest_path is not None:
-                    _write_or_validate_final_manifest(
-                        manifest_path=manifest_path,
-                        manifest=manifest,
-                        final_run=bool(args.final_run),
+                    persona_plain_agents=persona_plain_agents,
+                ) if experiment_enabled else None
+                experiment_resume_state = _load_hle_experiment_resume_state(
+                    stage_state_file=cli_stage_state_path,
+                    resume_settings=cast(dict[str, Any], resume_settings) if resume_settings is not None else {},
+                ) if experiment_enabled else None
+                if experiment_resume_state is not None:
+                    run_tag = str(experiment_resume_state["run_tag"])
+                    experiment_root = Path(str(experiment_resume_state["experiment_root"]))
+                    manifest_path = Path(str(experiment_resume_state["manifest_path"]))
+                    manifest = (
+                        _build_hle_experiment_manifest(
+                            manifest_path=manifest_path,
+                            experiment_root=experiment_root,
+                            run_tag=run_tag,
+                            dataset=str(dataset),
+                            meta=meta,
+                            item_uids=[item.item_uid for item in items],
+                            stage_state_file=cli_stage_state_path,
+                            model_name=args.model_name,
+                            generator_model_name=generator_model_name,
+                            judge_runtime_model_name=judge_runtime_model_name,
+                                judge_generator_model_name=judge_generator_model_name,
+                                persona_backend=persona_backend,
+                            n_agents=int(args.n_agents),
+                            n_rounds=int(args.n_rounds),
+                            emit_trace_level=str(args.emit_trace_level),
+                            hle_variant=str(args.hle_variant),
+                            hle_modality=str(args.hle_modality),
+                            resume_settings=cast(dict[str, Any], resume_settings) if resume_settings is not None else None,
+                        )
+                        if not manifest_path.exists()
+                        else None
                     )
+                else:
+                    ts = _timestamp_tag()
+                    run_tag = _build_run_tag(tag=args.tag, meta=meta, subset_spec_tag=subset_spec_tag, timestamp_tag=ts)
+                    experiment_root = default_experiment_root(out_dir=out_dir, run_tag=run_tag) if experiment_enabled else out_dir
+                    manifest_path = (
+                        Path(args.final_manifest)
+                        if args.final_manifest
+                        else (_default_hle_experiment_manifest_path(experiment_root=experiment_root) if experiment_enabled else None)
+                    )
+                    manifest = None
+                experiment_root.mkdir(parents=True, exist_ok=True)
+                if experiment_enabled:
+                    persona_artifacts_dir = (
+                        Path(args.persona_artifacts_dir)
+                        if args.persona_artifacts_dir
+                        else (experiment_root / "persona_artifacts")
+                    )
+                    if manifest is None:
+                        manifest = (
+                            load_manifest(manifest_path)
+                            if manifest_path.exists()
+                            else _build_hle_experiment_manifest(
+                                manifest_path=manifest_path,
+                                experiment_root=experiment_root,
+                                run_tag=run_tag,
+                                dataset=str(dataset),
+                                meta=meta,
+                                item_uids=[item.item_uid for item in items],
+                                stage_state_file=cli_stage_state_path,
+                                model_name=args.model_name,
+                                generator_model_name=generator_model_name,
+                                judge_runtime_model_name=judge_runtime_model_name,
+                                judge_generator_model_name=judge_generator_model_name,
+                                persona_backend=persona_backend,
+                                n_agents=int(args.n_agents),
+                                n_rounds=int(args.n_rounds),
+                                emit_trace_level=str(args.emit_trace_level),
+                                hle_variant=str(args.hle_variant),
+                                hle_modality=str(args.hle_modality),
+                                resume_settings=cast(dict[str, Any], resume_settings) if resume_settings is not None else None,
+                            )
+                        )
+                    _write_hle_experiment_manifest(path=manifest_path, manifest=manifest)
+                else:
+                    persona_artifacts_dir = Path(args.persona_artifacts_dir) if args.persona_artifacts_dir else (out_dir / "persona_artifacts")
+                    manifest_path = Path(args.final_manifest) if args.final_manifest else None
+                    manifest = _build_final_manifest(
+                        args=args,
+                        dataset=dataset,
+                        meta=meta,
+                        items=items,
+                        provider_name=provider_name,
+                        generator_provider_name=generator_provider_name,
+                        judge_provider_name=judge_provider_name,
+                        judge_generator_provider_name=judge_generator_provider_name,
+                        generator_model_name=generator_model_name,
+                        judge_generator_model_name=judge_generator_model_name,
+                        judge_runtime_model_name=judge_runtime_model_name,
+                        persona_backend=persona_backend,
+                        modes=modes,
+                        emit_trace_level=str(args.emit_trace_level),
+                    )
+                    if manifest_path is not None:
+                        _write_or_validate_final_manifest(
+                            manifest_path=manifest_path,
+                            manifest=manifest,
+                            final_run=bool(args.final_run),
+                        )
                 ledger_path = Path(args.token_ledger_path) if args.token_ledger_path else _default_token_ledger_path()
                 cost_tracker = CostTracker(
                     ledger_path=ledger_path,
@@ -741,7 +1288,7 @@ def main() -> None:
                     session_meta={
                         "cli_name": "debate-v-majority",
                         "dataset": dataset,
-                        "modes": list(modes),
+                        "modes": ["hle_experiment"] if experiment_enabled else list(modes),
                         "run_tag": run_tag,
                         "debater_model": args.model_name,
                         "debater_provider": provider_name,
@@ -781,7 +1328,7 @@ def main() -> None:
                                 quiet=bool(args.quiet),
                                 status_label="judge runtime",
                             )
-                    if ("personas" in modes or bool(args.use_personas)) and persona_backend == "llm":
+                    if (experiment_enabled or "personas" in modes or bool(args.use_personas)) and persona_backend == "llm":
                         assert generator_model_name is not None
                         persona_generator_engine = _reuse_or_create_role_engine(
                             existing_engine=engine,
@@ -812,15 +1359,16 @@ def main() -> None:
                                 status_label="judge generator",
                             )
 
-                    persona_axes_path = Path(args.persona_axes_file) if args.persona_axes_file else None
-                    judge_bank_path = Path(args.judge_bank_dir) if args.judge_bank_dir else None
-                    gpqa_family_cache_path = Path(args.gpqa_family_cache_path) if args.gpqa_family_cache_path else None
-                    cli_stage_state_path = Path(args.stage_state_file) if args.stage_state_file else None
+                    persona_generation_n = (
+                        int(args.n_agents) - persona_plain_agents
+                        if ("personas" in modes and "debate" in modes)
+                        else int(args.persona_n)
+                    )
                     persona_generation_kwargs = {
                         "dataset": dataset,
                         "items": items,
                         "artifacts_dir": persona_artifacts_dir,
-                        "n_personas": int(args.persona_n),
+                        "n_personas": persona_generation_n,
                         "persona_seed": int(args.persona_seed),
                         "axis_mode": str(args.persona_axes_mode),
                         "fixed_axis_count": int(args.persona_fixed_axis_count),
@@ -836,7 +1384,336 @@ def main() -> None:
                         "judge_bank_dir": judge_bank_path,
                         "judge_bank_refresh": bool(args.judge_bank_refresh),
                         "gpqa_family_cache_path": gpqa_family_cache_path,
+                        "n_plain_agents": persona_plain_agents,
                     }
+                    experiment_persona_generation_kwargs = {
+                        **persona_generation_kwargs,
+                        "n_personas": int(args.n_agents) - persona_plain_agents,
+                        "n_plain_agents": persona_plain_agents,
+                    }
+
+                    if experiment_enabled:
+                        assert manifest_path is not None
+                        experiment_manifest = cast(dict[str, Any], manifest)
+                        completed_arm_names = set(_completed_hle_experiment_arms(experiment_manifest))
+                        if completed_arm_names == set(HLE_EXPERIMENT_ARMS):
+                            print("[experiment] All experiment arms are already complete.", file=status_file)
+                            return
+                        judge_sampling_kwargs = experiment_judge_sampling_kwargs
+                        interactive_experiment = bool(sys.stdin.isatty()) and getattr(args, "hle_experiment_stop_after", None) is None
+
+                        def _experiment_arm_stage_state_file(arm_name: str) -> Path:
+                            return arm_results_path(experiment_root=experiment_root, arm_name=arm_name).parent / "stage_state.jsonl"
+
+                        def _run_experiment_debate_arm(
+                            *,
+                            arm_name: str,
+                            use_personas: bool,
+                            runtime_judge_persona_enabled: bool,
+                            persona_artifacts_by_item: dict[str, Any] | None = None,
+                        ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+                            from .debate_runner import _DebateStopped
+
+                            arm_cost_before = _cost_summary_snapshot(cost_tracker)
+                            arm_stage_state_file = _experiment_arm_stage_state_file(arm_name)
+                            prev_debate_entry = (
+                                load_latest_stage_entry_of_type(arm_stage_state_file, "debate")
+                                if arm_stage_state_file.exists()
+                                else None
+                            )
+                            debate_stage_state_file = (
+                                arm_stage_state_file
+                                if (interactive_experiment or arm_stage_state_file.exists())
+                                else None
+                            )
+                            current_debate_stop_after: str | None = None
+                            if interactive_experiment:
+                                if prev_debate_entry is None:
+                                    current_debate_stop_after = "round_0"
+                                else:
+                                    current_debate_stop_after = _next_debate_stage(
+                                        completed_stage=str(prev_debate_entry.completed_stage),
+                                        n_rounds=int(args.n_rounds),
+                                        judge_rounds=experiment_judge_rounds,
+                                    )
+
+                            while True:
+                                debate_cost_before = _cost_summary_snapshot(cost_tracker)
+                                try:
+                                    arm_results_by_round = run_debate(
+                                        dataset=dataset,
+                                        items=items,
+                                        engine=cast(InferenceEngine, engine),
+                                        n_agents=args.n_agents,
+                                        n_rounds=args.n_rounds,
+                                        judge_rounds=experiment_judge_rounds,
+                                        batch_size=batch_size,
+                                        judge_block_size=args.judge_block_size,
+                                        judge_sampling_kwargs=judge_sampling_kwargs,
+                                        judge_strict_final_only=bool(args.judge_strict_final_only),
+                                        judge_recovery_parse_enabled=bool(args.judge_recovery_parse_enabled),
+                                        judge_engine=judge_runtime_engine,
+                                        use_personas=use_personas,
+                                        artifacts_dir=persona_artifacts_dir if use_personas else None,
+                                        persona_seed=int(args.persona_seed),
+                                        persona_axis_mode=str(args.persona_axes_mode),
+                                        persona_fixed_axis_count=int(args.persona_fixed_axis_count),
+                                        persona_task_axis_count=int(args.persona_task_axis_count),
+                                        persona_sampling_method=str(args.persona_sampling_method),
+                                        persona_judge_mode=str(args.judge_persona_mode),
+                                        persona_backend=persona_backend,
+                                        generator_model=generator_model_name,
+                                        judge_generator_model=judge_generator_model_name,
+                                        persona_generator_engine=persona_generator_engine,
+                                        persona_judge_engine=persona_judge_engine,
+                                        persona_axes_file=persona_axes_path,
+                                        persona_save_artifacts=bool(args.persona_save_artifacts) if use_personas else False,
+                                        persona_replay=bool(args.persona_replay) if use_personas else False,
+                                        judge_trace_mode=str(args.judge_trace_mode),
+                                        judge_bank_dir=judge_bank_path,
+                                        judge_bank_refresh=bool(args.judge_bank_refresh),
+                                        gpqa_family_cache_path=gpqa_family_cache_path,
+                                        public_rationale_max_tokens=int(args.public_rationale_max_tokens),
+                                        enable_runtime_judge_persona=runtime_judge_persona_enabled,
+                                        persona_artifacts_by_item=persona_artifacts_by_item,
+                                        progress_file=progress_file,
+                                        debate_stop_after=current_debate_stop_after,
+                                        stage_state_file=debate_stage_state_file,
+                                        persona_plain_agents=persona_plain_agents if use_personas else 0,
+                                    )
+                                except _DebateStopped:
+                                    completed_stage = str(current_debate_stop_after)
+                                    _print_stage_cost_summary(
+                                        label=f"{arm_name}:{completed_stage}",
+                                        before=debate_cost_before,
+                                        cost_tracker=cost_tracker,
+                                        status_file=status_file,
+                                    )
+                                    print(
+                                        f"[staged] Debate stopped after '{completed_stage}'. State: {arm_stage_state_file}",
+                                        file=status_file,
+                                    )
+                                    next_stage = _next_debate_stage(
+                                        completed_stage=completed_stage,
+                                        n_rounds=int(args.n_rounds),
+                                        judge_rounds=experiment_judge_rounds,
+                                    )
+                                    if next_stage is None:
+                                        return [], [], []
+                                    if not _prompt_continue_debate_stage(next_stage=next_stage, status_file=status_file):
+                                        print(
+                                            f"[staged] Debate staging stopped after '{completed_stage}'. State: {arm_stage_state_file}",
+                                            file=status_file,
+                                        )
+                                        return [], [], []
+                                    current_debate_stop_after = next_stage
+                                    continue
+                                break
+
+                            _print_stage_cost_summary(
+                                label=arm_name,
+                                before=arm_cost_before,
+                                cost_tracker=cost_tracker,
+                                status_file=status_file,
+                            )
+                            final_round = int(args.n_rounds) if args.debate_judge_rounds is None else max(experiment_judge_rounds)
+                            arm_records = arm_results_by_round[final_round]
+                            return _write_hle_experiment_arm_outputs(
+                                records=arm_records,
+                                arm_name=arm_name,
+                                experiment_root=experiment_root,
+                                manifest_path=manifest_path,
+                                run_tag=run_tag,
+                                dataset=dataset,
+                                meta=meta,
+                                mode="debate",
+                                use_personas=use_personas,
+                                runtime_judge_persona_enabled=runtime_judge_persona_enabled,
+                                emit_trace_level=str(args.emit_trace_level),
+                                judge_trace_mode=str(args.judge_trace_mode),
+                                public_rationale_max_tokens=int(args.public_rationale_max_tokens),
+                                results_by_round=arm_results_by_round,
+                                judge_rounds=experiment_judge_rounds,
+                            )
+
+                        for arm_name in HLE_EXPERIMENT_ARMS:
+                            if arm_name in completed_arm_names:
+                                continue
+                            if not args.quiet:
+                                print(f"\n[experiment] Running {arm_name}...", file=sys.stderr)
+                            if arm_name == "single":
+                                single_cost_before = _cost_summary_snapshot(cost_tracker)
+                                arm_records = run_sampled(
+                                    dataset=dataset,
+                                    items=items,
+                                    engine=cast(InferenceEngine, engine),
+                                    n_samples=1,
+                                    batch_size=batch_size,
+                                    mode_label="single",
+                                    progress_file=progress_file,
+                                )
+                                output_rows, additional_paths, trace_paths = _write_hle_experiment_arm_outputs(
+                                    records=arm_records,
+                                    arm_name=arm_name,
+                                    experiment_root=experiment_root,
+                                    manifest_path=manifest_path,
+                                    run_tag=run_tag,
+                                    dataset=dataset,
+                                    meta=meta,
+                                    mode="single",
+                                    use_personas=False,
+                                    runtime_judge_persona_enabled=False,
+                                    emit_trace_level=str(args.emit_trace_level),
+                                    judge_trace_mode=None,
+                                    public_rationale_max_tokens=None,
+                                )
+                                _print_stage_cost_summary(
+                                    label="single",
+                                    before=single_cost_before,
+                                    cost_tracker=cost_tracker,
+                                    status_file=status_file,
+                                )
+                            elif arm_name == "debate_plain":
+                                output_rows, additional_paths, trace_paths = _run_experiment_debate_arm(
+                                    arm_name=arm_name,
+                                    use_personas=False,
+                                    runtime_judge_persona_enabled=False,
+                                )
+                                if not output_rows and interactive_experiment:
+                                    return
+                            else:
+                                arm_stage_state_file = _experiment_arm_stage_state_file(arm_name)
+                                persona_rows: list[dict[str, Any]] | None = None
+                                persona_generation_cost_before = _cost_summary_snapshot(cost_tracker)
+                                persona_generation_executed = False
+                                prev_persona_entry = (
+                                    load_latest_stage_entry_of_type(arm_stage_state_file, "persona")
+                                    if arm_stage_state_file.exists()
+                                    else None
+                                )
+                                current_stage: str | None = None
+                                if prev_persona_entry is None:
+                                    if interactive_experiment:
+                                        current_stage = "axes"
+                                else:
+                                    current_stage = _next_persona_stage(str(prev_persona_entry.completed_stage))
+                                    if current_stage is None:
+                                        persona_rows = persona_rows_from_stage_entry(prev_persona_entry)
+                                if current_stage is not None:
+                                    persona_generation_executed = True
+                                    while current_stage is not None:
+                                        stage_cost_before = _cost_summary_snapshot(cost_tracker)
+                                        entry = run_persona_generation_staged(
+                                            **experiment_persona_generation_kwargs,
+                                            stage_state_file=arm_stage_state_file,
+                                            persona_stage=current_stage,
+                                            save_artifacts=bool(args.persona_save_artifacts),
+                                            replay=bool(args.persona_replay),
+                                            dump_cards=bool(args.persona_dump_cards),
+                                            summary_file=status_file,
+                                        )
+                                        completed_stage = str(entry.completed_stage)
+                                        print(
+                                            f"[staged] Persona stage '{completed_stage}' complete. State: {arm_stage_state_file}",
+                                            file=status_file,
+                                        )
+                                        _print_stage_cost_summary(
+                                            label=f"{arm_name}:persona:{completed_stage}",
+                                            before=stage_cost_before,
+                                            cost_tracker=cost_tracker,
+                                            status_file=status_file,
+                                        )
+                                        next_stage = _next_persona_stage(completed_stage)
+                                        if next_stage is None:
+                                            persona_rows = persona_rows_from_stage_entry(entry)
+                                            break
+                                        if interactive_experiment and not _prompt_continue_persona_stage(next_stage=next_stage, status_file=status_file):
+                                            print(
+                                                f"[staged] Persona staging stopped after '{completed_stage}'. State: {arm_stage_state_file}",
+                                                file=status_file,
+                                            )
+                                            return
+                                        current_stage = next_stage
+                                elif persona_rows is None:
+                                    persona_generation_executed = True
+                                    persona_rows = run_persona_generation(
+                                        **experiment_persona_generation_kwargs,
+                                        save_artifacts=bool(args.persona_save_artifacts),
+                                        replay=bool(args.persona_replay),
+                                        dump_cards=bool(args.persona_dump_cards),
+                                        summary_file=status_file,
+                                    )
+                                assert persona_rows is not None
+                                if persona_generation_executed:
+                                    _print_stage_cost_summary(
+                                        label="persona_generation",
+                                        before=persona_generation_cost_before,
+                                        cost_tracker=cost_tracker,
+                                        status_file=status_file,
+                                    )
+                                generated_persona_artifacts = persona_artifacts_from_rows(persona_rows)
+                                if interactive_experiment:
+                                    prev_debate_entry = (
+                                        load_latest_stage_entry_of_type(arm_stage_state_file, "debate")
+                                        if arm_stage_state_file.exists()
+                                        else None
+                                    )
+                                    if prev_debate_entry is None:
+                                        if not _prompt_continue_to_debate(status_file=status_file):
+                                            print("[staged] Stopped after personas. Progress has been saved.", file=status_file)
+                                            return
+                                output_rows, additional_paths, trace_paths = _run_experiment_debate_arm(
+                                    arm_name=arm_name,
+                                    use_personas=True,
+                                    runtime_judge_persona_enabled=True,
+                                    persona_artifacts_by_item=generated_persona_artifacts,
+                                )
+                                if not output_rows and interactive_experiment:
+                                    return
+                            results[arm_name] = output_rows
+                            if not args.quiet:
+                                acc = _accuracy(output_rows)
+                                print(
+                                    f"[result] {arm_name}: {acc*100:.1f}% ({sum(r['final_correct'] for r in output_rows)}/{len(output_rows)})",
+                                    file=sys.stderr,
+                                )
+                            print(f"[output] Written to {arm_results_path(experiment_root=experiment_root, arm_name=arm_name)}", file=status_file)
+                            experiment_manifest = update_manifest_for_arm(
+                                manifest=experiment_manifest,
+                                arm_name=arm_name,
+                                rows=output_rows,
+                                trace_paths=trace_paths,
+                                additional_output_paths=additional_paths,
+                            )
+                            _write_hle_experiment_manifest(path=manifest_path, manifest=experiment_manifest)
+                            completed_arm_names.add(arm_name)
+                            _append_hle_experiment_stage(
+                                stage_state_file=cli_stage_state_path,
+                                dataset=dataset,
+                                items=items,
+                                completed_stage=arm_name,
+                                experiment_state={
+                                    "run_tag": run_tag,
+                                    "experiment_root": str(experiment_root),
+                                    "manifest_path": str(manifest_path),
+                                    "completed_arms": sorted(completed_arm_names),
+                                },
+                                resume_settings=cast(dict[str, Any], resume_settings),
+                            )
+                            if str(getattr(args, "hle_experiment_stop_after", "") or "") == arm_name:
+                                print(f"[experiment] Stopped after {arm_name}. Resume with the same --stage_state_file.", file=status_file)
+                                return
+                            if interactive_experiment:
+                                remaining_arms = [name for name in HLE_EXPERIMENT_ARMS if name not in completed_arm_names]
+                                if remaining_arms:
+                                    next_arm = remaining_arms[0]
+                                    if not _prompt_continue_experiment_arm(next_arm=next_arm, status_file=status_file):
+                                        print(
+                                            f"[staged] Experiment staging stopped after '{arm_name}'. Resume with the same --stage_state_file.",
+                                            file=status_file,
+                                        )
+                                        return
+                        return
 
                     ran_staged_personas = False
                     generated_persona_artifacts: dict[str, Any] | None = None
@@ -893,13 +1770,33 @@ def main() -> None:
                                     return
                                 ran_staged_personas = True
                             else:
-                                records = run_persona_generation(
-                                    **persona_generation_kwargs,
-                                    save_artifacts=bool(args.persona_save_artifacts),
-                                    replay=bool(args.persona_replay),
-                                    dump_cards=bool(args.persona_dump_cards),
-                                    summary_file=status_file,
-                                )
+                                if stage_state_path is None:
+                                    stage_state_path = out_dir / f"stage_state_{dataset_tag}_{run_tag}.jsonl"
+                                current_stage = _PERSONA_STAGE_ORDER[0]
+                                records = None
+                                while True:
+                                    stage_cost_before = _cost_summary_snapshot(cost_tracker)
+                                    entry = run_persona_generation_staged(
+                                        **persona_generation_kwargs,
+                                        stage_state_file=stage_state_path,
+                                        persona_stage=current_stage,
+                                        save_artifacts=bool(args.persona_save_artifacts),
+                                        replay=bool(args.persona_replay),
+                                        dump_cards=bool(args.persona_dump_cards),
+                                        summary_file=status_file,
+                                    )
+                                    completed_stage = str(entry.completed_stage)
+                                    _print_stage_cost_summary(
+                                        label=f"persona:{completed_stage}",
+                                        before=stage_cost_before,
+                                        cost_tracker=cost_tracker,
+                                        status_file=status_file,
+                                    )
+                                    next_stage = _next_persona_stage(completed_stage)
+                                    if next_stage is None:
+                                        records = persona_rows_from_stage_entry(entry)
+                                        break
+                                    current_stage = next_stage
                             generated_persona_artifacts = persona_artifacts_from_rows(records)
                         elif mode == "single":
                             records = run_sampled(
@@ -1047,6 +1944,7 @@ def main() -> None:
                                     progress_file=progress_file,
                                     debate_stop_after=stop_after,
                                     stage_state_file=stage_state_file,
+                                    persona_plain_agents=persona_plain_agents,
                                 )
 
                             while True:

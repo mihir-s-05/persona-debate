@@ -23,6 +23,7 @@ from .schema import (
     PersonaDescriptor,
     PersonaGenerationConfig,
     ValidationResult,
+    build_slot_layout,
 )
 from .validators import duplicate_diagnostics, validate_card, validate_descriptor, validate_descriptor_against_task
 
@@ -115,33 +116,6 @@ def _persona_name(idx: int, point: dict[str, float]) -> str:
     return f"{dominant_bucket} {base.title()} P{idx + 1}"
 
 
-def _heuristic_descriptors(*, config: PersonaGenerationConfig, axes: list[Axis], points: list[dict[str, float]]) -> list[PersonaDescriptor]:
-    descriptors: list[PersonaDescriptor] = []
-    for idx, point in enumerate(points):
-        axis_interpretation = {
-            axis.axis_id: _axis_interpretation(axis, float(point.get(axis.axis_id, 0.5)))
-            for axis in axes
-        }
-        ordered_interps = list(axis_interpretation.values())
-        short_rule = "; ".join(ordered_interps[:2]) if ordered_interps else "reason independently and verify the final answer"
-        reasoning_summary = (
-            "Focus on " + ", ".join(ordered_interps[:3])
-            if ordered_interps
-            else "focus on an independently reasoned solution"
-        )
-        descriptors.append(
-            PersonaDescriptor(
-                persona_id=f"persona_{idx + 1}",
-                name=_persona_name(idx, point),
-                axis_values={k: float(v) for k, v in point.items()},
-                axis_interpretation=axis_interpretation,
-                short_rule=short_rule,
-                reasoning_summary=reasoning_summary,
-            )
-        )
-    return descriptors
-
-
 def build_descriptor_messages(
     *,
     config: PersonaGenerationConfig,
@@ -206,7 +180,10 @@ def _llm_descriptors(
 
 
 def _effective_backend(*, config: PersonaGenerationConfig, engine: Any | None) -> str:
-    return "llm" if config.backend == "llm" or (config.backend == "auto" and engine is not None) else "heuristic"
+    _ = config
+    if engine is None:
+        raise ValueError("persona generation requires a generator engine")
+    return "llm"
 
 
 def _descriptor_prompt_axis(axis: Any) -> dict[str, Any]:
@@ -260,8 +237,7 @@ def _validate_descriptor_for_generation(
     base = validate_descriptor(descriptor)
     if base.status != "accept":
         return base
-    if backend != "llm":
-        return base
+    _ = backend
     return validate_descriptor_against_task(
         descriptor,
         question=None,
@@ -369,37 +345,33 @@ def generate_descriptors_from_state(
         descriptor_messages: list[dict[str, Any]] | None = None
         raw_result_text: str | None = None
         parse_error: str | None = None
-        if backend == "llm" and engine is not None:
-            base_messages = build_descriptor_messages(
-                config=config,
-                axis_selection=axis_selection,
+        base_messages = build_descriptor_messages(
+            config=config,
+            axis_selection=axis_selection,
+            points=points,
+        )
+        if retry_context is not None:
+            descriptor_messages = base_messages + retry_context
+        else:
+            descriptor_messages = base_messages
+        result = ensure_inference_results(
+            engine,
+            [descriptor_messages],
+            batch_size=1,
+            sampling_kwargs={"max_tokens": DESCRIPTOR_MAX_TOKENS},
+            model_role="generator",
+        )[0]
+        raw_result_text = str(result.text)
+        descriptor_call_meta = inference_result_metadata(result)
+        try:
+            descriptors = parse_descriptor_result(
+                raw_result_text,
+                n_personas=config.n_personas,
                 points=points,
             )
-            if retry_context is not None:
-                descriptor_messages = base_messages + retry_context
-            else:
-                descriptor_messages = base_messages
-            result = ensure_inference_results(
-                engine,
-                [descriptor_messages],
-                batch_size=1,
-                sampling_kwargs={"max_tokens": DESCRIPTOR_MAX_TOKENS},
-                model_role="generator",
-            )[0]
-            raw_result_text = str(result.text)
-            descriptor_call_meta = inference_result_metadata(result)
-            try:
-                descriptors = parse_descriptor_result(
-                    raw_result_text,
-                    n_personas=config.n_personas,
-                    points=points,
-                )
-            except ValueError as exc:
-                parse_error = str(exc)
-                descriptors = []
-        else:
-            descriptors = _heuristic_descriptors(config=config, axes=axis_selection.axes, points=points)
-            descriptor_call_meta = None
+        except ValueError as exc:
+            parse_error = str(exc)
+            descriptors = []
         validator_rows: list[dict[str, Any]] = []
         has_retry = parse_error is not None
         if parse_error is not None:
@@ -461,17 +433,16 @@ def generate_descriptors_from_state(
         }
         if not has_retry and not dupes:
             return descriptors, last_meta
-        if backend == "llm" and engine is not None:
-            retry_context = [
-                {
-                    "role": "user",
-                    "content": _build_descriptor_retry_feedback(
-                        parse_error=parse_error,
-                        validator_rows=validator_rows,
-                        duplicates=dupes,
-                    ),
-                },
-            ]
+        retry_context = [
+            {
+                "role": "user",
+                "content": _build_descriptor_retry_feedback(
+                    parse_error=parse_error,
+                    validator_rows=validator_rows,
+                    duplicates=dupes,
+                ),
+            },
+        ]
     assert last_meta is not None
     failure_metadata = {
         **last_meta,
@@ -484,37 +455,6 @@ def generate_descriptors_from_state(
         f"Descriptor generation exhausted retries: {failure_metadata['validator_metadata']}",
         stage="descriptors",
         metadata=failure_metadata,
-    )
-
-
-def _heuristic_card(descriptor: PersonaDescriptor) -> PersonaCard:
-    priorities = [
-        descriptor.short_rule,
-        "surface the main failure mode before finalizing",
-    ]
-    distrusts = [
-        "unsupported leaps",
-        "answer-first rationalization",
-    ]
-    return PersonaCard(
-        persona_id=descriptor.persona_id,
-        title=descriptor.name,
-        core_reasoning_strategy=descriptor.reasoning_summary,
-        priorities=priorities,
-        distrusts=distrusts,
-        decomposition_style=next(iter(descriptor.axis_interpretation.values()), descriptor.short_rule),
-        revision_policy="update the answer only when another path exposes a concrete flaw in the current reasoning",
-        confidence_policy="be explicit about uncertainty when a critical step is weak",
-        failure_mode_to_avoid="do not collapse into decorative style or answer-first reasoning",
-        system_prompt=(
-            "You are solving as an operational reasoning persona.\n"
-            f"Persona: {descriptor.name}\n"
-            f"Core strategy: {descriptor.reasoning_summary}\n"
-            f"Priorities: {'; '.join(priorities)}\n"
-            f"Distrust: {'; '.join(distrusts)}\n"
-            "Do not role-play biography. Focus on how to reason."
-        ),
-        card_version=CARD_PROMPT_VERSION,
     )
 
 
@@ -601,44 +541,6 @@ def _llm_card(
     return card, inference_result_metadata(result)
 
 
-def _heuristic_card_distinctive(descriptor: PersonaDescriptor) -> PersonaCard:
-    """Generate a heuristic card that uses all axis interpretations for distinctiveness."""
-    all_interps = list(descriptor.axis_interpretation.values())
-    priorities = [
-        descriptor.short_rule,
-        "surface the main failure mode before finalizing",
-    ]
-    if len(all_interps) > 2:
-        priorities.append(all_interps[-1])
-    distrusts = [
-        "unsupported leaps",
-        "answer-first rationalization",
-        f"ignoring the {descriptor.persona_id} operating policy",
-    ]
-    decomp = "; ".join(all_interps) if all_interps else descriptor.short_rule
-    return PersonaCard(
-        persona_id=descriptor.persona_id,
-        title=descriptor.name,
-        core_reasoning_strategy=descriptor.reasoning_summary,
-        priorities=priorities,
-        distrusts=distrusts,
-        decomposition_style=decomp,
-        revision_policy="update the answer only when another path exposes a concrete flaw in the current reasoning",
-        confidence_policy="be explicit about uncertainty when a critical step is weak",
-        failure_mode_to_avoid="do not collapse into decorative style or answer-first reasoning",
-        system_prompt=(
-            "You are solving as an operational reasoning persona.\n"
-            f"Persona: {descriptor.name} ({descriptor.persona_id})\n"
-            f"Core strategy: {descriptor.reasoning_summary}\n"
-            f"Axis policy: {decomp}\n"
-            f"Priorities: {'; '.join(priorities)}\n"
-            f"Distrust: {'; '.join(distrusts)}\n"
-            "Do not role-play biography. Focus on how to reason."
-        ),
-        card_version=CARD_PROMPT_VERSION,
-    )
-
-
 def _regenerate_duplicate_cards(
     *,
     cards: list[PersonaCard],
@@ -658,15 +560,12 @@ def _regenerate_duplicate_cards(
         regenerated_indices.add(int(row["right"]))
     for idx in regenerated_indices:
         descriptor = descriptors[idx]
-        if backend == "llm" and engine is not None:
-            card, _ = _llm_card(
-                descriptor=descriptor,
-                question=question,
-                question_media=question_media,
-                engine=engine,
-            )
-        else:
-            card = _heuristic_card_distinctive(descriptor)
+        card, _ = _llm_card(
+            descriptor=descriptor,
+            question=question,
+            question_media=question_media,
+            engine=cast(Any, engine),
+        )
         updated[idx] = card
     return updated
 
@@ -678,10 +577,12 @@ def expand_cards(
     question: str,
     raw_task: dict[str, Any] | None = None,
     engine: Any | None = None,
-    backend: str = "heuristic",
+    backend: str = "llm",
 ) -> tuple[list[PersonaCard], dict[str, Any]]:
     last_meta: dict[str, Any] | None = None
     question_media = _question_media_for_task(dataset=dataset, raw_task=raw_task)
+    if engine is None:
+        raise ValueError("persona generation requires a generator engine for card generation")
     attempt_audits: list[dict[str, Any]] = []
     for attempt in range(MAX_GENERATION_RETRIES + 1):
         cards: list[PersonaCard] = []
@@ -694,45 +595,42 @@ def expand_cards(
             parse_error: str | None = None
             request_messages: list[dict[str, Any]] | None = None
             validation: ValidationResult | None = None
-            if backend == "llm" and engine is not None:
-                request_messages = build_card_messages(
-                    descriptor=descriptor,
-                    question=question,
-                    question_media=question_media,
+            request_messages = build_card_messages(
+                descriptor=descriptor,
+                question=question,
+                question_media=question_media,
+            )
+            if attempt > 0:
+                prev = next(
+                    (
+                        audit for audit in reversed(attempt_audits)
+                        if audit.get("persona_id") == descriptor.persona_id
+                    ),
+                    None,
                 )
-                if attempt > 0:
-                    prev = next(
-                        (
-                            audit for audit in reversed(attempt_audits)
-                            if audit.get("persona_id") == descriptor.persona_id
+                request_messages = request_messages + [
+                    {
+                        "role": "user",
+                        "content": _build_card_retry_feedback(
+                            parse_error=None if prev is None else prev.get("parse_error"),
+                            validation=None if prev is None else prev.get("validation"),
                         ),
-                        None,
-                    )
-                    request_messages = request_messages + [
-                        {
-                            "role": "user",
-                            "content": _build_card_retry_feedback(
-                                parse_error=None if prev is None else prev.get("parse_error"),
-                                validation=None if prev is None else prev.get("validation"),
-                            ),
-                        }
-                    ]
-                result = ensure_inference_results(
-                    engine,
-                    [request_messages],
-                    batch_size=1,
-                    sampling_kwargs={"max_tokens": CARD_MAX_TOKENS},
-                    model_role="generator",
-                )[0]
-                raw_result_text = str(result.text)
-                card_call_meta = inference_result_metadata(result)
-                try:
-                    card = parse_card_result(raw_result_text, descriptor=descriptor)
-                except ValueError as exc:
-                    parse_error = str(exc)
-                    card = None
-            else:
-                card, card_call_meta = _heuristic_card(descriptor), None
+                    }
+                ]
+            result = ensure_inference_results(
+                engine,
+                [request_messages],
+                batch_size=1,
+                sampling_kwargs={"max_tokens": CARD_MAX_TOKENS},
+                model_role="generator",
+            )[0]
+            raw_result_text = str(result.text)
+            card_call_meta = inference_result_metadata(result)
+            try:
+                card = parse_card_result(raw_result_text, descriptor=descriptor)
+            except ValueError as exc:
+                parse_error = str(exc)
+                card = None
             if parse_error is not None:
                 validation = ValidationResult(status="retry", reasons=[parse_error])
                 validator_rows.append(
@@ -831,6 +729,10 @@ def build_persona_artifact(
         backend=backend,
         judge_card=judge_card,
     )
+    n_plain = int(config.n_plain_agents)
+    n_total = config.n_personas + n_plain
+    slot_layout = build_slot_layout(n_agents=n_total, n_plain_agents=n_plain) if n_plain > 0 else None
+
     return PersonaArtifact(
         artifact_version=ARTIFACT_VERSION,
         dataset=config.dataset,
@@ -864,8 +766,10 @@ def build_persona_artifact(
             "judge_persona_mode": str(config.judge_persona_mode),
             "backend": backend,
             "axes_file": None if config.axes_file is None else str(config.axes_file),
+            "n_plain_agents": n_plain,
         },
         validator_metadata=validator_metadata,
+        slot_layout=slot_layout,
     )
 
 

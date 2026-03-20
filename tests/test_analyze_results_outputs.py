@@ -246,7 +246,7 @@ def test_analyze_results_emits_phase3_persona_fidelity_metrics(tmp_path: Path):
                 "n_rounds": 2,
                 "persona_summaries": [
                     {"persona_id": "p1", "title": "Careful verifier", "short_rule": "Double-check."},
-                    {"persona_id": "p2", "title": "Fast heuristic", "short_rule": "Use the first pattern."},
+                    {"persona_id": "p2", "title": "Fast solver", "short_rule": "Use the first pattern."},
                     {"persona_id": "p3", "title": "Skeptic", "short_rule": "Attack the common view."},
                 ],
                 "agent_round_outputs": [
@@ -425,6 +425,87 @@ def test_analyze_results_supports_hle_runs_via_registry_adapter(tmp_path: Path):
     assert "('hle', 'standalone_persona_majority')" in payload["comparison_pooled"]
 
 
+def test_analyze_results_supports_mixed_plain_persona_debate_rows(tmp_path: Path):
+    results_dir = tmp_path / "results"
+    out_dir = tmp_path / "out"
+    runs_dir = results_dir / "mixed_debate"
+
+    _write_jsonl(
+        runs_dir / "mixed_debate.jsonl",
+        [
+            {
+                "schema_version": "phase2.debate.v1",
+                "dataset": "gpqa",
+                "mode": "debate",
+                "row_origin": "debate_judge",
+                "debater_model": "gemini-3-flash-preview",
+                "item_uid": "gpqa:item-mixed",
+                "dataset_revision": "test",
+                "orig_id": 2718,
+                "question": "Which option is correct?",
+                "answer": "A",
+                "n_agents": 3,
+                "n_rounds": 2,
+                "strategy": {"mode": "debate", "use_personas": True, "n_agents": 3, "n_rounds": 2, "persona_plain_agents": 1},
+                "persona_meta": {"n_plain_agents": 1, "slot_layout": ["plain", "persona", "persona"]},
+                "persona_ids": ["persona_2", "persona_3"],
+                "persona_summaries": [
+                    None,
+                    {"persona_id": "persona_2", "title": "Verifier", "short_rule": "Check details."},
+                    {"persona_id": "persona_3", "title": "Challenger", "short_rule": "Probe weaknesses."},
+                ],
+                "agent_round_outputs": [
+                    [
+                        {"private_raw_response": "Plain agent picks A. \\boxed{A}", "public_rationale": "plain rationale", "final_answer": "A", "confidence": 0.7},
+                        {"private_raw_response": "Plain agent keeps A. \\boxed{A}", "public_rationale": "plain stays", "final_answer": "A", "confidence": 0.7},
+                    ],
+                    [
+                        {"private_raw_response": "Verifier prefers B. \\boxed{B}", "public_rationale": "verifier rationale", "final_answer": "B", "confidence": 0.6},
+                        {"private_raw_response": "Verifier switches to A. \\boxed{A}", "public_rationale": "verifier updates", "final_answer": "A", "confidence": 0.8},
+                    ],
+                    [
+                        {"private_raw_response": "Challenger prefers B. \\boxed{B}", "public_rationale": "challenger rationale", "final_answer": "B", "confidence": 0.5},
+                        {"private_raw_response": "Challenger keeps B. \\boxed{B}", "public_rationale": "challenger stays", "final_answer": "B", "confidence": 0.5},
+                    ],
+                ],
+                "agent_round_parsed_answers": [["A", "A"], ["B", "A"], ["B", "B"]],
+                "convergence_per_round": [
+                    {"round": 1, "distinct_answers": 2, "vote_counts": {"A": 1, "B": 2}, "unanimous": False},
+                    {"round": 2, "distinct_answers": 2, "vote_counts": {"A": 2, "B": 1}, "unanimous": False},
+                ],
+                "answer_changes_per_agent": [
+                    {"agent_index": 0, "answers_by_round": ["A", "A"], "changed_from_prior_round": [False, False], "first_change_round": None},
+                    {"agent_index": 1, "answers_by_round": ["B", "A"], "changed_from_prior_round": [False, True], "first_change_round": 2},
+                    {"agent_index": 2, "answers_by_round": ["B", "B"], "changed_from_prior_round": [False, False], "first_change_round": None},
+                ],
+                "round1_majority_answer": "B",
+                "round1_majority_correct": 0,
+                "final_round_majority_answer": "A",
+                "final_round_majority_correct": 1,
+                "final_judge_answer": "A",
+                "final_judge_correct": 1,
+                "judge_trace": {"judge_raw_response": "\\boxed{A}"},
+                "agent_responses": [
+                    [{"role": "user", "content": "q"}, {"role": "assistant", "content": "\\boxed{A}"}, {"role": "user", "content": "d"}, {"role": "assistant", "content": "\\boxed{A}"}],
+                    [{"role": "user", "content": "q"}, {"role": "assistant", "content": "\\boxed{B}"}, {"role": "user", "content": "d"}, {"role": "assistant", "content": "\\boxed{A}"}],
+                    [{"role": "user", "content": "q"}, {"role": "assistant", "content": "\\boxed{B}"}, {"role": "user", "content": "d"}, {"role": "assistant", "content": "\\boxed{B}"}],
+                ],
+            }
+        ],
+    )
+
+    ar.TARGET_MODEL_TAG = "gemini-3-flash-preview"
+    ar.analyze(results_dir, out_dir)
+
+    payload = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+    fidelity_row = payload["debate_persona_fidelity_rows"][0]
+    assert fidelity_row["item_uid"] == "gpqa:item-mixed"
+    assert fidelity_row["revision_rate_by_persona"][0]["persona_id"] is None
+    assert fidelity_row["revision_rate_by_persona"][0]["title"] is None
+    assert fidelity_row["revision_rate_by_persona"][1]["persona_id"] == "persona_2"
+    assert fidelity_row["revision_rate_by_persona"][2]["persona_id"] == "persona_3"
+
+
 def test_analyze_results_normalizes_legacy_debate_rows_from_agent_responses(tmp_path: Path):
     results_dir = tmp_path / "results"
     out_dir = tmp_path / "out"
@@ -526,7 +607,7 @@ def test_parse_run_meta_supports_legacy_and_phase2_rows():
             "run_meta": {
                 "dataset": "gpqa",
                 "dataset_meta": {"subset_size": 1, "seed": 123},
-                "output_schema_version": "phase7.logical.v1",
+                "output_schema_version": "phase7.logical.v2",
             },
             "strategy": {"mode": "single", "n_samples": 1},
             "task": {"dataset": "gpqa", "item_uid": "gpqa:item-7"},
@@ -537,7 +618,7 @@ def test_parse_run_meta_supports_legacy_and_phase2_rows():
     assert legacy_meta.dataset == "gpqa"
     assert phase2_meta.schema_version == "phase2.single.v1"
     assert phase7_meta.dataset == "gpqa"
-    assert phase7_meta.schema_version == "phase7.logical.v1"
+    assert phase7_meta.schema_version == "phase7.logical.v2"
     assert phase7_meta.n == 1
     assert phase7_meta.seed == 123
     include_legacy, legacy_model = ar.should_include_path(
@@ -570,3 +651,5 @@ def test_analyze_results_defaults_to_gemini_target_model(monkeypatch):
         assert model == "gemini-3-flash-preview"
     finally:
         importlib.reload(reloaded)
+
+
