@@ -6,9 +6,9 @@ from typing import Any
 
 
 ARTIFACT_VERSION = "phase0.v1"
-AXIS_PROMPT_VERSION = "phase0.axes.v3"
+AXIS_PROMPT_VERSION = "phase0.axes.v4"
 DESCRIPTOR_PROMPT_VERSION = "phase0.descriptors.v6"
-CARD_PROMPT_VERSION = "phase0.cards.v6"
+CARD_PROMPT_VERSION = "phase0.cards.v7"
 JUDGE_PROMPT_VERSION = "phase0.judge.v4"
 JUDGE_BANK_PROMPT_VERSION = "phase0.judge_bank.v1"
 
@@ -110,14 +110,25 @@ def build_task_axis_messages(
         f"Question:\n{question}\n\n"
         f"{image_note}"
         "Propose reasoning-relevant axes for diverse debaters.\n"
-        "Good axes should create observable differences in search order, decomposition style, verification "
-        "timing, pruning aggressiveness, evidence standards, or revision triggers.\n"
-        "Prefer axes whose extremes would plausibly send agents down different first-pass solution paths on "
-        "this question or task family.\n"
+        "Good axes must create observable differences in round-1 solve behavior, round-2 critique behavior, or "
+        "round-3 revision thresholds.\n"
+        "Write axes as portable debate behaviors, not as summaries of the hidden task, theorem family, object "
+        "type, benchmark mechanism, or domain ontology.\n"
+        "Low and high descriptions should be framed in terms like evidence standard, comparison rule, search "
+        "policy, pressure test, disagreement handling, or revision trigger.\n"
+        "If an axis would reveal what kind of object is being analyzed, rewrite it as a general rule for how the "
+        "debater gathers evidence, compares alternatives, attacks weak reasoning, or decides to update.\n"
+        "Prefer axes whose extremes would plausibly send agents down different first-pass solution paths or make "
+        "them attack different weaknesses in a rival answer.\n"
         "Favor support coverage over average-case density: include axes that help span rare but plausible "
         "reasoning policies, not just the most common safe personas.\n"
-        "Do not propose biography, tone, verbosity, generic competence, answer hints, theorem giveaways, "
-        "trap spoilers, or any axis that implicitly nudges toward a specific final answer.\n"
+        "Do not propose biography, tone, verbosity, generic competence, answer hints, theorem names, object-family "
+        "labels, symbolic object types, benchmark-specific mechanism language, or any axis that implicitly nudges "
+        "toward a specific final answer.\n"
+        "Bad axis wording: `flow_theory_vs_axiomatic_derivation`, `surface_ion_pairing_focus`, "
+        "`metadata_sensitivity`, `cohen_forcing_first`.\n"
+        "Good axis wording: `constraint_first_vs_hypothesis_first`, `earliest_weak_link_attack_vs_whole_model_attack`, "
+        "`local_patch_vs_global_rebuild`, `consensus_agnostic_vs_convergence_sensitive`.\n"
         "Return JSON only matching this schema:\n"
         f"{_json_schema_block(schema)}"
     )
@@ -127,7 +138,8 @@ def build_task_axis_messages(
             "content": (
                 "You generate reasoning-diversity axes for multi-agent debate. "
                 "Optimize for support coverage across plausible reasoning policies. "
-                "Axes must change how the agent reasons, not what answer it is nudged toward."
+                "Axes must change how the agent reasons, not what answer it is nudged toward. "
+                "Reject axes that sound like a theorem family, object class, mechanism label, or domain-specific lens."
             ),
         },
         {"role": "user", "content": _user_content_with_media(user, question_media=question_media)},
@@ -211,13 +223,13 @@ def build_stage2_messages(
     schema = {
         "persona_id": descriptor.get("persona_id", "persona_1"),
         "title": "Compact title",
-        "core_reasoning_strategy": "One compact paragraph",
+        "core_reasoning_strategy": "Round 1 solve behavior",
         "priorities": ["priority 1", "priority 2"],
         "distrusts": ["thing to distrust 1", "thing to distrust 2"],
-        "decomposition_style": "How this persona breaks work apart",
-        "revision_policy": "When this persona should revise",
-        "confidence_policy": "How uncertainty is handled",
-        "failure_mode_to_avoid": "Main failure mode",
+        "decomposition_style": "Round 2 critique behavior: concrete failure pattern to expose",
+        "revision_policy": "Round 3 defend/revise/switch trigger with explicit condition",
+        "confidence_policy": "Short confidence and uncertainty rule",
+        "failure_mode_to_avoid": "Main internal trap to avoid",
         "system_prompt": "Compact operational system prompt",
     }
     user = (
@@ -226,7 +238,14 @@ def build_stage2_messages(
         "Descriptor:\n"
         f"{json.dumps(descriptor, indent=2, ensure_ascii=False)}\n\n"
         "Write in terms of operating rules, not biography.\n"
-        "The card should specify how this persona chooses candidate paths, checks intermediate steps, "
+        "Interpret the fields as round-specific policies, not generic style labels.\n"
+        "`core_reasoning_strategy` = round-1 solve behavior only: how the persona forms an initial answer or case.\n"
+        "`decomposition_style` = round-2 critique behavior only: one concrete attack rule or failure pattern to expose in a peer answer.\n"
+        "`revision_policy` = round-3 response behavior only: an explicit defend/revise/switch trigger using if/when/unless language tied to evidence.\n"
+        "`confidence_policy` = one short confidence or uncertainty gating rule.\n"
+        "`failure_mode_to_avoid` = the main internal trap this persona should guard against.\n"
+        "`priorities` and `distrusts` are optional, but if present they should support the same solve/critique/revise behavior.\n"
+        "The card should specify how this persona chooses candidate paths, attacks peer reasoning, "
         "handles disagreement, and decides whether to revise.\n"
         "Differences should survive contact with the task and be visible in execution, not just sound "
         "different on paper.\n"
@@ -245,6 +264,12 @@ def build_stage2_messages(
         "generalizing'.\n"
         "The card must describe portable reasoning behavior only. It must not speculate about what specific "
         "object types, formulas, or latent patterns will appear in the problem.\n"
+        "Good decomposition_style: 'Attack the earliest unsupported step the peer answer depends on.'\n"
+        "Good decomposition_style: 'Flag when a peer answer survives only by skipping a necessary case or rule.'\n"
+        "Good revision_policy: 'Defend unless a critique exposes a contradiction or missing necessary case; switch only if the conclusion no longer holds.'\n"
+        "Good revision_policy: 'Revise if a peer breaks a required step; otherwise answer objections without changing the core line.'\n"
+        "Forbidden wording: do not write `the answer is`, `likely answer`, `correct answer`, `answer:`, `option A`, "
+        "`option B`, `option C`, `option D`, `option E`, `rule out option`, or any text that predicts or names a final answer.\n"
         "Good card move: 'propose a global invariant early, then reject branches that violate it and only "
         "switch strategies after an explicit contradiction.'\n"
         "Bad card move: 'start with n=1,2,3', 'test nearby integers', 'look for geometric means', or any "

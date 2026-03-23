@@ -177,21 +177,25 @@ def _parse_judge_output(
         return JudgeParseResult(answer=None, mode="none", source="none", strict_success=False)
 
     raw_text = str(text)
-    variants = [("raw", raw_text)]
-
     if strict_enabled:
-        for suffix, candidate in variants:
-            parsed = _strict_parse_answer(dataset, candidate, raw_task)
-            if parsed is not None:
-                src = f"{source_prefix}_strict" if suffix == "raw" else f"{source_prefix}_strict_variant"
-                return JudgeParseResult(answer=parsed, mode="strict", source=src, strict_success=True)
+        parsed = _strict_parse_answer(dataset, raw_text, raw_task)
+        if parsed is not None:
+            return JudgeParseResult(
+                answer=parsed,
+                mode="strict",
+                source=f"{source_prefix}_strict",
+                strict_success=True,
+            )
 
     if recovery_enabled:
-        for suffix, candidate in variants:
-            parsed = _recover_parse_answer(dataset, candidate, raw_task)
-            if parsed is not None:
-                src = f"{source_prefix}_recovery" if suffix == "raw" else f"{source_prefix}_recovery_variant"
-                return JudgeParseResult(answer=parsed, mode="recover", source=src, strict_success=False)
+        parsed = _recover_parse_answer(dataset, raw_text, raw_task)
+        if parsed is not None:
+            return JudgeParseResult(
+                answer=parsed,
+                mode="recover",
+                source=f"{source_prefix}_recovery",
+                strict_success=False,
+            )
 
     return JudgeParseResult(answer=None, mode="none", source="none", strict_success=False)
 

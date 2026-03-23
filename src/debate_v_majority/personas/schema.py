@@ -69,15 +69,50 @@ class PersonaDescriptor:
     short_rule: str
     reasoning_summary: str
 
+    @property
+    def axis_signature(self) -> dict[str, str]:
+        return self.axis_interpretation
+
+    @property
+    def solve_style(self) -> str:
+        return self.short_rule
+
+    @property
+    def critique_style(self) -> str:
+        return self.reasoning_summary
+
+    @property
+    def revision_policy(self) -> str:
+        return ""
+
+    @property
+    def failure_mode_to_watch(self) -> str:
+        return ""
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PersonaDescriptor":
         return cls(
             persona_id=str(data["persona_id"]),
             name=str(data["name"]),
             axis_values={str(k): float(v) for k, v in (data.get("axis_values") or {}).items()},
-            axis_interpretation={str(k): str(v) for k, v in (data.get("axis_interpretation") or {}).items()},
-            short_rule=str(data["short_rule"]),
-            reasoning_summary=str(data["reasoning_summary"]),
+            axis_interpretation={
+                str(k): str(v)
+                for k, v in (
+                    data.get("axis_interpretation")
+                    or data.get("axis_signature")
+                    or {}
+                ).items()
+            },
+            short_rule=str(
+                data.get("short_rule")
+                or data.get("solve_style")
+                or "apply a distinct operational reasoning policy"
+            ),
+            reasoning_summary=str(
+                data.get("reasoning_summary")
+                or data.get("critique_style")
+                or "attack the most consequential unsupported step in competing answers"
+            ),
         )
 
 
@@ -95,18 +130,54 @@ class PersonaCard:
     system_prompt: str
     card_version: str
 
+    @property
+    def core_policy(self) -> str:
+        return self.core_reasoning_strategy
+
+    @property
+    def critique_policy(self) -> str:
+        return self.decomposition_style
+
+    @property
+    def failure_mode_to_watch(self) -> str:
+        return self.failure_mode_to_avoid
+
+    @property
+    def round_reminder(self) -> str:
+        return self.confidence_policy
+
+    @property
+    def axis_signature(self) -> dict[str, str]:
+        return {}
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PersonaCard":
         return cls(
             persona_id=str(data["persona_id"]),
             title=str(data["title"]),
-            core_reasoning_strategy=str(data["core_reasoning_strategy"]),
+            core_reasoning_strategy=str(
+                data.get("core_reasoning_strategy")
+                or data.get("core_policy")
+                or ""
+            ),
             priorities=[str(x) for x in data.get("priorities", [])],
             distrusts=[str(x) for x in data.get("distrusts", [])],
-            decomposition_style=str(data["decomposition_style"]),
-            revision_policy=str(data["revision_policy"]),
-            confidence_policy=str(data["confidence_policy"]),
-            failure_mode_to_avoid=str(data["failure_mode_to_avoid"]),
+            decomposition_style=str(
+                data.get("decomposition_style")
+                or data.get("critique_policy")
+                or ""
+            ),
+            revision_policy=str(data.get("revision_policy") or ""),
+            confidence_policy=str(
+                data.get("confidence_policy")
+                or data.get("round_reminder")
+                or ""
+            ),
+            failure_mode_to_avoid=str(
+                data.get("failure_mode_to_avoid")
+                or data.get("failure_mode_to_watch")
+                or ""
+            ),
             system_prompt=str(data["system_prompt"]),
             card_version=str(data["card_version"]),
         )

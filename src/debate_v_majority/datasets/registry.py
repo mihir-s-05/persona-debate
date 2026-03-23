@@ -77,8 +77,8 @@ class ModuleDatasetAdapter(DatasetAdapter):
             return int(self.module.check_answer_correctness(answer, gt, raw_task))
         return int(self.module.check_answer_correctness(answer, gt))
 
-    def construct_debate_message(self, other_agent_answers: list[str]) -> dict[str, str]:
-        return cast(dict[str, str], self.module.construct_debate_message(other_agent_answers))
+    def construct_debate_message(self, other_agent_answers: list[str], *, phase: str = "generic") -> dict[str, str]:
+        return cast(dict[str, str], self.module.construct_debate_message(other_agent_answers, phase=phase))
 
     def materialize(self, out_path: Path, *, variant: str | None = None) -> None:
         try:

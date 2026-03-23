@@ -9,6 +9,7 @@ import unicodedata
 from typing import Any, Iterable, Literal
 
 from ..shared import normalize_freeform_string, normalize_numeric_string, parse_math
+from .base import build_structured_debate_message
 
 
 HLE_DATASET_ID = "skylenage/HLE-Verified"
@@ -691,7 +692,13 @@ def check_answer_correctness(answer: Any, gt: Any, task_info: dict[str, Any] | N
     return int(score_answer(None if answer is None else str(answer), task_info)["correct"])
 
 
-def construct_debate_message(other_agent_answers: list[str]) -> dict[str, str]:
+def construct_debate_message(other_agent_answers: list[str], *, phase: str = "generic") -> dict[str, str]:
+    if phase in {"critique", "defense"}:
+        return build_structured_debate_message(
+            phase=phase,
+            updates=other_agent_answers,
+            final_answer_instruction="using the same strict format required in the original question.",
+        )
     body_lines = [AGENT_PROMPT["debate"][0]]
     for idx, answer in enumerate(other_agent_answers, start=1):
         body_lines.append(f"Agent {idx}: {answer}")

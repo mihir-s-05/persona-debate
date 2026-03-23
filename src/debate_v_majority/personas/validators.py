@@ -8,13 +8,13 @@ from .schema import PersonaCard, PersonaDescriptor, ValidationResult
 
 ANSWER_LEAK_PATTERNS = [
     re.compile(r"\\boxed\s*{", re.IGNORECASE),
-    re.compile(r"\boption\s+[ABCD]\b", re.IGNORECASE),
-    re.compile(r"\banswer\s*[:=]\s*[ABCD0-9-]", re.IGNORECASE),
+    re.compile(r"\boption\s+[A-E]\b", re.IGNORECASE),
+    re.compile(r"\banswer\s*[:=]\s*[A-E0-9-]", re.IGNORECASE),
     re.compile(r"\blikely\s+answer\b", re.IGNORECASE),
     re.compile(r"\bcorrect\s+answer\b", re.IGNORECASE),
     re.compile(r"\bthe\s+answer\s+is\b", re.IGNORECASE),
     re.compile(r"\beliminate option\b|\brule out option\b", re.IGNORECASE),
-    re.compile(r"\boption\s+[ABCD]\s+is\s+(?:wrong|incorrect|right|correct)\b", re.IGNORECASE),
+    re.compile(r"\boption\s+[A-E]\s+is\s+(?:wrong|incorrect|right|correct)\b", re.IGNORECASE),
 ]
 
 QUESTION_HINT_PATTERNS = [
@@ -36,6 +36,172 @@ _STOPWORDS = {
     "question", "answer", "final", "carefully", "return", "form", "following", "task", "dataset",
     "option", "options", "correct", "incorrect", "value", "values", "real", "positive", "negative",
 }
+
+_CARD_ACTION_VERBS = (
+    "switch",
+    "revise",
+    "rebuild",
+    "restart",
+    "abandon",
+    "defend",
+    "maintain",
+    "retain",
+    "hold",
+    "keep",
+    "patch",
+    "narrow",
+    "re-evaluate",
+)
+
+_REVISION_TRIGGER_CUES = (
+    "contradiction",
+    "contradictions",
+    "missing case",
+    "broken",
+    "cannot repair",
+    "ranking",
+    "changes your view",
+    "better-supported",
+    "fails",
+    "counter-example",
+    "counterexample",
+    "edge case",
+    "exception",
+    "invalidated",
+    "identified",
+    "demonstrated",
+    "demonstrates",
+    "rebuild",
+    "re-derivation",
+    "framework",
+    "mismatch",
+    "unhandled",
+    "fatal structural flaw",
+    "lower-energy",
+    "more plausible",
+    "more probable",
+    "foundational block",
+    "dead end",
+    "different outcome",
+    "superior",
+    "proven impossible",
+    "proved impossible",
+    "proves that",
+    "violation",
+    "violates",
+    "forbidden zone",
+    "excluded zone",
+    "global law",
+    "symmetry",
+    "specific link",
+    "concrete contradiction",
+)
+
+_REVISION_EVIDENCE_CUES = (
+    "evidence",
+    "counterevidence",
+    "counter-evidence",
+    "counterexample",
+    "counter-example",
+    "objection",
+    "objections",
+    "critique",
+    "critiques",
+)
+
+_CRITIQUE_ATTACK_CUES = (
+    "attack",
+    "attacks",
+    "critique",
+    "expose",
+    "exposes",
+    "audit",
+    "audits",
+    "scrutinize",
+    "scrutinizes",
+    "probe",
+    "probes",
+    "check",
+    "checks",
+    "identify",
+    "identifies",
+    "demand",
+    "demands",
+    "test",
+    "tests",
+    "hunt",
+    "hunts",
+    "flag",
+    "flags",
+    "question",
+    "questions",
+    "pressure-test",
+    "pressure tests",
+)
+
+_CRITIQUE_FAILURE_CUES = (
+    "unsupported",
+    "assumption",
+    "constraint",
+    "constraints",
+    "break",
+    "category",
+    "ranking",
+    "drift",
+    "link",
+    "contradiction",
+    "contradictions",
+    "counter-example",
+    "counterexample",
+    "edge case",
+    "exception",
+    "invalid",
+    "gap",
+    "gaps",
+    "leak",
+    "leaks",
+    "stability",
+    "connect",
+    "connectivity",
+    "justify",
+    "justification",
+    "final claim",
+    "conclusion",
+    "derive",
+    "derives",
+    "support",
+    "supports",
+    "bind",
+    "architecture",
+    "framework",
+    "mapping",
+    "rule",
+    "rules",
+    "symmetry",
+    "conservation law",
+    "verification",
+    "step-by-step",
+    "transition",
+    "transitions",
+    "impossible state",
+    "impossible states",
+    "high-level leap",
+    "high-level leaps",
+    "local dependency",
+    "local dependencies",
+    "forbidden zone",
+)
+
+_CRITIQUE_STRUCTURAL_CUES = (
+    "whether",
+    "when",
+    "fails",
+    "violate",
+    "violates",
+    "bypass",
+    "single rule",
+    "specific",
+)
 
 
 def _normalize_text(text: str) -> str:
@@ -85,6 +251,64 @@ def _jaccard_similarity(a: str, b: str) -> float:
     return len(sa & sb) / len(sa | sb)
 
 
+def _compat_attr(obj: Any, *names: str) -> str:
+    for name in names:
+        value = getattr(obj, name, None)
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def _compat_list_attr(obj: Any, *names: str) -> list[str]:
+    for name in names:
+        value = getattr(obj, name, None)
+        if isinstance(value, list):
+            return [str(x) for x in value]
+    return []
+
+
+def _compat_map_attr(obj: Any, *names: str) -> dict[str, str]:
+    for name in names:
+        value = getattr(obj, name, None)
+        if isinstance(value, dict):
+            return {str(k): str(v) for k, v in value.items()}
+    return {}
+
+
+def _contains_any(text: str, cues: tuple[str, ...]) -> bool:
+    return any(cue in text for cue in cues)
+
+
+def _descriptor_text(descriptor: PersonaDescriptor) -> str:
+    return " ".join(
+        [
+            descriptor.name,
+            _compat_attr(descriptor, "solve_style", "short_rule"),
+            _compat_attr(descriptor, "critique_style", "reasoning_summary"),
+            _compat_attr(descriptor, "revision_policy"),
+            _compat_attr(descriptor, "failure_mode_to_watch"),
+            " ".join(_compat_map_attr(descriptor, "axis_signature", "axis_interpretation").values()),
+        ]
+    )
+
+
+def _card_text(card: PersonaCard) -> str:
+    return " ".join(
+        [
+            card.title,
+            _compat_attr(card, "core_policy", "core_reasoning_strategy"),
+            " ".join(_compat_list_attr(card, "priorities")),
+            " ".join(_compat_list_attr(card, "distrusts")),
+            " ".join(_compat_map_attr(card, "axis_signature").values()),
+            _compat_attr(card, "critique_policy", "decomposition_style"),
+            _compat_attr(card, "revision_policy"),
+            _compat_attr(card, "round_reminder", "confidence_policy"),
+            _compat_attr(card, "failure_mode_to_watch", "failure_mode_to_avoid"),
+            card.system_prompt,
+        ]
+    )
+
+
 def validate_text_for_leakage(text: str) -> ValidationResult:
     norm = _normalize_text(text)
     if any(pattern.search(text) for pattern in ANSWER_LEAK_PATTERNS):
@@ -99,16 +323,7 @@ def validate_text_for_leakage(text: str) -> ValidationResult:
 
 
 def validate_descriptor(descriptor: PersonaDescriptor) -> ValidationResult:
-    text = " ".join(
-        [
-            descriptor.name,
-            descriptor.short_rule,
-            descriptor.reasoning_summary,
-            " ".join(descriptor.axis_interpretation.values()),
-        ]
-    )
-    res = validate_text_for_leakage(text)
-    return res
+    return validate_text_for_leakage(_descriptor_text(descriptor))
 
 
 def validate_descriptor_against_task(
@@ -122,14 +337,7 @@ def validate_descriptor_against_task(
     if base.status != "accept":
         return base
 
-    descriptor_text = " ".join(
-        [
-            descriptor.name,
-            descriptor.short_rule,
-            descriptor.reasoning_summary,
-            " ".join(descriptor.axis_interpretation.values()),
-        ]
-    )
+    descriptor_text = _descriptor_text(descriptor)
     task_text = " ".join(
         part for part in [question or "", _collect_task_text(raw_task), *(context_texts or [])] if part
     ).strip()
@@ -165,22 +373,56 @@ def validate_descriptor_against_task(
 
 
 def validate_card(card: PersonaCard) -> ValidationResult:
-    text = " ".join(
-        [
-            card.title,
-            card.core_reasoning_strategy,
-            " ".join(card.priorities),
-            " ".join(card.distrusts),
-            card.decomposition_style,
-            card.revision_policy,
-            card.confidence_policy,
-            card.failure_mode_to_avoid,
-            card.system_prompt,
-        ]
-    )
-    res = validate_text_for_leakage(text)
+    critique_policy = _compat_attr(card, "critique_policy", "decomposition_style")
+    revision_policy = _compat_attr(card, "revision_policy")
+    axis_signature = _compat_map_attr(card, "axis_signature")
+    res = validate_text_for_leakage(_card_text(card))
+    if res.status != "accept":
+        return res
     if len(_normalize_text(card.system_prompt)) > 1200:
         return ValidationResult(status="retry", reasons=["system_prompt too long for compact operational card"])
+    if axis_signature and not (2 <= len(axis_signature) <= 4):
+        return ValidationResult(status="retry", reasons=["axis_signature must contain between 2 and 4 entries"])
+
+    revision_norm = _normalize_text(revision_policy)
+    wrapped_revision = f" {revision_norm} "
+    has_trigger_keyword = _contains_any(revision_norm, _REVISION_TRIGGER_CUES)
+    has_conditional_structure = (
+        any(marker in wrapped_revision for marker in (" if ", " unless ", " when ", " only if "))
+        and _contains_any(revision_norm, _CARD_ACTION_VERBS)
+    )
+    has_compact_evidence_trigger = (
+        _contains_any(revision_norm, _CARD_ACTION_VERBS)
+        and _contains_any(revision_norm, _REVISION_EVIDENCE_CUES)
+    )
+    has_compact_revision_label = (
+        len(revision_norm.split()) <= 2
+        and revision_norm in _CARD_ACTION_VERBS
+    )
+    if not (
+        has_trigger_keyword
+        or has_conditional_structure
+        or has_compact_evidence_trigger
+        or has_compact_revision_label
+    ):
+        return ValidationResult(status="retry", reasons=["revision_policy must name a concrete switch trigger"])
+
+    critique_norm = _normalize_text(critique_policy)
+    has_attack_verb = _contains_any(critique_norm, _CRITIQUE_ATTACK_CUES)
+    has_failure_target = _contains_any(critique_norm, _CRITIQUE_FAILURE_CUES)
+    has_structural_specificity = _contains_any(critique_norm, _CRITIQUE_STRUCTURAL_CUES)
+    has_compact_critique_label = (
+        len(critique_norm.split()) <= 3
+        and (
+            critique_norm in {"branch-and-test", "stepwise", "step"}
+            or critique_norm.endswith("decomposition")
+        )
+    )
+    if not (
+        has_compact_critique_label
+        or ((has_attack_verb or has_structural_specificity) and (has_failure_target or has_structural_specificity))
+    ):
+        return ValidationResult(status="retry", reasons=["critique_policy is too generic"])
     return res
 
 

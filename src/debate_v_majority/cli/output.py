@@ -75,8 +75,19 @@ def _default_out_dir(dataset: DatasetName) -> Path:
 
 
 def _axis_bank_version() -> str:
-    axis_ids = ",".join(axis.axis_id for axis in FIXED_AXIS_BANK)
-    return f"fixed_bank.{len(FIXED_AXIS_BANK)}.{hashlib.sha256(axis_ids.encode('utf-8')).hexdigest()[:8]}"
+    payload = [
+        {
+            "axis_id": axis.axis_id,
+            "name": axis.name,
+            "kind": axis.kind,
+            "low_desc": axis.low_desc,
+            "high_desc": axis.high_desc,
+            "notes": axis.notes,
+        }
+        for axis in FIXED_AXIS_BANK
+    ]
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()[:8]
+    return f"fixed_bank.{len(FIXED_AXIS_BANK)}.{digest}"
 
 
 def _short_question_text(question: Any, *, limit: int = 160) -> str | None:

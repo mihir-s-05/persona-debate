@@ -55,6 +55,6 @@ def test_trace2txt_script_help_runs():
 def test_token_ledger_cost_script_help_runs():
     proc = _run_help("token-ledger-cost")
     assert proc.returncode == 0
-    assert "--ledger-path" in proc.stdout
     assert "--summary-path" in proc.stdout
+    assert "shared_token_ledger" in proc.stdout
 

@@ -33,6 +33,7 @@ from ..personas import (
     resolve_judge_family_assignment,
     save_artifact as save_persona_artifact,
 )
+from ..personas.generator import _effective_persona_seed
 from ..personas.prompt_templates import (
     ARTIFACT_VERSION,
     CARD_PROMPT_VERSION,
@@ -60,6 +61,7 @@ def _persona_generation_settings(
     *,
     n_personas: int,
     persona_seed: int,
+    item_uid: str | None = None,
     axis_mode: str,
     fixed_axis_count: int,
     task_axis_count: int,
@@ -71,7 +73,7 @@ def _persona_generation_settings(
     axes_file: Path | None,
     n_plain_agents: int = 0,
 ) -> dict[str, Any]:
-    return {
+    settings = {
         "n_personas": int(n_personas),
         "persona_seed": int(persona_seed),
         "axis_mode": str(axis_mode),
@@ -85,6 +87,12 @@ def _persona_generation_settings(
         "axes_file": None if axes_file is None else str(axes_file),
         "n_plain_agents": int(n_plain_agents),
     }
+    if item_uid is not None:
+        settings["effective_persona_seed"] = _effective_persona_seed(
+            persona_seed=persona_seed,
+            item_uid=item_uid,
+        )
+    return settings
 
 
 def _staged_persona_resume_settings(
@@ -772,6 +780,7 @@ def _build_staged_persona_artifact(
         generation_settings=_persona_generation_settings(
             n_personas=config.n_personas,
             persona_seed=config.persona_seed,
+            item_uid=config.item_uid,
             axis_mode=str(config.axis_mode),
             fixed_axis_count=config.fixed_axis_count,
             task_axis_count=config.task_axis_count,

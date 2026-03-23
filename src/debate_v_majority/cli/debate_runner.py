@@ -110,6 +110,7 @@ def _build_initial_agent_contexts(
     engine: InferenceEngine,
     persona_artifacts: list[PersonaArtifact | None],
     n_agents: int,
+    debate_protocol: str,
 ) -> list[list[list[dict[str, Any]]]]:
     def _system_msgs(q_idx: int, agent_idx: int) -> list[dict[str, Any]]:
         artifact = persona_artifacts[q_idx]
@@ -129,6 +130,7 @@ def _build_initial_agent_contexts(
                     question=question,
                     raw_task=raw_task,
                     engine=engine,
+                    debate_protocol=debate_protocol,
                 ),
             ]
             for agent_idx in range(n_agents)
@@ -137,19 +139,51 @@ def _build_initial_agent_contexts(
     ]
 
 
+def _structured_phase_for_round(*, debate_protocol: str, current_round_num: int) -> str:
+    if debate_protocol != "structured":
+        return "generic"
+    if current_round_num <= 2:
+        return "critique"
+    return "defense"
+
+
+def _persona_round_reminder(card: Any, *, phase: str) -> str:
+    if phase == "generic":
+        return (
+            f"[Reminder: You are reasoning as {card.title}. "
+            f"Strategy: {card.core_reasoning_strategy}]\n\n"
+        )
+    if phase == "critique":
+        active_line = f"Round 2 critique policy: {getattr(card, 'critique_policy', card.decomposition_style)}"
+    elif phase == "defense":
+        active_line = f"Round 3 revision policy: {card.revision_policy}"
+    else:
+        active_line = f"Core policy: {card.core_reasoning_strategy}"
+    failure_mode = getattr(card, "failure_mode_to_watch", card.failure_mode_to_avoid)
+    reminder = getattr(card, "round_reminder", card.confidence_policy)
+    return (
+        f"[Persona Constitution Reminder]\n"
+        f"Role: {card.title}\n"
+        f"{active_line}\n"
+        f"Failure mode to watch: {failure_mode}\n"
+        f"Short reminder: {reminder}\n\n"
+    )
+
+
 def _build_agent_debate_message(
     *,
     dataset: DatasetName,
     previous_round_outputs: list[dict[str, Any]],
     agent_idx: int,
     persona_artifact: PersonaArtifact | None,
+    phase: str,
 ) -> dict[str, Any]:
     other_answers = [
         _format_debate_share_entry(previous_round_outputs[idx])
         for idx in range(len(previous_round_outputs))
         if idx != agent_idx
     ]
-    debate_msg = _construct_debate_message(dataset, other_answers)
+    debate_msg = _construct_debate_message(dataset, other_answers, phase=phase)
     if persona_artifact is None:
         return debate_msg
     card = persona_artifact.card_for_agent(agent_idx)
@@ -157,11 +191,7 @@ def _build_agent_debate_message(
         return debate_msg
     return {
         **debate_msg,
-        "content": (
-            f"[Reminder: You are reasoning as {card.title}. "
-            f"Strategy: {card.core_reasoning_strategy}]\n\n"
-            + debate_msg["content"]
-        ),
+        "content": _persona_round_reminder(card, phase=phase) + debate_msg["content"],
     }
 
 
@@ -214,6 +244,7 @@ def _debate_runtime_settings(
     judge_recovery_parse_enabled: bool,
     judge_trace_mode: str,
     public_rationale_max_tokens: int,
+    debate_protocol: str,
 ) -> dict[str, Any]:
     return {
         "debater_model": getattr(engine, "model_name", None),
@@ -226,6 +257,7 @@ def _debate_runtime_settings(
         "judge_recovery_parse_enabled": bool(judge_recovery_parse_enabled),
         "judge_trace_mode": str(judge_trace_mode),
         "public_rationale_max_tokens": int(public_rationale_max_tokens),
+        "debate_protocol": str(debate_protocol),
     }
 
 
@@ -332,6 +364,7 @@ def run_debate(
     judge_bank_refresh: bool = False,
     gpqa_family_cache_path: Path | None = None,
     public_rationale_max_tokens: int = 96,
+    debate_protocol: str = "legacy",
     enable_runtime_judge_persona: bool | None = None,
     persona_artifacts_by_item: dict[str, PersonaArtifact] | None = None,
     progress_file: TextIO = sys.stdout,
@@ -339,6 +372,8 @@ def run_debate(
     stage_state_file: Path | None = None,
     persona_plain_agents: int = 0,
 ) -> dict[int, list[dict[str, Any]]]:
+    if str(debate_protocol) == "structured" and int(n_rounds) != 2:
+        raise ValueError("structured debate protocol currently requires n_rounds=2 (for 3 total answer rounds)")
     judge_rounds = _normalise_judge_rounds(judge_rounds)
     debate_update_rounds = max(0, int(n_rounds))
     total_answer_rounds = debate_update_rounds + 1
@@ -373,6 +408,7 @@ def run_debate(
         judge_recovery_parse_enabled=judge_recovery_parse_enabled,
         judge_trace_mode=judge_trace_mode,
         public_rationale_max_tokens=public_rationale_max_tokens,
+        debate_protocol=debate_protocol,
     )
     parsed_items: list[tuple[SubsetItem, str, Any, dict[str, Any]]] = []
     for item in items:
@@ -546,6 +582,7 @@ def run_debate(
         engine=engine,
         persona_artifacts=persona_artifacts,
         n_agents=n_agents,
+        debate_protocol=debate_protocol,
     )
     agent_round_outputs_by_q: list[list[list[dict[str, Any]]]] = [
         [[] for _ in range(n_agents)]
@@ -675,6 +712,10 @@ def run_debate(
     ):
         skip_debater = pending_judge_round == round_idx
         if round_idx > 0 and not skip_debater:
+            phase = _structured_phase_for_round(
+                debate_protocol=debate_protocol,
+                current_round_num=round_idx + 1,
+            )
             for q_idx in range(len(parsed_items)):
                 agent_contexts = all_contexts[q_idx]
                 previous_round_outputs = [agent_round_outputs_by_q[q_idx][agent_idx][-1] for agent_idx in range(n_agents)]
@@ -689,6 +730,7 @@ def run_debate(
                             previous_round_outputs=previous_round_outputs,
                             agent_idx=agent_idx,
                             persona_artifact=persona_artifacts[q_idx],
+                            phase=phase,
                         )
                     )
 

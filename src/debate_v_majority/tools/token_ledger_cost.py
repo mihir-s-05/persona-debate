@@ -4,16 +4,24 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_LEDGER_PATH = REPO_ROOT / "out" / "shared_token_ledger.jsonl"
-DEFAULT_SUMMARY_PATH = REPO_ROOT / "out" / "shared_token_ledger_total.json"
+DEFAULT_SUMMARY_PATH = REPO_ROOT / "out" / "token_ledger_total.json"
+
+
+def _ledger_path_candidates() -> list[Path]:
+    """Fixed set of JSONL ledgers to merge (each included only if the file exists)."""
+    return [
+        REPO_ROOT / "out" / "token_ledger.jsonl",
+        REPO_ROOT / "out" / "shared_token_ledger.jsonl",
+        REPO_ROOT / "token_ledger.jsonl",
+    ]
 
 
 @dataclass
@@ -23,6 +31,7 @@ class LedgerCostSummary:
     rows_with_cost: int = 0
     rows_missing_or_invalid_cost: int = 0
     total_cost_usd: Decimal = Decimal("0")
+    file_breakdown: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _now_iso_utc() -> str:
@@ -41,7 +50,7 @@ def _to_decimal_cost(value: Any) -> Decimal | None:
     return amount
 
 
-def compute_total_cost(ledger_path: Path) -> LedgerCostSummary:
+def _compute_total_cost_one_file(ledger_path: Path) -> LedgerCostSummary:
     summary = LedgerCostSummary()
     with ledger_path.open("r", encoding="utf-8") as handle:
         for raw_line in handle:
@@ -71,16 +80,64 @@ def compute_total_cost(ledger_path: Path) -> LedgerCostSummary:
     return summary
 
 
-def _payload(ledger_path: Path, summary: LedgerCostSummary) -> dict[str, Any]:
+def compute_total_cost(ledger_paths: Path | Sequence[Path]) -> LedgerCostSummary:
+    """Sum `estimated_cost_usd` across one or more token ledger JSONL files."""
+    paths = [ledger_paths] if isinstance(ledger_paths, Path) else list(ledger_paths)
+    if not paths:
+        raise ValueError("ledger_paths must contain at least one path")
+
+    combined = LedgerCostSummary()
+    for ledger_path in paths:
+        one = _compute_total_cost_one_file(ledger_path)
+        combined.lines_read += one.lines_read
+        combined.rows_parsed += one.rows_parsed
+        combined.rows_with_cost += one.rows_with_cost
+        combined.rows_missing_or_invalid_cost += one.rows_missing_or_invalid_cost
+        combined.total_cost_usd += one.total_cost_usd
+        combined.file_breakdown.append(
+            {
+                "ledger_path": str(ledger_path),
+                "lines_read": one.lines_read,
+                "rows_parsed": one.rows_parsed,
+                "rows_with_estimated_cost": one.rows_with_cost,
+                "rows_missing_or_invalid_cost": one.rows_missing_or_invalid_cost,
+                "total_cost_usd": float(one.total_cost_usd),
+                "total_cost_usd_str": f"{one.total_cost_usd:.8f}",
+            }
+        )
+    return combined
+
+
+def _dedupe_ledger_paths(paths: list[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for p in paths:
+        key = p.resolve()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def _resolved_ledger_paths() -> list[Path]:
+    """All configured ledger files that exist (shared + local, deduped)."""
+    existing = [p for p in _ledger_path_candidates() if p.exists()]
+    return _dedupe_ledger_paths(existing)
+
+
+def _payload(ledger_paths: list[Path], summary: LedgerCostSummary) -> dict[str, Any]:
     return {
         "generated_at_utc": _now_iso_utc(),
-        "ledger_path": str(ledger_path),
+        "ledger_paths": [str(p) for p in ledger_paths],
+        "ledger_path": str(ledger_paths[0]) if len(ledger_paths) == 1 else None,
         "lines_read": summary.lines_read,
         "rows_parsed": summary.rows_parsed,
         "rows_with_estimated_cost": summary.rows_with_cost,
         "rows_missing_or_invalid_cost": summary.rows_missing_or_invalid_cost,
         "total_cost_usd": float(summary.total_cost_usd),
         "total_cost_usd_str": f"{summary.total_cost_usd:.8f}",
+        "per_ledger": summary.file_breakdown,
     }
 
 
@@ -92,14 +149,10 @@ def _write_summary(summary_path: Path, payload: dict[str, Any]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Aggregate estimated_cost_usd from a shared token ledger JSONL and write a summary "
-            "file with the running total."
+            "Aggregate estimated_cost_usd from the repo token ledgers (out/token_ledger.jsonl, "
+            "out/shared_token_ledger.jsonl, and repo-root token_ledger.jsonl when each exists) and "
+            "write a combined total summary JSON."
         )
-    )
-    parser.add_argument(
-        "--ledger-path",
-        default=str(DEFAULT_LEDGER_PATH),
-        help="Path to shared_token_ledger.jsonl.",
     )
     parser.add_argument(
         "--summary-path",
@@ -108,19 +161,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    ledger_path = Path(args.ledger_path)
-    summary_path = Path(args.summary_path)
-    if not ledger_path.exists():
-        print(f"Ledger file not found: {ledger_path}", file=sys.stderr)
+    ledger_paths = _resolved_ledger_paths()
+    if not ledger_paths:
+        print(
+            "No token ledger JSONL files found. Expected at least one of:\n"
+            + "\n".join(f"  - {p}" for p in _ledger_path_candidates()),
+            file=sys.stderr,
+        )
         return 1
 
-    summary = compute_total_cost(ledger_path)
-    payload = _payload(ledger_path, summary)
+    summary_path = Path(args.summary_path)
+
+    summary = compute_total_cost(ledger_paths)
+    payload = _payload(ledger_paths, summary)
     _write_summary(summary_path, payload)
 
+    parts = [f"${row['total_cost_usd_str']}" for row in summary.file_breakdown]
+    joined = " + ".join(parts) if len(parts) > 1 else parts[0]
     print(
-        f"Updated total cost: ${summary.total_cost_usd:.8f} "
-        f"({summary.rows_with_cost} rows with estimated_cost_usd)."
+        f"Updated total cost: ${summary.total_cost_usd:.8f} ({joined}) "
+        f"— {summary.rows_with_cost} rows with estimated_cost_usd across {len(ledger_paths)} file(s)."
     )
     print(f"Summary written to: {summary_path}")
     return 0

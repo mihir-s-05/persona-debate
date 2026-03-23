@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from debate_v_majority.cli import main_impl as cli_main_impl
+from debate_v_majority.cli.persona_runtime import _persona_generation_settings
 from debate_v_majority.cli.subset import _make_dataset_subset
 from debate_v_majority.personas.axes import AxisGenerationExhaustedError, build_axis_selection
 from debate_v_majority.personas import (
@@ -45,6 +46,7 @@ from debate_v_majority.personas.generator import (
     MAX_GENERATION_RETRIES,
     _axis_interpretation,
     _descriptor_context_texts,
+    _effective_persona_seed,
     generate_descriptors,
 )
 from debate_v_majority.personas.judge_generator import JUDGE_CARD_MAX_TOKENS
@@ -212,6 +214,62 @@ def test_halton_sampling_is_deterministic():
     points1 = sample_axis_points(axes=axes, num_personas=4, seed=5, method="halton")
     points2 = sample_axis_points(axes=axes, num_personas=4, seed=5, method="halton")
     assert points1 == points2
+
+
+def test_effective_persona_seed_varies_by_item_uid():
+    config_a = PersonaGenerationConfig(
+        dataset="aime25",
+        question="What is 1+1?",
+        raw_task={"problem": "What is 1+1?", "answer": "2"},
+        item_uid="aime25:item-a",
+        item_display_id=1,
+        dataset_revision="rev-test",
+        n_personas=2,
+        persona_seed=7,
+        axis_mode="fixed",
+        fixed_axis_count=1,
+    )
+    config_b = PersonaGenerationConfig(
+        dataset="aime25",
+        question="What is 1+1?",
+        raw_task={"problem": "What is 1+1?", "answer": "2"},
+        item_uid="aime25:item-b",
+        item_display_id=2,
+        dataset_revision="rev-test",
+        n_personas=2,
+        persona_seed=7,
+        axis_mode="fixed",
+        fixed_axis_count=1,
+    )
+
+    seed_a_1 = _effective_persona_seed(config=config_a)
+    seed_a_2 = _effective_persona_seed(config=config_a)
+    seed_b = _effective_persona_seed(config=config_b)
+
+    assert seed_a_1 == seed_a_2
+    assert seed_a_1 != seed_b
+
+
+def test_persona_generation_settings_include_effective_seed_for_item():
+    settings = _persona_generation_settings(
+        n_personas=2,
+        persona_seed=7,
+        item_uid="aime25:item-a",
+        axis_mode="fixed",
+        fixed_axis_count=1,
+        task_axis_count=0,
+        sampling_method="maximin",
+        judge_persona_mode="neutral_baseline",
+        backend="llm",
+        generator_model="fake-generator",
+        judge_generator_model="fake-judge-generator",
+        axes_file=None,
+    )
+
+    assert settings["effective_persona_seed"] == _effective_persona_seed(
+        persona_seed=7,
+        item_uid="aime25:item-a",
+    )
 
 
 def test_balanced_principle_option_axis_interpretation_is_grammatical():
@@ -463,6 +521,7 @@ def test_build_persona_artifact_and_roundtrip(tmp_path: Path):
     artifact = build_persona_artifact(config=config, judge_card=judge_card, generator_engine=engine)
     assert artifact.item_uid == "aime25:h:test"
     assert len(artifact.cards) == 3
+    assert artifact.generation_settings["effective_persona_seed"] == _effective_persona_seed(config=config)
     path = save_artifact(artifacts_dir=tmp_path, artifact=artifact)
     restored = load_artifact(path=path)
     assert restored.to_dict() == artifact.to_dict()
@@ -751,7 +810,7 @@ def test_make_item_uid_falls_back_to_content_hash_for_aime():
 
 def test_fixed_axis_bank_has_expected_shape():
     assert len(FIXED_AXIS_BANK) == 6
-    assert FIXED_AXIS_BANK[0].axis_id == "symbolic_vs_intuitive"
+    assert FIXED_AXIS_BANK[0].axis_id == "revision_resistance_vs_revision_readiness"
 
 
 def test_get_fixed_axes_returns_requested_prefix():
@@ -915,7 +974,7 @@ def test_generate_descriptors_retry_keeps_axes_and_sampled_points_stable(monkeyp
     expected_points = sample_axis_points(
         axes=get_fixed_axes(1),
         num_personas=2,
-        seed=7,
+        seed=_effective_persona_seed(config=config),
         method=config.sampling_method,
     )
     assert len(descriptors) == 2
@@ -1504,4 +1563,3 @@ def test_prompt_templates_emphasize_support_coverage_and_operational_behavior():
     assert "superficial consensus" in judge_user
     assert "multi-agent compatible" in judge_user
     assert "majority-vs-best-argument conflicts" in judge_user
-

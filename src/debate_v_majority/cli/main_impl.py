@@ -610,6 +610,7 @@ def _hle_experiment_resume_settings(
     persona_save_artifacts: bool,
     persona_replay: bool,
     emit_trace_level: str,
+    debate_protocol: str,
     persona_plain_agents: int = 0,
 ) -> dict[str, Any]:
     return {
@@ -629,6 +630,7 @@ def _hle_experiment_resume_settings(
         },
         "n_agents": int(n_agents),
         "n_rounds": int(n_rounds),
+        "debate_protocol": str(debate_protocol),
         "judge_rounds": [int(round_num) for round_num in judge_rounds],
         "persona_generation": {
             "n_personas": int(n_agents) - int(persona_plain_agents),
@@ -676,6 +678,7 @@ def _hle_experiment_resume_settings(
                 "judge_recovery_parse_enabled": bool(judge_recovery_parse_enabled),
                 "judge_trace_mode": str(judge_trace_mode),
                 "public_rationale_max_tokens": int(public_rationale_max_tokens),
+                "debate_protocol": str(debate_protocol),
             },
         },
         "persona_debate": {
@@ -708,6 +711,7 @@ def _hle_experiment_resume_settings(
                 "judge_recovery_parse_enabled": bool(judge_recovery_parse_enabled),
                 "judge_trace_mode": str(judge_trace_mode),
                 "public_rationale_max_tokens": int(public_rationale_max_tokens),
+                "debate_protocol": str(debate_protocol),
             },
         },
         "persona_backend": str(persona_backend),
@@ -991,6 +995,9 @@ def main() -> None:
         if int(args.public_rationale_max_tokens) <= 0:
             print("--public_rationale_max_tokens must be > 0", file=status_file)
             sys.exit(2)
+        if str(getattr(args, "debate_protocol", "legacy")) == "structured" and int(args.n_rounds) != 2:
+            print("--debate_protocol structured currently requires --n_rounds 2 (for 3 total answer rounds)", file=status_file)
+            sys.exit(2)
         persona_plain_agents = int(getattr(args, "persona_plain_agents", 0) or 0)
         persona_backed_debate_enabled = bool(experiment_enabled or ("debate" in modes and bool(args.use_personas)))
         if persona_plain_agents < 0:
@@ -1179,6 +1186,7 @@ def main() -> None:
                     persona_save_artifacts=bool(args.persona_save_artifacts),
                     persona_replay=bool(args.persona_replay),
                     emit_trace_level=str(args.emit_trace_level),
+                    debate_protocol=str(args.debate_protocol),
                     persona_plain_agents=persona_plain_agents,
                 ) if experiment_enabled else None
                 experiment_resume_state = _load_hle_experiment_resume_state(
@@ -1474,6 +1482,7 @@ def main() -> None:
                                         judge_bank_refresh=bool(args.judge_bank_refresh),
                                         gpqa_family_cache_path=gpqa_family_cache_path,
                                         public_rationale_max_tokens=int(args.public_rationale_max_tokens),
+                                    debate_protocol=str(args.debate_protocol),
                                         enable_runtime_judge_persona=runtime_judge_persona_enabled,
                                         persona_artifacts_by_item=persona_artifacts_by_item,
                                         progress_file=progress_file,
@@ -1939,7 +1948,8 @@ def main() -> None:
                                     judge_bank_refresh=bool(args.judge_bank_refresh),
                                     gpqa_family_cache_path=gpqa_family_cache_path,
                                     public_rationale_max_tokens=int(args.public_rationale_max_tokens),
-                                    enable_runtime_judge_persona=True,
+                                    debate_protocol=str(args.debate_protocol),
+                                    enable_runtime_judge_persona=bool(args.use_personas),
                                     persona_artifacts_by_item=generated_persona_artifacts,
                                     progress_file=progress_file,
                                     debate_stop_after=stop_after,

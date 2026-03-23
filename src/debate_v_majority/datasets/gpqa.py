@@ -9,7 +9,7 @@ import re
 from typing import Any
 
 from ..shared import parse_math, normalize_freeform_string
-from .base import build_standard_debate_message
+from .base import build_standard_debate_message, build_structured_debate_message
 
 
 # =============================================================================
@@ -318,10 +318,16 @@ def check_answer_correctness(answer: Any, gt: Any) -> int:
 # =============================================================================
 
 
-def construct_debate_message(other_agent_answers: list[str]) -> dict[str, str]:
+def construct_debate_message(other_agent_answers: list[str], *, phase: str = "generic") -> dict[str, str]:
     """
     Construct a debate prompt showing other agents' answers.
     """
+    if phase in {"critique", "defense"}:
+        return build_structured_debate_message(
+            phase=phase,
+            updates=other_agent_answers,
+            final_answer_instruction="and put your final choice in the form \\boxed{A} (one of A, B, C, D) at the end of your response.",
+        )
     return build_standard_debate_message(
         intro=AGENT_PROMPT["debate"][0],
         updates=other_agent_answers,

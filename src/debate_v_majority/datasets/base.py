@@ -56,7 +56,7 @@ class DatasetAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def construct_debate_message(self, other_agent_answers: list[str]) -> dict[str, str]:
+    def construct_debate_message(self, other_agent_answers: list[str], *, phase: str = "generic") -> dict[str, str]:
         raise NotImplementedError
 
     @abstractmethod
@@ -193,6 +193,39 @@ def build_standard_debate_message(
     update_template: str = "\n\n One agent update: ```{answer}```",
 ) -> dict[str, str]:
     parts = [str(intro)]
-    parts.extend(str(update_template).format(answer=answer) for answer in updates)
+    parts.extend(str(update_template).format(answer=answer, index=idx) for idx, answer in enumerate(updates, start=1))
     parts.append(str(outro))
     return {"role": "user", "content": "".join(parts)}
+
+
+def build_structured_debate_message(
+    *,
+    phase: str,
+    updates: list[str],
+    final_answer_instruction: str,
+    update_template: str = "\n\nAgent {index}: ```{answer}```",
+) -> dict[str, str]:
+    if phase == "critique":
+        intro = "Round 2 - Cross-examination. These are the prior-round outputs from other agents:"
+        outro = (
+            "\n\nIdentify one concrete flaw in a competing answer and one unresolved objection to your own answer. "
+            "Focus on evidence and reasoning quality rather than agreement counts. Then give your current answer "
+            f"{final_answer_instruction}"
+        )
+    elif phase == "defense":
+        intro = "Round 3 - Defense and conditional revision. These are the prior-round outputs from other agents:"
+        outro = (
+            "\n\nReassess your answer in light of the critiques. Defend it by answering the strongest concrete objections. "
+            "Revise if one or more critiques materially weaken your position or if another answer is now better supported by the evidence. "
+            "Do not switch because a majority disagrees with you alone. If you revise, cite the exact reason or reasons. "
+            f"Then give your current answer {final_answer_instruction}"
+        )
+    else:
+        intro = "These are the prior-round outputs from other agents:"
+        outro = f"\n\nEvaluate them critically, decide whether to revise, and then give your updated answer {final_answer_instruction}"
+    return build_standard_debate_message(
+        intro=intro,
+        updates=updates,
+        outro=outro,
+        update_template=update_template,
+    )

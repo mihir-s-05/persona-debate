@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
+import hashlib
 from typing import Any, cast
 
 from ..engines import ensure_inference_results, inference_result_metadata
@@ -39,24 +40,6 @@ class GenerationExhaustedError(ValueError):
         self.stage = stage
         self.metadata = metadata
 
-_LOW_STYLE = {
-    "symbolic_vs_intuitive": "use explicit symbolic structure before relying on intuition",
-    "exhaustive_vs_pruning": "enumerate cases carefully before pruning",
-    "propose_first_vs_verify_first": "propose a candidate path early and test it quickly",
-    "local_vs_global_focus": "start from local components and build upward",
-    "mechanistic_vs_elimination_reasoning": "construct the answer from mechanism rather than elimination",
-    "low_vs_high_skepticism_of_intermediates": "treat intermediate steps as tentatively usable unless contradicted",
-}
-
-_HIGH_STYLE = {
-    "symbolic_vs_intuitive": "use intuitive structure and plausibility before formal derivation",
-    "exhaustive_vs_pruning": "prune aggressively and focus on the highest-value paths first",
-    "propose_first_vs_verify_first": "verify constraints before committing to a candidate path",
-    "local_vs_global_focus": "start from global structure and derive local details",
-    "mechanistic_vs_elimination_reasoning": "lean on elimination and contradiction checks before full construction",
-    "low_vs_high_skepticism_of_intermediates": "aggressively audit intermediate steps for hidden assumptions",
-}
-
 
 def _question_media_for_task(*, dataset: str, raw_task: dict[str, Any] | None) -> list[dict[str, Any]] | None:
     if dataset != "hle" or raw_task is None:
@@ -89,15 +72,15 @@ def _lower_sentence_start(text: str) -> str:
 def _axis_interpretation(axis: Axis, value: float) -> str:
     bucket = _axis_bucket(value)
     if bucket == "low":
-        return _LOW_STYLE.get(axis.axis_id, axis.low_desc)
+        return axis.low_desc
     if bucket == "high":
-        return _HIGH_STYLE.get(axis.axis_id, axis.high_desc)
+        return axis.high_desc
     if value < 0.5:
-        primary = _strip_sentence(_LOW_STYLE.get(axis.axis_id, axis.low_desc))
-        secondary = _lower_sentence_start(_strip_sentence(_HIGH_STYLE.get(axis.axis_id, axis.high_desc)))
+        primary = _strip_sentence(axis.low_desc)
+        secondary = _lower_sentence_start(_strip_sentence(axis.high_desc))
     else:
-        primary = _strip_sentence(_HIGH_STYLE.get(axis.axis_id, axis.high_desc))
-        secondary = _lower_sentence_start(_strip_sentence(_LOW_STYLE.get(axis.axis_id, axis.low_desc)))
+        primary = _strip_sentence(axis.high_desc)
+        secondary = _lower_sentence_start(_strip_sentence(axis.low_desc))
     return f"blend two moves: {primary}; also {secondary}."
 
 
@@ -156,34 +139,29 @@ def parse_descriptor_result(
     return descriptors
 
 
-def _llm_descriptors(
-    *,
-    config: PersonaGenerationConfig,
-    axis_selection: Any,
-    points: list[dict[str, float]],
-    engine: Any,
-) -> tuple[list[PersonaDescriptor], dict[str, Any]]:
-    messages = build_descriptor_messages(
-        config=config, axis_selection=axis_selection, points=points,
-    )
-    result = ensure_inference_results(
-        engine,
-        [messages],
-        batch_size=1,
-        sampling_kwargs={"max_tokens": DESCRIPTOR_MAX_TOKENS},
-        model_role="generator",
-    )[0]
-    descriptors = parse_descriptor_result(
-        str(result.text), n_personas=config.n_personas, points=points,
-    )
-    return descriptors, inference_result_metadata(result)
-
-
 def _effective_backend(*, config: PersonaGenerationConfig, engine: Any | None) -> str:
     _ = config
     if engine is None:
         raise ValueError("persona generation requires a generator engine")
     return "llm"
+
+
+def _effective_persona_seed(
+    *,
+    config: PersonaGenerationConfig | None = None,
+    persona_seed: int | None = None,
+    item_uid: str | None = None,
+) -> int:
+    if config is not None:
+        base_seed = int(config.persona_seed)
+        item_uid = str(config.item_uid)
+    else:
+        if persona_seed is None or item_uid is None:
+            raise ValueError("effective persona seed requires either config or both persona_seed and item_uid")
+        base_seed = int(persona_seed)
+        item_uid = str(item_uid)
+    payload = f"{base_seed}:{item_uid}".encode("utf-8")
+    return int(hashlib.sha256(payload).hexdigest()[:8], 16)
 
 
 def _descriptor_prompt_axis(axis: Any) -> dict[str, Any]:
@@ -252,6 +230,7 @@ def prepare_descriptor_generation(
     engine: Any | None = None,
 ) -> tuple[Any, list[dict[str, float]], str]:
     backend = _effective_backend(config=config, engine=engine)
+    effective_seed = _effective_persona_seed(config=config)
     axis_selection = build_axis_selection(
         mode=config.axis_mode,
         question=config.question,
@@ -267,7 +246,7 @@ def prepare_descriptor_generation(
     points = sample_axis_points(
         axes=axis_selection.axes,
         num_personas=config.n_personas,
-        seed=config.persona_seed,
+        seed=effective_seed,
         method=config.sampling_method,
     )
     return axis_selection, points, backend
@@ -477,17 +456,44 @@ def parse_card_result(
     descriptor: PersonaDescriptor,
 ) -> PersonaCard:
     payload = parse_json_payload(result_text)
+    decomposition_style = str(
+        payload.get("decomposition_style")
+        or "Attack the earliest unsupported step a peer answer depends on."
+    )
+    revision_policy = str(
+        payload.get("revision_policy")
+        or "Defend unless a critique exposes a contradiction, missing necessary case, or broken assumption; switch only if the conclusion no longer holds."
+    )
+    confidence_policy = str(
+        payload.get("confidence_policy")
+        or "Keep confidence proportional to support and unresolved objections."
+    )
+    failure_mode_to_avoid = str(
+        payload.get("failure_mode_to_avoid")
+        or "Do not confuse a plausible path with a justified one."
+    )
+    system_prompt = str(
+        payload.get("system_prompt")
+        or (
+            f"Reason as {payload.get('title') or descriptor.name}. "
+            f"Round 1 solve policy: {str(payload.get('core_reasoning_strategy') or descriptor.reasoning_summary)} "
+            f"Round 2 critique policy: {decomposition_style} "
+            f"Round 3 revision policy: {revision_policy} "
+            f"Confidence rule: {confidence_policy} "
+            f"Failure mode to avoid: {failure_mode_to_avoid}"
+        )
+    )
     return PersonaCard(
         persona_id=str(payload.get("persona_id") or descriptor.persona_id),
         title=str(payload.get("title") or descriptor.name),
         core_reasoning_strategy=str(payload.get("core_reasoning_strategy") or descriptor.reasoning_summary),
         priorities=[str(x) for x in payload.get("priorities", [])],
         distrusts=[str(x) for x in payload.get("distrusts", [])],
-        decomposition_style=str(payload.get("decomposition_style") or descriptor.short_rule),
-        revision_policy=str(payload.get("revision_policy") or "revise only on concrete evidence"),
-        confidence_policy=str(payload.get("confidence_policy") or "be explicit about uncertainty"),
-        failure_mode_to_avoid=str(payload.get("failure_mode_to_avoid") or "do not collapse into answer-first reasoning"),
-        system_prompt=str(payload.get("system_prompt") or descriptor.reasoning_summary),
+        decomposition_style=decomposition_style,
+        revision_policy=revision_policy,
+        confidence_policy=confidence_policy,
+        failure_mode_to_avoid=failure_mode_to_avoid,
+        system_prompt=system_prompt,
         card_version=CARD_PROMPT_VERSION,
     )
 
@@ -511,12 +517,37 @@ def _build_card_retry_feedback(
         reasons = []
     if status in ("retry", "reject_hard"):
         parts.append(f"- Validation: {', '.join(str(reason) for reason in reasons)}")
+        joined_reasons = " ".join(str(reason) for reason in reasons).lower()
+        if "contains answer-oriented leakage indicators" in joined_reasons:
+            parts.append(
+                "- Remove any phrase that states, predicts, labels, or eliminates a final answer."
+            )
+            parts.append(
+                "- Never write `the answer is`, `answer:`, `likely answer`, `correct answer`, `option A-E`, or `rule out option`."
+            )
+        if "critique_policy is too generic" in joined_reasons:
+            parts.append(
+                "- `decomposition_style` must be a concrete Round-2 attack rule aimed at the opponent's reasoning, not a general solve style."
+            )
+            parts.append(
+                "- Name a specific weakness to probe or failure pattern to expose, e.g. earliest unsupported step, missing necessary case, dropped constraint, or unjustified leap."
+            )
+        if "revision_policy must name a concrete switch trigger" in joined_reasons:
+            parts.append(
+                "- `revision_policy` must include an explicit trigger for defend vs revise vs switch using if/when/unless language."
+            )
+            parts.append(
+                "- Tie the trigger to evidence such as contradiction, missing necessary case, broken assumption, or direct counterexample."
+            )
     parts.append("")
     parts.append("Regenerate this card. Requirements:")
     parts.append("- Return ONLY a valid JSON object matching the requested schema")
     parts.append("- No markdown fencing, no prose, no explanation")
     parts.append("- Keep the card compact and operational")
     parts.append("- Focus on reasoning policy, not biography or style")
+    parts.append("- `core_reasoning_strategy` is round-1 solve behavior")
+    parts.append("- `decomposition_style` is round-2 critique behavior only")
+    parts.append("- `revision_policy` is round-3 defend/revise/switch behavior only")
     return "\n".join(parts)
 
 
@@ -550,7 +581,6 @@ def _regenerate_duplicate_cards(
     question: str,
     raw_task: dict[str, Any],
     engine: Any | None,
-    backend: str,
 ) -> list[PersonaCard]:
     """Re-run card generation for duplicates with enhanced distinctiveness."""
     updated = list(cards)
@@ -655,11 +685,10 @@ def expand_cards(
                         "attempt": attempt,
                     }
                 )
-                if validation.status == "reject_hard":
-                    raise ValueError(f"Card {card.persona_id} rejected: {validation.reasons}")
-                if validation.status == "retry":
+                if validation.status in ("retry", "reject_hard"):
                     has_retry = True
-                cards.append(card)
+                if validation.status == "accept":
+                    cards.append(card)
             call_metadata.append(card_call_meta)
             attempt_audits.append(
                 {
@@ -672,7 +701,9 @@ def expand_cards(
                     "card": None if parse_error is not None or card is None else asdict(card),
                 }
             )
-        dupes = duplicate_diagnostics(card.system_prompt for card in cards)
+        dupes: list[dict[str, float | int]] = []
+        if not has_retry:
+            dupes = duplicate_diagnostics(card.system_prompt for card in cards)
         if dupes:
             cards = _regenerate_duplicate_cards(
                 cards=cards,
@@ -682,7 +713,6 @@ def expand_cards(
                 question=question,
                 raw_task=raw_task,
                 engine=engine,
-                backend=backend,
             )
             dupes = duplicate_diagnostics(card.system_prompt for card in cards)
         last_meta = {
@@ -732,6 +762,7 @@ def build_persona_artifact(
     n_plain = int(config.n_plain_agents)
     n_total = config.n_personas + n_plain
     slot_layout = build_slot_layout(n_agents=n_total, n_plain_agents=n_plain) if n_plain > 0 else None
+    effective_seed = _effective_persona_seed(config=config)
 
     return PersonaArtifact(
         artifact_version=ARTIFACT_VERSION,
@@ -757,6 +788,7 @@ def build_persona_artifact(
         generation_settings={
             "n_personas": int(config.n_personas),
             "persona_seed": int(config.persona_seed),
+            "effective_persona_seed": effective_seed,
             "axis_mode": str(config.axis_mode),
             "fixed_axis_count": int(config.fixed_axis_count),
             "task_axis_count": int(config.task_axis_count),

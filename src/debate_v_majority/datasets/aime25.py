@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from ..shared import parse_math, normalize_numeric_string
-from .base import build_standard_debate_message
+from .base import build_standard_debate_message, build_structured_debate_message
 
 
 # =============================================================================
@@ -76,7 +76,7 @@ def parse_answer(text: str, task_info: dict[str, Any]) -> str | None:
                 v = int(norm)
                 if 0 <= v <= 999:
                     return norm
-            except Exception:
+            except ValueError:
                 pass
         # If the boxed content isn't a valid AIME integer in [0,999], fall back to
         # tail logic rather than returning an out-of-range intermediate result.
@@ -96,7 +96,7 @@ def parse_answer(text: str, task_info: dict[str, Any]) -> str | None:
             v = int(m.group(1))
             if 0 <= v <= 999:
                 return normalize_numeric_string(str(v))
-        except Exception:
+        except ValueError:
             pass
 
     # Last integer in [0,999] in the tail.
@@ -131,13 +131,18 @@ def check_answer_correctness(answer: Any, gt: Any) -> int:
 # =============================================================================
 
 
-def construct_debate_message(other_agent_answers: list[str]) -> dict[str, str]:
+def construct_debate_message(other_agent_answers: list[str], *, phase: str = "generic") -> dict[str, str]:
     """
     Construct a debate prompt showing other agents' answers.
     """
+    if phase in {"critique", "defense"}:
+        return build_structured_debate_message(
+            phase=phase,
+            updates=other_agent_answers,
+            final_answer_instruction="in the form \\boxed{answer} at the end of your response.",
+        )
     return build_standard_debate_message(
         intro=AGENT_PROMPT["debate"][0],
         updates=other_agent_answers,
         outro=AGENT_PROMPT["debate"][1],
     )
-

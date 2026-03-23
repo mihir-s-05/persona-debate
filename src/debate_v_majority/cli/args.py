@@ -97,7 +97,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--n_rounds",
         type=int,
         default=3,
-        help="Number of debate update rounds after the initial independent solve.",
+        help="Number of debate update rounds after the initial independent solve. Legacy default 3 means 4 total answer rounds; use 2 with --debate_protocol structured for a 3-total-round protocol.",
+    )
+    ap.add_argument(
+        "--debate_protocol",
+        type=str,
+        default="legacy",
+        choices=["legacy", "structured"],
+        help="Debate prompting protocol. 'legacy' keeps the current generic reconsideration rounds; 'structured' uses 3-phase prompting (independent solve, critique, defense/revision).",
     )
     ap.add_argument("--majority_samples", type=int, default=5, help="Samples for majority voting.")
     ap.add_argument(
