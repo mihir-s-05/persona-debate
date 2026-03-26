@@ -216,8 +216,10 @@ def build_structured_debate_message(
         intro = "Round 3 - Defense and conditional revision. These are the prior-round outputs from other agents:"
         outro = (
             "\n\nReassess your answer in light of the critiques. Defend it by answering the strongest concrete objections. "
-            "Revise if one or more critiques materially weaken your position or if another answer is now better supported by the evidence. "
-            "Do not switch because a majority disagrees with you alone. If you revise, cite the exact reason or reasons. "
+            "Revise only if one or more critiques expose a concrete contradiction, a missing necessary step, "
+            "or another answer directly resolves a specific failure in your line. "
+            "Do not switch because a majority disagrees with you, because another answer sounds cleaner, or because it is more popular. "
+            "If you revise, cite the exact reason or reasons. "
             f"Then give your current answer {final_answer_instruction}"
         )
     else:

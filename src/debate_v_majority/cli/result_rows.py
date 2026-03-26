@@ -72,6 +72,13 @@ def _compute_persona_fidelity_metrics(
     *,
     answer_changes: list[dict[str, Any]],
     convergence: list[dict[str, Any]],
+    round1_has_correct: bool | None = None,
+    round1_majority_correct: int | None = None,
+    final_round_has_correct: bool | None = None,
+    final_round_majority_correct: int | None = None,
+    judge_correct: int | None = None,
+    final_round_majority_answer: str | None = None,
+    judge_answer: str | None = None,
 ) -> dict[str, Any]:
     round1_answers = [
         agent_outputs[0].get("final_answer") if agent_outputs else None
@@ -146,6 +153,33 @@ def _compute_persona_fidelity_metrics(
         if distances:
             public_rationale_diversity = round(sum(distances) / len(distances), 4)
 
+    round1_correct_minority_present: bool | None = None
+    correct_minority_amplified_by_final_majority: bool | None = None
+    correct_minority_amplified_by_judge: bool | None = None
+    correct_minority_suppressed_by_final_round: bool | None = None
+    if round1_has_correct is not None and round1_majority_correct is not None:
+        round1_correct_minority_present = bool(round1_has_correct and int(round1_majority_correct) == 0)
+        if final_round_majority_correct is not None:
+            correct_minority_amplified_by_final_majority = bool(
+                round1_correct_minority_present and int(final_round_majority_correct) == 1
+            )
+        if judge_correct is not None:
+            correct_minority_amplified_by_judge = bool(round1_correct_minority_present and int(judge_correct) == 1)
+        if final_round_has_correct is not None:
+            correct_minority_suppressed_by_final_round = bool(
+                round1_correct_minority_present and not final_round_has_correct
+            )
+
+    judge_majority_disagreed: bool | None = None
+    if judge_answer is not None and final_round_majority_answer is not None:
+        judge_majority_disagreed = judge_answer != final_round_majority_answer
+
+    judge_rescue: bool | None = None
+    judge_harm: bool | None = None
+    if judge_correct is not None and final_round_majority_correct is not None:
+        judge_rescue = bool(int(judge_correct) == 1 and int(final_round_majority_correct) == 0)
+        judge_harm = bool(int(judge_correct) == 0 and int(final_round_majority_correct) == 1)
+
     return {
         "round1_answer_entropy": round(round1_entropy, 4),
         "unique_round1_answers": unique_round1_answers,
@@ -153,6 +187,13 @@ def _compute_persona_fidelity_metrics(
         "revision_rate_by_persona": revision_rate_by_persona,
         "convergence_rate": round(convergence_rate, 4),
         "public_rationale_diversity": public_rationale_diversity,
+        "judge_majority_disagreed": judge_majority_disagreed,
+        "judge_rescue": judge_rescue,
+        "judge_harm": judge_harm,
+        "round1_correct_minority_present": round1_correct_minority_present,
+        "correct_minority_amplified_by_final_majority": correct_minority_amplified_by_final_majority,
+        "correct_minority_amplified_by_judge": correct_minority_amplified_by_judge,
+        "correct_minority_suppressed_by_final_round": correct_minority_suppressed_by_final_round,
     }
 
 
@@ -224,6 +265,9 @@ def _persona_runtime_meta(
     persona_sampling_method: str,
     persona_backend: str,
     public_rationale_max_tokens: int | None = None,
+    generation_settings: dict[str, Any] | None = None,
+    replay: bool | None = None,
+    save_artifacts: bool | None = None,
 ) -> dict[str, Any] | None:
     if artifact is None:
         return None
@@ -238,6 +282,12 @@ def _persona_runtime_meta(
         "backend": persona_backend,
         "public_rationale_max_tokens": public_rationale_max_tokens,
     }
+    if generation_settings is not None:
+        meta["generation_settings"] = dict(generation_settings)
+    if replay is not None:
+        meta["replay"] = bool(replay)
+    if save_artifacts is not None:
+        meta["save_artifacts"] = bool(save_artifacts)
     if artifact.slot_layout is not None:
         meta["slot_layout"] = list(artifact.slot_layout)
         meta["n_plain_agents"] = artifact.n_plain_agents

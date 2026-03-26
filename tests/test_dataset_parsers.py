@@ -232,6 +232,54 @@ def test_hle_freeform_scoring_uses_verified_answer_aliases():
     assert "united states" in scoring["accepted_answers"]
 
 
+def test_hle_freeform_exact_scoring_normalizes_comma_spacing():
+    task = {
+        "id": "hle-free-comma-1",
+        "question": "Give the two answers separated by a comma.",
+        "answer": "yes,yes",
+        "answer_type": "exactMatch",
+        "category": "math",
+        "Verified_Classes": "Gold subset",
+    }
+    scoring = hle.score_answer("yes, yes", task)
+    assert scoring["predicted_answer"] == "yes,yes"
+    assert scoring["expected_answer"] == "yes,yes"
+    assert scoring["correct"] == 1
+
+
+def test_hle_freeform_exact_scoring_canonicalizes_countable_synonyms():
+    task = {
+        "id": "hle-free-countable-1",
+        "question": "What is the largest possible weight of the group?",
+        "answer": "countable",
+        "answer_type": "exactMatch",
+        "category": "math",
+        "Verified_Classes": "Gold subset",
+    }
+    scoring = hle.score_answer(r"\aleph_0", task)
+    assert scoring["predicted_answer"] == "countable"
+    assert scoring["expected_answer"] == "countable"
+    assert scoring["correct"] == 1
+
+
+def test_hle_freeform_exact_scoring_canonicalizes_ccsd_excitation_rank_synonyms():
+    task = {
+        "id": "hle-free-ccsd-1",
+        "question": (
+            "In CCSD, for what other excited Slater determinants are matrix elements "
+            "of the above form zero?"
+        ),
+        "answer": "Septuply and higher.",
+        "answer_type": "exactMatch",
+        "category": "physics",
+        "Verified_Classes": "Gold subset",
+    }
+    scoring = hle.score_answer("more than six-fold excited determinants", task)
+    assert scoring["predicted_answer"] == "septuply and higher"
+    assert scoring["expected_answer"] == "septuply and higher"
+    assert scoring["correct"] == 1
+
+
 def test_cli_parse_answer_returns_none_when_no_boxed_for_aime():
     raw_task = {"problem": "What is 1+1?", "answer": "2"}
     text = "I need to think about this more carefully before answering."
@@ -253,4 +301,3 @@ def test_gpqa_strict_judge_parse_requires_boxed_choice():
     }
     assert strict_judge_parse_answer("gpqa", "Final answer: B", raw_task) is None
     assert strict_judge_parse_answer("gpqa", "\\boxed{B}", raw_task) == "B"
-

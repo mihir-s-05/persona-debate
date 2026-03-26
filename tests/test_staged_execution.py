@@ -23,11 +23,16 @@ from debate_v_majority.cli.stage_state import (
     make_stage_entry,
 )
 from debate_v_majority.personas.generator import (
+    COVERAGE_AUDIT_VERSION,
+    GENERATION_SETTINGS_VERSION,
+    SEMANTIC_REDUNDANCY_VERSION,
+    SLOT_SAMPLING_VERSION,
     build_card_messages,
     build_descriptor_messages,
     parse_card_result,
     parse_descriptor_result,
 )
+from debate_v_majority.personas.axes import AXIS_BANK_VERSION
 from debate_v_majority.personas.schema import (
     Axis,
     AxisSelection,
@@ -459,8 +464,8 @@ def test_build_descriptor_messages_sanitizes_task_axis_descriptions():
     assert "1/(x-18)" not in user_content
     assert "Specific constants from the item." not in user_content
     assert "Interpret this axis abstractly from its name only." in user_content
-    assert "What is 2+2?" not in user_content
-    assert "Question:" not in user_content
+    assert "What is 2+2?" in user_content
+    assert "Prompt:" in user_content
 
 
 def test_parse_descriptor_result():
@@ -1186,16 +1191,24 @@ def test_staged_persona_completed_stage_is_noop_before_replay_lookup(tmp_path: P
             persona_data={"aime25:test_0": {"artifact": {"item_uid": "aime25:test_0"}}},
                 meta={
                     "resume_settings": {
+                        "generation_settings_version": GENERATION_SETTINGS_VERSION,
                         "n_personas": 2,
                         "persona_seed": 0,
                         "axis_mode": "replay",
                         "fixed_axis_count": 2,
                         "task_axis_count": 0,
                         "sampling_method": "maximin",
+                        "slot_sampling_version": SLOT_SAMPLING_VERSION,
+                        "slot_role_scheme": "generic_coverage_v1",
+                        "population_design_version": "generic_persona_coverage.v1",
                         "judge_persona_mode": "neutral_baseline",
                         "backend": "llm",
                         "generator_model": "fake-generator",
                         "judge_generator_model": "fake-judge-generator",
+                        "axis_bank_version": AXIS_BANK_VERSION,
+                        "generic_axis_bank_version": AXIS_BANK_VERSION,
+                        "semantic_redundancy_version": SEMANTIC_REDUNDANCY_VERSION,
+                        "coverage_audit_version": COVERAGE_AUDIT_VERSION,
                         "axes_file": None,
                         "n_plain_agents": 0,
                         "effective_backend": "llm",
@@ -3380,9 +3393,6 @@ def test_main_discards_auto_debate_stage_file_on_settings_mismatch(tmp_path: Pat
     assert stage_state_calls[1] == first_stage_state_file
     assert stage_state_calls[2] is None
     assert not (tmp_path / "stage_state_aime_debate.latest").exists()
-
-
-
 
 
 

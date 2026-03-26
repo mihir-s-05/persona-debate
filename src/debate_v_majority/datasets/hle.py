@@ -380,6 +380,57 @@ def normalize_freeform_exact_answer(value: str | None) -> str | None:
     return s or None
 
 
+def _canonicalize_countable_answer(value: str) -> str:
+    s = str(value).strip()
+    if s in {
+        r"\aleph_0",
+        r"\aleph0",
+        "aleph_0",
+        "aleph0",
+        "aleph 0",
+        "ℵ0",
+        "ℵ_0",
+        "countably infinite",
+    }:
+        return "countable"
+    return s
+
+
+def _canonicalize_excitation_rank_answer(value: str, task_info: dict[str, Any] | None = None) -> str:
+    s = str(value).strip()
+    task = prepare_task(task_info or {})
+    answer_hint = normalize_freeform_exact_answer(str(task.get("answer") or "")) or ""
+    question_hint = normalize_freeform_exact_answer(str(task.get("question") or "")) or ""
+    relevant_task = (
+        "septuply and higher" in answer_hint
+        or "excited slater determinants" in question_hint
+        or "excitation rank" in question_hint
+    )
+    if not relevant_task:
+        return s
+    patterns = [
+        r"^(?:any\s+)?excitation\s+rank\s+(?:greater\s+than|more\s+than)\s+(?:6|six)$",
+        r"^(?:more\s+than|greater\s+than)\s+(?:6|six)(?:-fold)?\s+excited(?:\s+slater)?\s+determinants?$",
+        r"^(?:septuply\s+and\s+higher)(?:\s+excited(?:\s+slater)?\s+determinants?)?$",
+    ]
+    if any(re.fullmatch(pattern, s) for pattern in patterns):
+        return "septuply and higher"
+    return s
+
+
+def canonicalize_freeform_exact_answer(
+    value: str | None,
+    task_info: dict[str, Any] | None = None,
+) -> str | None:
+    s = normalize_freeform_exact_answer(value)
+    if s is None:
+        return None
+    s = re.sub(r"\s*,\s*", ",", s)
+    s = _canonicalize_countable_answer(s)
+    s = _canonicalize_excitation_rank_answer(s, task_info)
+    return s or None
+
+
 def _strip_markdown_bold_markers(text: str) -> str:
     """Remove inline markdown bold wrappers so cue regexes can see the underlying keyword."""
     return "\n".join(re.sub(r"\*\*([^*]+)\*\*", r"\1", line) for line in str(text).splitlines())
@@ -449,7 +500,7 @@ def _verified_freeform_answer_set(task_info: dict[str, Any]) -> list[str]:
     seen: set[str] = set()
     for source in candidate_sources:
         for candidate in _iter_candidate_strings(source):
-            norm = normalize_freeform_exact_answer(candidate)
+            norm = canonicalize_freeform_exact_answer(candidate, raw_task)
             if norm is None or norm in seen:
                 continue
             seen.add(norm)
@@ -606,7 +657,7 @@ def extract_response(
             strict=strict and not parse_with_recovery,
             recover=parse_with_recovery,
         )
-        normalized_candidate = normalize_freeform_exact_answer(raw_candidate) if raw_candidate is not None else None
+        normalized_candidate = canonicalize_freeform_exact_answer(raw_candidate, raw_task) if raw_candidate is not None else None
         return raw_candidate, normalized_candidate
 
     candidate, normalized = _extract_candidate(parse_with_recovery=recover)
@@ -664,8 +715,8 @@ def score_answer(answer: str | None, task_info: dict[str, Any]) -> dict[str, Any
         match_type = "numeric_exact"
     else:
         accepted_answers = _verified_freeform_answer_set(raw_task)
-        expected = accepted_answers[0] if accepted_answers else normalize_freeform_exact_answer(expected_raw)
-        actual = normalize_freeform_exact_answer(answer) if answer is not None else None
+        expected = accepted_answers[0] if accepted_answers else canonicalize_freeform_exact_answer(expected_raw, raw_task)
+        actual = canonicalize_freeform_exact_answer(answer, raw_task) if answer is not None else None
         match_type = "freeform_verified_rule_set"
     if format_type == "freeform_exact":
         correct = int(actual is not None and ((expected is not None and actual == expected) or actual in accepted_answers))

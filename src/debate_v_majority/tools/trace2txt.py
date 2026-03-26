@@ -228,6 +228,35 @@ def _render_response_block(text: str, *, prefix: str = "  ", heading: str = "Res
     return [f"{prefix}{heading}:", _indent(rendered, prefix=prefix + "  ")]
 
 
+def _thought_summary_text(round_output: dict[str, Any]) -> str:
+    """Prefer top-level thought_summary; fall back to Gemini metadata on call_metadata."""
+    ts = str(round_output.get("thought_summary") or "").strip()
+    if ts:
+        return ts
+    meta = round_output.get("call_metadata")
+    if isinstance(meta, dict):
+        ts2 = str(meta.get("thought_summary") or "").strip()
+        if ts2:
+            return ts2
+    return ""
+
+
+def _judge_thought_sections(judge_trace: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return judge thought summaries without conflating raw and retry calls."""
+    sections: list[tuple[str, str]] = []
+    for key, title in (
+        ("judge_raw_call_metadata", "Judge thought summary (raw call)"),
+        ("judge_retry_call_metadata", "Judge thought summary (retry call)"),
+    ):
+        meta = judge_trace.get(key)
+        if not isinstance(meta, dict):
+            continue
+        ts = str(meta.get("thought_summary") or "").strip()
+        if ts:
+            sections.append((title, ts))
+    return sections
+
+
 def _render_judge_extraction_section(
     title: str,
     *,
@@ -281,11 +310,18 @@ def _render_debate_trace(row: dict[str, Any]) -> list[str]:
             rationale = str(round_output.get("public_rationale") or "").strip()
             if rationale:
                 lines.append(f"  Public rationale: {rationale}")
-            thought_summary = str(round_output.get("thought_summary") or "").strip()
+            thought_summary = _thought_summary_text(round_output)
             if thought_summary:
-                lines.append("  Thought summary:")
+                lines.append("  Thought summary (model thinking):")
                 lines.append(_indent(thought_summary, prefix="    "))
-            lines.extend(_render_response_block(str(round_output.get("private_raw_response") or ""), prefix="  "))
+            response_heading = "Response (visible output)" if thought_summary else "Response"
+            lines.extend(
+                _render_response_block(
+                    str(round_output.get("visible_output") or round_output.get("private_raw_response") or ""),
+                    prefix="  ",
+                    heading=response_heading,
+                )
+            )
 
     lines.append("")
     lines.append("Outcomes")
@@ -370,11 +406,20 @@ def _render_debate_trace(row: dict[str, Any]) -> list[str]:
                 continue
             lines.append(f"- {role}:")
             lines.append(_indent(content))
+    for title, judge_thought in _judge_thought_sections(judge_trace):
+        lines.append("")
+        lines.append(title)
+        lines.append(_indent(judge_thought))
     judge_raw = str(judge_trace.get("judge_raw_response") or "").strip()
     if judge_raw:
         lines.append("")
-        lines.append("Judge Raw Response")
+        lines.append("Judge Raw Response (visible output)")
         lines.append(_indent(judge_raw))
+    judge_retry_raw = str(judge_trace.get("judge_retry_raw_response") or "").strip()
+    if judge_retry_raw:
+        lines.append("")
+        lines.append("Judge Retry Raw Response (visible output)")
+        lines.append(_indent(judge_retry_raw))
     lines.extend(
         _render_judge_extraction_section(
             "Judge Extraction",

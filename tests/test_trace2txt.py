@@ -7,6 +7,7 @@ from debate_v_majority.cli.dataset_eval import _parse_question_answer
 from debate_v_majority.cli.debate_runner import run_debate
 from debate_v_majority.cli.subset import _make_dataset_subset
 from debate_v_majority.tools import trace2txt
+from debate_v_majority.tools.extract_transcripts import extract_from_jsonl_row
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
@@ -143,6 +144,79 @@ def test_render_trace2txt_for_debate_row(tmp_path: Path):
     exit_code = trace2txt.main(["--input", str(input_path), "--row-index", "0", "--out", str(stdout_path)])
     assert exit_code == 0
     assert "Round 2" in stdout_path.read_text(encoding="utf-8")
+
+
+def test_render_row_text_includes_thought_and_judge_thinking_metadata() -> None:
+    row = {
+        "dataset": "hle",
+        "mode": "debate",
+        "item_uid": "hle:x",
+        "question": "Q?",
+        "answer": "D",
+        "agent_round_outputs": [
+            [
+                {
+                    "thought_summary": None,
+                    "call_metadata": {"thought_summary": "Hidden think from API."},
+                    "private_raw_response": "visible only",
+                    "visible_output": "visible only",
+                    "final_answer": "D",
+                    "parse_success": True,
+                    "confidence": 0.9,
+                    "extractor_trace": {},
+                    "scoring_result": {"correct": 1},
+                }
+            ],
+        ],
+        "judge_trace": {
+            "judge_raw_response": "\\boxed{D}",
+            "judge_raw_call_metadata": {"thought_summary": "Judge thinks before answering."},
+            "judge_retry_raw_response": "\\boxed{D}",
+            "judge_retry_call_metadata": {"thought_summary": "Judge retries with a stricter answer."},
+        },
+    }
+    text = trace2txt.render_row_text(row)
+    assert "Thought summary (model thinking):" in text
+    assert "Hidden think from API." in text
+    assert "Response (visible output):" in text
+    assert "Judge thought summary (raw call)" in text
+    assert "Judge thinks before answering." in text
+    assert "Judge thought summary (retry call)" in text
+    assert "Judge retries with a stricter answer." in text
+    assert "Judge Raw Response (visible output)" in text
+    assert "Judge Retry Raw Response (visible output)" in text
+
+
+def test_extract_transcripts_jsonl_row_includes_thought_summaries(tmp_path: Path) -> None:
+    row = {
+        "question": "Q?",
+        "answer": "D",
+        "final_answer": "D",
+        "final_correct": 1,
+        "agent_round_outputs": [
+            [
+                {
+                    "thought_summary": None,
+                    "call_metadata": {"thought_summary": "Agent hidden think."},
+                }
+            ]
+        ],
+        "judge_trace": {
+            "judge_raw_response": "\\boxed{D}",
+            "judge_raw_call_metadata": {"thought_summary": "Judge raw think."},
+            "judge_retry_raw_response": "\\boxed{D}",
+            "judge_retry_call_metadata": {"thought_summary": "Judge retry think."},
+        },
+    }
+    outfile = extract_from_jsonl_row(row, {}, "case1", str(tmp_path))
+    assert outfile is not None
+    text = Path(outfile).read_text(encoding="utf-8")
+    assert "THOUGHT SUMMARIES (DEBATERS)" in text
+    assert "Agent hidden think." in text
+    assert "THOUGHT SUMMARY — Judge (raw call)" in text
+    assert "Judge raw think." in text
+    assert "THOUGHT SUMMARY — Judge (retry call)" in text
+    assert "Judge retry think." in text
 
 
 def test_trace2txt_renders_real_run_debate_judge_summary(tmp_path: Path, monkeypatch):

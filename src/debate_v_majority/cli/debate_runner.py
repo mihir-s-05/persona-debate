@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import json
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, TextIO
@@ -10,6 +11,14 @@ from tqdm import tqdm
 from .. import DatasetName
 from ..engines import InferenceEngine, ensure_inference_results, infer_native_context_len
 from ..personas import JudgeCard, PersonaArtifact, build_slot_layout
+from ..personas.axes import AXIS_BANK_VERSION
+from ..personas.generator import (
+    COVERAGE_AUDIT_VERSION,
+    GENERATION_SETTINGS_VERSION,
+    SEMANTIC_REDUNDANCY_VERSION,
+    SLOT_SAMPLING_VERSION,
+)
+from ..personas.prompt_templates import CARD_PROMPT_VERSION
 from ..shared import PrevJudgeInfo, PromptTokenCounter
 from .dataset_eval import (
     _build_initial_user_message,
@@ -119,7 +128,7 @@ def _build_initial_agent_contexts(
         card = artifact.card_for_agent(agent_idx)
         if card is None:
             return []
-        return [{"role": "system", "content": card.system_prompt}]
+        return [{"role": "system", "content": getattr(card, "initial_system_prompt", card.system_prompt)}]
 
     return [
         [
@@ -139,35 +148,182 @@ def _build_initial_agent_contexts(
     ]
 
 
-def _structured_phase_for_round(*, debate_protocol: str, current_round_num: int) -> str:
+def _round_output_text(round_output: dict[str, Any]) -> str:
+    return _format_debate_share_entry(round_output)
+
+
+def _debate_round_phase(*, debate_protocol: str, round_num: int) -> str:
     if debate_protocol != "structured":
         return "generic"
-    if current_round_num <= 2:
+    if round_num <= 2:
         return "critique"
     return "defense"
 
 
-def _persona_round_reminder(card: Any, *, phase: str) -> str:
-    if phase == "generic":
-        return (
-            f"[Reminder: You are reasoning as {card.title}. "
-            f"Strategy: {card.core_reasoning_strategy}]\n\n"
-        )
-    if phase == "critique":
-        active_line = f"Round 2 critique policy: {getattr(card, 'critique_policy', card.decomposition_style)}"
-    elif phase == "defense":
-        active_line = f"Round 3 revision policy: {card.revision_policy}"
-    else:
-        active_line = f"Core policy: {card.core_reasoning_strategy}"
+def _persona_round_reminder(card: Any, *, round_num: int) -> str:
     failure_mode = getattr(card, "failure_mode_to_watch", card.failure_mode_to_avoid)
-    reminder = getattr(card, "round_reminder", card.confidence_policy)
-    return (
-        f"[Persona Constitution Reminder]\n"
-        f"Role: {card.title}\n"
-        f"{active_line}\n"
-        f"Failure mode to watch: {failure_mode}\n"
-        f"Short reminder: {reminder}\n\n"
+    if round_num <= 1:
+        active_label = "Round 1 solve policy"
+        active_policy = (
+            getattr(card, "round1_solver_policy", {}).get("opening_strategy")
+            if isinstance(getattr(card, "round1_solver_policy", None), dict)
+            else None
+        ) or card.core_reasoning_strategy
+        lines = [
+            "[Persona Constitution Reminder]",
+            f"Identity: {getattr(card, 'base_identity', card.title)}",
+            f"{active_label}: {active_policy}",
+            f"Failure mode to avoid: {failure_mode}",
+        ]
+    elif round_num == 2:
+        lines = [
+            "[Persona Constitution Reminder]",
+            f"Identity: {getattr(card, 'base_identity', card.title)}",
+            f"Round 1 solve policy carryover: {card.core_reasoning_strategy}",
+            f"Round 2 critique policy: {getattr(card, 'round2_reminder', getattr(card, 'critique_policy', card.decomposition_style))}",
+            f"Failure mode to avoid: {failure_mode}",
+        ]
+    else:
+        lines = [
+            "[Persona Constitution Reminder]",
+            f"Identity: {getattr(card, 'base_identity', card.title)}",
+            f"Round 3 revision policy: {getattr(card, 'round3_reminder', card.revision_policy)}",
+            f"Confidence rule: {getattr(card, 'round_reminder', card.confidence_policy)}",
+            f"Failure mode to avoid: {failure_mode}",
+        ]
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+_STANCE_SUPPORT_MARKERS = (
+    "agree",
+    "supports",
+    "correct",
+    "compelling",
+    "persuasive",
+    "well-supported",
+    "strongest",
+)
+
+_STANCE_CRITICISM_MARKERS = (
+    "disagree",
+    "flaw",
+    "incorrect",
+    "wrong",
+    "unsupported",
+    "unconvincing",
+    "fails",
+    "does not",
+    "doesn't",
+    "cannot",
+    "can't",
+)
+
+
+def _round3_peer_stance(
+    *,
+    self_answer: Any,
+    peer_output: dict[str, Any],
+    peer_text: str,
+) -> str:
+    peer_answer = peer_output.get("final_answer")
+    text = peer_text.lower()
+    support_hits = sum(marker in text for marker in _STANCE_SUPPORT_MARKERS)
+    criticism_hits = sum(marker in text for marker in _STANCE_CRITICISM_MARKERS)
+    if self_answer is not None and peer_answer == self_answer:
+        return "criticism" if criticism_hits > support_hits else "support"
+    if support_hits > criticism_hits + 1:
+        return "support"
+    return "criticism"
+
+
+def _round3_basin_key(answer: Any) -> str:
+    if answer is None:
+        return "__UNPARSED__"
+    if isinstance(answer, (str, int, float, bool)):
+        return str(answer)
+    try:
+        return json.dumps(answer, sort_keys=True, ensure_ascii=True)
+    except TypeError:
+        return str(answer)
+
+
+def _round3_basin_label(answer: Any) -> str:
+    if answer is None:
+        return "unparsed / no final answer"
+    if isinstance(answer, str):
+        return answer
+    try:
+        return json.dumps(answer, sort_keys=True, ensure_ascii=True)
+    except TypeError:
+        return str(answer)
+
+
+def _build_round3_bundle(
+    *,
+    previous_round_outputs: list[dict[str, Any]],
+    agent_idx: int,
+) -> tuple[list[str], str]:
+    self_output = previous_round_outputs[agent_idx]
+    self_answer = self_output.get("final_answer")
+    basin_entries: dict[str, dict[str, Any]] = {}
+    basin_order: list[str] = []
+    for idx, peer_output in enumerate(previous_round_outputs):
+        if idx == agent_idx:
+            continue
+        peer_text = _round_output_text(peer_output)
+        peer_answer = peer_output.get("final_answer")
+        basin_key = _round3_basin_key(peer_answer)
+        if basin_key not in basin_entries:
+            basin_entries[basin_key] = {
+                "answer": peer_answer,
+                "support": 0,
+                "criticism": 0,
+                "entries": [],
+            }
+            basin_order.append(basin_key)
+        stance = _round3_peer_stance(
+            self_answer=self_answer,
+            peer_output=peer_output,
+            peer_text=peer_text,
+        )
+        basin_entries[basin_key][stance] += 1
+        basin_entries[basin_key]["entries"].append((idx + 1, stance, peer_text))
+    preamble = [
+        "Your previous answer/output:",
+        _round_output_text(self_output),
+        "",
+        "Peer outputs are grouped by answer basin. Compare competing basins by whether they expose a concrete contradiction or resolve a specific failure in your line.",
+        "",
+    ]
+    self_basin_key = _round3_basin_key(self_answer)
+    ordered_basin_keys = sorted(
+        basin_order,
+        key=lambda key: (
+            0 if key == self_basin_key else 1,
+            -len(basin_entries[key]["entries"]),
+            basin_order.index(key),
+        ),
     )
+    entries: list[str] = []
+    for basin_key in ordered_basin_keys:
+        basin = basin_entries[basin_key]
+        answer_label = _round3_basin_label(basin["answer"])
+        if basin_key == self_basin_key:
+            header = (
+                f"Peer basin matching your last answer ({len(basin['entries'])} agent(s); "
+                f"{basin['support']} support / {basin['criticism']} criticism):"
+            )
+        else:
+            header = (
+                f"Competing peer basin `{answer_label}` ({len(basin['entries'])} agent(s); "
+                f"{basin['support']} support / {basin['criticism']} criticism):"
+            )
+        basin_lines = [header]
+        for peer_idx, stance, peer_text in basin["entries"]:
+            basin_lines.append(f"{stance.title()} from agent {peer_idx}:\n{peer_text}")
+        entries.append("\n".join(basin_lines))
+    return entries, "\n".join(preamble)
 
 
 def _build_agent_debate_message(
@@ -176,14 +332,26 @@ def _build_agent_debate_message(
     previous_round_outputs: list[dict[str, Any]],
     agent_idx: int,
     persona_artifact: PersonaArtifact | None,
-    phase: str,
+    debate_protocol: str,
+    round_num: int,
 ) -> dict[str, Any]:
-    other_answers = [
-        _format_debate_share_entry(previous_round_outputs[idx])
-        for idx in range(len(previous_round_outputs))
-        if idx != agent_idx
-    ]
-    debate_msg = _construct_debate_message(dataset, other_answers, phase=phase)
+    preface = ""
+    if debate_protocol == "structured" and round_num >= 3:
+        other_answers, preface = _build_round3_bundle(
+            previous_round_outputs=previous_round_outputs,
+            agent_idx=agent_idx,
+        )
+    else:
+        other_answers = [
+            _round_output_text(previous_round_outputs[idx])
+            for idx in range(len(previous_round_outputs))
+            if idx != agent_idx
+        ]
+    debate_msg = _construct_debate_message(
+        dataset,
+        other_answers,
+        phase=_debate_round_phase(debate_protocol=debate_protocol, round_num=round_num),
+    )
     if persona_artifact is None:
         return debate_msg
     card = persona_artifact.card_for_agent(agent_idx)
@@ -191,7 +359,7 @@ def _build_agent_debate_message(
         return debate_msg
     return {
         **debate_msg,
-        "content": _persona_round_reminder(card, phase=phase) + debate_msg["content"],
+        "content": _persona_round_reminder(card, round_num=round_num) + preface + debate_msg["content"],
     }
 
 
@@ -213,6 +381,15 @@ def _debate_persona_settings(
     judge_bank_refresh: bool,
     gpqa_family_cache_path: Path | None,
     persona_plain_agents: int = 0,
+    generation_settings_version: str | None = None,
+    slot_sampling_version: str | None = None,
+    slot_role_scheme: str | None = None,
+    population_design_version: str | None = None,
+    axis_bank_version: int | None = None,
+    generic_axis_bank_version: int | None = None,
+    semantic_redundancy_version: str | None = None,
+    coverage_audit_version: str | None = None,
+    card_schema_version: str | None = None,
 ) -> dict[str, Any]:
     return {
         "use_personas": bool(use_personas),
@@ -231,6 +408,15 @@ def _debate_persona_settings(
         "judge_bank_refresh": bool(judge_bank_refresh),
         "gpqa_family_cache_path": path_setting(gpqa_family_cache_path),
         "persona_plain_agents": int(persona_plain_agents),
+        "generation_settings_version": generation_settings_version,
+        "slot_sampling_version": slot_sampling_version,
+        "slot_role_scheme": slot_role_scheme,
+        "population_design_version": population_design_version,
+        "axis_bank_version": axis_bank_version,
+        "generic_axis_bank_version": generic_axis_bank_version,
+        "semantic_redundancy_version": semantic_redundancy_version,
+        "coverage_audit_version": coverage_audit_version,
+        "card_schema_version": card_schema_version,
     }
 
 
@@ -346,9 +532,9 @@ def run_debate(
     use_personas: bool = False,
     artifacts_dir: Path | None = None,
     persona_seed: int = 0,
-    persona_axis_mode: str = "hybrid",
-    persona_fixed_axis_count: int = 2,
-    persona_task_axis_count: int = 1,
+    persona_axis_mode: str = "fixed",
+    persona_fixed_axis_count: int = 6,
+    persona_task_axis_count: int = 0,
     persona_sampling_method: str = "maximin",
     persona_judge_mode: str = "task_family_generated",
     persona_backend: str = "auto",
@@ -398,6 +584,15 @@ def run_debate(
         judge_bank_refresh=judge_bank_refresh,
         gpqa_family_cache_path=gpqa_family_cache_path,
         persona_plain_agents=persona_plain_agents,
+        generation_settings_version=GENERATION_SETTINGS_VERSION,
+        slot_sampling_version=SLOT_SAMPLING_VERSION,
+        slot_role_scheme="generic_coverage_v1",
+        population_design_version="generic_persona_coverage.v1",
+        axis_bank_version=AXIS_BANK_VERSION,
+        generic_axis_bank_version=AXIS_BANK_VERSION,
+        semantic_redundancy_version=SEMANTIC_REDUNDANCY_VERSION,
+        coverage_audit_version=COVERAGE_AUDIT_VERSION,
+        card_schema_version=CARD_PROMPT_VERSION,
     )
     current_runtime_settings = _debate_runtime_settings(
         engine=engine,
@@ -710,12 +905,9 @@ def run_debate(
         total=max(0, total_answer_rounds - start_round_idx),
         file=progress_file,
     ):
+        current_round_num = round_idx + 1
         skip_debater = pending_judge_round == round_idx
         if round_idx > 0 and not skip_debater:
-            phase = _structured_phase_for_round(
-                debate_protocol=debate_protocol,
-                current_round_num=round_idx + 1,
-            )
             for q_idx in range(len(parsed_items)):
                 agent_contexts = all_contexts[q_idx]
                 previous_round_outputs = [agent_round_outputs_by_q[q_idx][agent_idx][-1] for agent_idx in range(n_agents)]
@@ -730,11 +922,10 @@ def run_debate(
                             previous_round_outputs=previous_round_outputs,
                             agent_idx=agent_idx,
                             persona_artifact=persona_artifacts[q_idx],
-                            phase=phase,
+                            debate_protocol=debate_protocol,
+                            round_num=current_round_num,
                         )
                     )
-
-        current_round_num = round_idx + 1
         current_debate_round = max(0, current_round_num - 1)
         if not skip_debater:
             pending_debater_checkpoint_count = 0
@@ -1068,6 +1259,30 @@ def run_debate(
                 )
                 final_majority_answer = final_round_majority_result["majority_answer"]
                 final_majority_correct = final_round_majority_result["majority_correct"]
+                round1_answers = [
+                    agent_outputs[0].get("final_answer") if agent_outputs else None
+                    for agent_outputs in agent_round_outputs
+                ]
+                round1_has_correct = any(
+                    _check_answer_correctness(dataset, answer, gt_answer, raw_task) == 1
+                    for answer in round1_answers
+                    if answer is not None
+                )
+                final_round_answers = [
+                    answers[-1] if answers else None
+                    for answers in agent_round_parsed_answers
+                ]
+                final_round_has_correct = any(
+                    _check_answer_correctness(dataset, answer, gt_answer, raw_task) == 1
+                    for answer in final_round_answers
+                    if answer is not None
+                )
+                final_judge_answer = judged
+                final_judge_correct = (
+                    None
+                    if final_judge_answer is None
+                    else _check_answer_correctness(dataset, final_judge_answer, gt_answer, raw_task)
+                )
                 convergence_per_round = _compute_round_convergence(
                     agent_round_outputs,
                     n_rounds=current_round_num,
@@ -1077,9 +1292,15 @@ def run_debate(
                     agent_round_outputs,
                     answer_changes=answer_changes_per_agent,
                     convergence=convergence_per_round,
+                    round1_has_correct=round1_has_correct,
+                    round1_majority_correct=round1_majority_correct,
+                    final_round_has_correct=final_round_has_correct,
+                    final_round_majority_correct=final_majority_correct,
+                    judge_correct=final_judge_correct,
+                    final_round_majority_answer=final_majority_answer,
+                    judge_answer=final_judge_answer,
                 )
 
-                final_judge_answer = judged
                 judge_extraction = _extract_output_details(
                     dataset=dataset,
                     raw_response=str(judge_raw_output),
@@ -1105,7 +1326,6 @@ def run_debate(
                     accepted_judge_extraction = judge_retry_extraction
                     accepted_judge_scoring = judge_retry_extraction["scoring_result"]
                     accepted_judge_trace_source = "retry"
-                final_judge_correct = _check_answer_correctness(dataset, final_judge_answer, gt_answer, raw_task)
                 judge_raw_call_meta = _inference_result_meta(
                     judge_raw_result,
                     request_messages=judge_context,
@@ -1196,6 +1416,11 @@ def run_debate(
                     persona_sampling_method=persona_sampling_method,
                     persona_backend=persona_backend,
                     public_rationale_max_tokens=public_rationale_max_tokens,
+                    generation_settings=(
+                        None if persona_artifacts[q_idx] is None else dict(persona_artifacts[q_idx].generation_settings)
+                    ),
+                    replay=bool(persona_replay),
+                    save_artifacts=bool(persona_save_artifacts),
                 )
                 judge_meta = {
                     "judge_model": getattr(judge_engine, "model_name", engine.model_name),

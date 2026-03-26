@@ -64,7 +64,10 @@ def _range_tag(range_str: str | None) -> str:
 
 
 def _build_run_tag(*, tag: str | None, meta: dict[str, Any], subset_spec_tag: str, timestamp_tag: str) -> str:
-    base = tag or f"n{meta['subset_size']}_seed{meta['seed']}"
+    seed_tag = f"seed{meta['seed']}"
+    base = tag or f"n{meta['subset_size']}_{seed_tag}"
+    if tag and seed_tag not in base:
+        base = f"{base}_{seed_tag}"
     if subset_spec_tag:
         base = f"{base}_{subset_spec_tag}"
     return f"{base}_{timestamp_tag}"

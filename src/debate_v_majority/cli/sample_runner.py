@@ -104,7 +104,7 @@ def run_sampled(
         for sample_idx in range(n_samples):
             ctx: list[dict[str, Any]] = []
             if artifact is not None:
-                ctx.append({"role": "system", "content": artifact.cards[sample_idx].system_prompt})
+                ctx.append({"role": "system", "content": artifact.cards[sample_idx].initial_system_prompt})
             ctx.append(
                 _build_initial_user_message(
                     dataset=dataset,

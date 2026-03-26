@@ -6,8 +6,9 @@ from pathlib import Path
 import pytest
 
 from debate_v_majority.cli.dataset_eval import _parse_question_answer
-from debate_v_majority.cli.debate_runner import run_debate
+from debate_v_majority.cli.debate_runner import _build_round3_bundle, run_debate
 from debate_v_majority.cli.subset import _make_dataset_subset
+from debate_v_majority.datasets.base import build_structured_debate_message
 from debate_v_majority.engines import InferenceResult
 
 
@@ -699,6 +700,188 @@ def test_run_debate_with_personas_works_on_aime(tmp_path: Path):
     assert row["persona_meta"]["artifact_path"] is not None
 
 
+def test_run_debate_persona_round_prompt_uses_round_specific_sections_and_surfaces_metrics(tmp_path: Path):
+    from debate_v_majority.personas import Axis, AxisSelection, JudgeCard, PersonaArtifact, PersonaCard
+
+    dataset_path = tmp_path / "aime_round_prompt.jsonl"
+    _write_jsonl(
+        dataset_path,
+        [
+            {
+                "problem": "What is 1+1?",
+                "answer": "2",
+                "id": "aime-round-prompt",
+            }
+        ],
+    )
+    items, _ = _make_dataset_subset(
+        dataset="aime25",
+        test_path=dataset_path,
+        n=1,
+        seed=1,
+        ids=[0],
+        range_str=None,
+    )
+    artifact = PersonaArtifact(
+        artifact_version="phase0.v2",
+        dataset="aime25",
+        item_uid=items[0].item_uid,
+        dataset_revision=items[0].dataset_revision,
+        item_display_id=items[0].item_display_id,
+        persona_seed=7,
+        generator_model="fake-generator",
+        judge_generator_model="fake-judge-generator",
+        axes=AxisSelection(
+            mode="fixed",
+            axes=[
+                Axis(
+                    axis_id="verification_style",
+                    name="Verification Style",
+                    kind="fixed",
+                    low_desc="Verify cautiously before committing.",
+                    high_desc="Advance quickly, then verify later.",
+                )
+            ],
+            benchmark_family="aime25",
+            question_summary="What is 1+1?",
+            generator_prompt_version="phase0.axes.v4",
+            generator_model="fake-generator",
+        ),
+        sampled_points=[{"verification_style": 0.5}],
+        descriptors=[],
+        cards=[
+            PersonaCard(
+                persona_id=f"persona_{idx + 1}",
+                title=f"Card persona_{idx + 1}",
+                core_reasoning_strategy=f"strategy {idx + 1}",
+                priorities=[f"priority {idx + 1}"],
+                distrusts=[f"distrust {idx + 1}"],
+                decomposition_style=f"critique {idx + 1}",
+                revision_policy=f"revise {idx + 1}",
+                confidence_policy=f"confidence {idx + 1}",
+                failure_mode_to_avoid=f"failure {idx + 1}",
+                system_prompt=f"System prompt {idx + 1}",
+                card_version="phase1.cards.v1",
+            )
+            for idx in range(3)
+        ],
+        judge_card=JudgeCard(
+            judge_id="judge_aime25",
+            judge_family="physics",
+            domain_scope="physics",
+            evaluation_priorities=["score transcript support"],
+            tie_break_policy="prefer explicit support",
+            independent_resolve_policy="limited_check_only",
+            answer_format_policy="strict",
+            confidence_policy=None,
+            system_prompt="Judge prompt",
+            card_version="phase0.judge.v4",
+            source={},
+        ),
+        prompt_versions={"axis": "phase0.axes.v4", "card": "phase1.cards.v1", "judge": "phase0.judge.v4"},
+        created_at="2026-03-23T00:00:00Z",
+        generation_settings={
+            "n_personas": 3,
+            "persona_seed": 7,
+            "effective_persona_seed": 1,
+            "axis_mode": "fixed",
+            "fixed_axis_count": 1,
+            "task_axis_count": 0,
+            "sampling_method": "maximin",
+            "generator_model": "fake-generator",
+            "judge_generator_model": "fake-judge-generator",
+            "judge_persona_mode": "task_family_generated",
+            "backend": "llm",
+            "axes_file": None,
+            "n_plain_agents": 0,
+        },
+        validator_metadata={},
+    )
+    engine = _FakeDebateEngine(
+        outputs_by_call=[
+            [
+                "First pass says 3. \\boxed{3}",
+                "I also say 3. \\boxed{3}",
+                "Initial answer is 2. \\boxed{2}",
+            ],
+            [
+                "After critique I switch to 2. \\boxed{2}",
+                "I revise to 2. \\boxed{2}",
+                "I keep 2. \\boxed{2}",
+            ],
+            ["\\boxed{2}"],
+        ]
+    )
+
+    results = run_debate(
+        dataset="aime25",
+        items=items,
+        engine=engine,
+        n_agents=3,
+        n_rounds=1,
+        judge_rounds=[1],
+        batch_size=4,
+        judge_block_size=1,
+        use_personas=True,
+        artifacts_dir=tmp_path / "artifacts",
+        persona_seed=7,
+        persona_backend="llm",
+        persona_save_artifacts=True,
+        public_rationale_max_tokens=12,
+        persona_artifacts_by_item={items[0].item_uid: artifact},
+    )
+
+    row = results[1][0]
+    round2_prompt = engine.calls[1][0][0][-1]["content"]
+    assert "[Persona Constitution Reminder]" in round2_prompt
+    assert "Round 2 critique policy" in round2_prompt
+    assert "Round 1 solve policy" in round2_prompt
+    assert "Round 3 revision policy" not in round2_prompt
+    assert row["persona_meta"]["replay"] is False
+    assert row["persona_meta"]["save_artifacts"] is True
+    assert row["persona_meta"]["generation_settings"]["n_personas"] == 3
+    assert row["persona_meta"]["generation_settings"]["effective_persona_seed"] is not None
+    metrics = row["persona_fidelity_metrics"]
+    assert metrics["round1_correct_minority_present"] is True
+    assert metrics["correct_minority_amplified_by_final_majority"] is True
+    assert metrics["correct_minority_amplified_by_judge"] is True
+    assert metrics["correct_minority_suppressed_by_final_round"] is False
+    assert metrics["judge_majority_disagreed"] is False
+    assert metrics["judge_rescue"] is False
+    assert metrics["judge_harm"] is False
+
+
+def test_build_structured_debate_message_defense_requires_concrete_failure():
+    msg = build_structured_debate_message(
+        phase="defense",
+        updates=["Agent 1: ```A```", "Agent 2: ```B```"],
+        final_answer_instruction="in the form \\boxed{answer}",
+    )
+    content = msg["content"]
+    assert "better supported by the evidence" not in content
+    assert "concrete contradiction" in content
+    assert "directly resolves a specific failure in your line" in content
+
+
+def test_round3_bundle_groups_by_answer_basin_without_convergence_count():
+    previous_round_outputs = [
+        {"answer": "A", "final_answer": "A", "full_output": "I keep A. Agent 3 is wrong."},
+        {"answer": "A", "final_answer": "A", "full_output": "I agree A is still strongest."},
+        {"answer": "B", "final_answer": "B", "full_output": "I disagree. B fixes the missing step."},
+        {"answer": "B", "final_answer": "B", "full_output": "B is correct and A fails."},
+        {"answer": "C", "final_answer": "C", "full_output": "C is a fallback if both lines break."},
+    ]
+
+    entries, preface = _build_round3_bundle(previous_round_outputs=previous_round_outputs, agent_idx=0)
+
+    assert "Current convergence context" not in preface
+    assert "grouped by answer basin" in preface
+    assert entries[0].startswith("Peer basin matching your last answer")
+    assert "Competing peer basin `B`" in entries[1]
+    assert "Support from agent 2" in entries[0]
+    assert "Criticism from agent 3" in entries[1]
+
+
 def test_run_debate_propagates_judge_retry_generation_failures(tmp_path: Path):
     dataset_path = tmp_path / "gpqa_retry_failure.jsonl"
     _write_jsonl(
@@ -1058,5 +1241,3 @@ def test_run_debate_requires_full_judge_transcript_when_context_is_too_long(tmp_
     assert row["final_judge_answer"] == gt_letter
     assert row["judge_trace"]["judge_context_is_full_transcript"] is False
     assert row["judge_trace"]["judge_context_start_round"] == 2
-
-

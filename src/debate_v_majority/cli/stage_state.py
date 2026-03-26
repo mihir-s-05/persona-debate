@@ -207,7 +207,15 @@ def _render_persona_stage(entry: StageEntry) -> list[str]:
                     for distrust in distrusts:
                         lines.append(f"  - {distrust}")
                 lines.append("- System prompt:")
-                lines.append(_format_multiline_block(str(card.get("system_prompt") or "")))
+                runtime_prompts = card.get("runtime_prompts") or {}
+                active_prompt = (
+                    runtime_prompts.get("initial_system_prompt")
+                    if isinstance(runtime_prompts, dict)
+                    else None
+                ) or card.get("initial_system_prompt") or card.get("system_prompt") or ""
+                lines.append(
+                    _format_multiline_block(str(active_prompt))
+                )
         elif entry.completed_stage == "judge_card":
             judge_card = dict(item_data.get("judge_card") or {})
             lines.append(f"- Judge family: `{judge_card.get('judge_family')}`")

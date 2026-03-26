@@ -11,6 +11,7 @@ from .schema import Axis, AxisSelection
 from .validators import validate_text_for_leakage
 
 AXIS_GENERATION_RETRIES = 4
+AXIS_BANK_VERSION = 3
 
 _TASK_AXIS_REJECTION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
@@ -47,56 +48,106 @@ class AxisGenerationExhaustedError(ValueError):
         self.metadata = metadata
 
 
-FIXED_AXIS_BANK: list[Axis] = [
-    Axis(
-        axis_id="revision_resistance_vs_revision_readiness",
-        name="Revision Resistance vs Revision Readiness",
+def _fixed_axis(
+    *,
+    family: str,
+    axis_id: str,
+    name: str,
+    low_desc: str,
+    high_desc: str,
+    axis_role: str = "solver",
+    canonical_dimension: str = "commitment_style",
+    stage_affinity: str = "all",
+    notes: str | None = None,
+) -> Axis:
+    return Axis(
+        axis_id=axis_id,
+        name=name,
         kind="fixed",
-        low_desc="Keep the current answer unless a peer identifies a specific error, contradiction, or missing constraint that materially weakens it.",
-        high_desc="Re-open the current answer quickly when a peer presents a concrete objection or a better-supported alternative, even if the current answer still seems plausible.",
-        source={"bank": "fixed_meta", "version": 1},
+        low_desc=low_desc,
+        high_desc=high_desc,
+        axis_role=axis_role,
+        canonical_dimension=canonical_dimension,
+        family_scope=family,
+        stage_affinity=stage_affinity,
+        notes=notes,
+        source={"bank": "generic_persona_coverage", "family": family, "bank_version": AXIS_BANK_VERSION},
+    )
+
+
+def _build_bank(*, family: str, specs: list[tuple[str, str, str, str, str, str | None]]) -> list[Axis]:
+    return [
+        _fixed_axis(
+            family=family,
+            axis_id=axis_id,
+            name=name,
+            low_desc=low_desc,
+            high_desc=high_desc,
+            axis_role="solver" if canonical_dimension != "social_update_style" else "debate",
+            canonical_dimension=canonical_dimension,
+            stage_affinity="all" if canonical_dimension != "social_update_style" else "round23",
+            notes=notes,
+        )
+        for axis_id, name, low_desc, high_desc, canonical_dimension, notes in specs
+    ]
+
+
+_GENERIC_AXIS_SPECS = [
+    (
+        "commitment_style",
+        "Commitment Style",
+        "Keep multiple live hypotheses in play until the prompt itself or later checks force a narrower commitment.",
+        "Commit to one promising line early and invest effort in repairing or pressure-testing it before branching.",
+        "commitment_style",
+        None,
     ),
-    Axis(
-        axis_id="defend_vs_rebuild_after_critique",
-        name="Defend vs Rebuild After Critique",
-        kind="fixed",
-        low_desc="After criticism, start by defending and repairing the current line of reasoning before considering a full rethink.",
-        high_desc="After criticism, temporarily rebuild the answer from the ground up before deciding whether the original line still survives.",
-        source={"bank": "fixed_meta", "version": 1},
+    (
+        "abstraction_preference",
+        "Abstraction Preference",
+        "Start from concrete examples, local traces, literal details, or visible cases before generalizing.",
+        "Start from global structure, abstractions, schemas, or governing principles before drilling into cases.",
+        "abstraction_preference",
+        None,
     ),
-    Axis(
-        axis_id="self_repair_vs_peer_pressure",
-        name="Self-Repair vs Peer Pressure",
-        kind="fixed",
-        low_desc="Use later rounds mainly to tighten your own reasoning, patch weak steps, and check whether your answer still holds.",
-        high_desc="Use later rounds mainly to pressure-test competing answers, expose their weak links, and raise the bar they must clear.",
-        source={"bank": "fixed_meta", "version": 1},
+    (
+        "evidence_preference",
+        "Evidence Preference",
+        "Trust local details, literal wording, explicit components, and step-level evidence first.",
+        "Trust global coherence, overall model fit, and structural consistency first.",
+        "evidence_preference",
+        None,
     ),
-    Axis(
-        axis_id="contradiction_hunting_vs_support_auditing",
-        name="Contradiction Hunting vs Support Auditing",
-        kind="fixed",
-        low_desc="Critique by looking for a concrete break, conflicting implication, or direct inconsistency that can overturn a line of reasoning.",
-        high_desc="Critique by asking whether the line is sufficiently supported at all, even if there is no single decisive contradiction yet.",
-        source={"bank": "fixed_meta", "version": 1},
+    (
+        "search_strategy",
+        "Search Strategy",
+        "Build a candidate line constructively and try to complete or repair it into a coherent answer.",
+        "Look for contradictions, elimination opportunities, or the fastest way to falsify a weak line.",
+        "search_strategy",
+        None,
     ),
-    Axis(
-        axis_id="explicit_claim_auditing_vs_assumption_auditing",
-        name="Explicit Claim Auditing vs Assumption Auditing",
-        kind="fixed",
-        low_desc="Check whether stated claims are actually justified by the reasoning that has been made explicit.",
-        high_desc="Probe for hidden assumptions, silent dependencies, and places where the argument relies on more than it openly establishes.",
-        source={"bank": "fixed_meta", "version": 1},
+    (
+        "verification_timing",
+        "Verification Timing",
+        "Sketch the line first, then verify only after the shape of the answer becomes clearer.",
+        "Verify consequential steps early and often before expanding the line any further.",
+        "verification_timing",
+        None,
     ),
-    Axis(
-        axis_id="independent_anchor_vs_convergence_awareness",
-        name="Independent Anchor vs Convergence Awareness",
-        kind="fixed",
-        low_desc="Treat other agents' agreement as mostly irrelevant and update only for the substance of their arguments.",
-        high_desc="Treat broad convergence as a cue to re-audit your view, while still requiring argument-level reasons before changing your answer.",
-        source={"bank": "fixed_meta", "version": 1},
+    (
+        "social_update_style",
+        "Social Update Style",
+        "Treat peer convergence as weak evidence and re-check the prompt independently before moving.",
+        "Treat peer convergence and repeated critique as meaningful evidence that should trigger a serious re-audit.",
+        "social_update_style",
+        None,
     ),
 ]
+
+_FAMILY_FIXED_AXIS_BANKS: dict[str, list[Axis]] = {
+    "default": _build_bank(family="generic", specs=_GENERIC_AXIS_SPECS),
+}
+
+FIXED_AXIS_BANK: list[Axis] = list(_FAMILY_FIXED_AXIS_BANKS["default"])
 
 
 def infer_benchmark_family(dataset: str, raw_task: dict[str, Any]) -> str:
@@ -127,11 +178,6 @@ def summarize_question(question: str, *, max_words: int = 24) -> str:
     return " ".join(words[:max_words]) + " ..."
 
 
-def get_fixed_axes(count: int) -> list[Axis]:
-    if count <= 0:
-        return []
-    return FIXED_AXIS_BANK[: min(count, len(FIXED_AXIS_BANK))]
-
 def _axis_text(axis: Axis) -> str:
     parts = [axis.name, axis.low_desc, axis.high_desc]
     if axis.notes:
@@ -153,6 +199,22 @@ def _task_axis_rejection_reason(axis: Axis) -> str | None:
         if pattern.search(text):
             return reason
     return None
+
+
+def _family_fixed_axis_bank(benchmark_family: str | None) -> list[Axis]:
+    _ = benchmark_family
+    return _FAMILY_FIXED_AXIS_BANKS["default"]
+
+
+def get_fixed_axes(count: int, benchmark_family: str | None = None) -> list[Axis]:
+    if count <= 0:
+        return []
+    bank = _family_fixed_axis_bank(benchmark_family)
+    if len(bank) >= count:
+        return bank[:count]
+    seen = {axis.axis_id for axis in bank}
+    extras = [axis for axis in _FAMILY_FIXED_AXIS_BANKS["default"] if axis.axis_id not in seen]
+    return (bank + extras)[:count]
 
 
 def _normalize_llm_axes(
@@ -182,6 +244,10 @@ def _normalize_llm_axes(
             kind="task",
             low_desc=low_desc,
             high_desc=high_desc,
+            axis_role="solver",
+            canonical_dimension=str(raw_axis.get("canonical_dimension") or "hypothesis_management"),
+            family_scope=benchmark_family,
+            stage_affinity="round1",
             notes=str(raw_axis.get("notes")).strip() if raw_axis.get("notes") is not None else None,
             source={
                 "generator": generator_model or "llm",
@@ -305,7 +371,7 @@ def generate_task_axes(
                 count=count,
                 benchmark_family=benchmark_family,
                 generator_model=generator_model,
-                backend="llm",
+                backend=backend,
                 call_metadata=call_metadata,
             )
             if len(llm_axes) >= count:
@@ -369,7 +435,7 @@ def build_axis_selection(
 ) -> AxisSelection:
     benchmark_family = infer_benchmark_family(dataset, raw_task)
     if mode == "fixed":
-        axes = get_fixed_axes(fixed_count)
+        axes = get_fixed_axes(fixed_count, benchmark_family=benchmark_family)
     elif mode == "task":
         axes = generate_task_axes(
             dataset=dataset,
@@ -386,7 +452,7 @@ def build_axis_selection(
             raise ValueError("axis mode 'file' requires an axes_file path")
         axes = _load_axes_file(axes_file)
     else:
-        axes = get_fixed_axes(fixed_count) + generate_task_axes(
+        axes = get_fixed_axes(fixed_count, benchmark_family=benchmark_family) + generate_task_axes(
             dataset=dataset,
             question=question,
             raw_task=raw_task,

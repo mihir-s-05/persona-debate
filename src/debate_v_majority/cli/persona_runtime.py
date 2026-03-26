@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, TextIO, cast
+from typing import Any, Literal, TextIO, cast
 
 from .. import DatasetName
 from ..datasets import get_dataset_adapter as resolve_dataset_adapter
@@ -33,7 +33,15 @@ from ..personas import (
     resolve_judge_family_assignment,
     save_artifact as save_persona_artifact,
 )
-from ..personas.generator import _effective_persona_seed
+from ..personas.axes import AXIS_BANK_VERSION
+from ..personas.generator import (
+    COVERAGE_AUDIT_VERSION,
+    GENERATION_SETTINGS_VERSION,
+    SEMANTIC_REDUNDANCY_VERSION,
+    SLOT_SAMPLING_VERSION,
+    _effective_persona_seed,
+)
+from ..personas.schema import AxisSelectionMode, JudgePersonaMode
 from ..personas.prompt_templates import (
     ARTIFACT_VERSION,
     CARD_PROMPT_VERSION,
@@ -74,16 +82,24 @@ def _persona_generation_settings(
     n_plain_agents: int = 0,
 ) -> dict[str, Any]:
     settings = {
+        "generation_settings_version": GENERATION_SETTINGS_VERSION,
         "n_personas": int(n_personas),
         "persona_seed": int(persona_seed),
         "axis_mode": str(axis_mode),
         "fixed_axis_count": int(fixed_axis_count),
         "task_axis_count": int(task_axis_count),
         "sampling_method": str(sampling_method),
+        "slot_sampling_version": SLOT_SAMPLING_VERSION,
+        "slot_role_scheme": "generic_coverage_v1",
+        "population_design_version": "generic_persona_coverage.v1",
         "judge_persona_mode": str(judge_persona_mode),
         "backend": str(backend),
         "generator_model": generator_model,
         "judge_generator_model": judge_generator_model,
+        "axis_bank_version": AXIS_BANK_VERSION,
+        "generic_axis_bank_version": AXIS_BANK_VERSION,
+        "semantic_redundancy_version": SEMANTIC_REDUNDANCY_VERSION,
+        "coverage_audit_version": COVERAGE_AUDIT_VERSION,
         "axes_file": None if axes_file is None else str(axes_file),
         "n_plain_agents": int(n_plain_agents),
     }
@@ -149,7 +165,9 @@ def _validate_staged_persona_resume(
         raise ValueError("Persona state items do not match the requested subset")
 
     saved_settings = prev_entry.meta.get("resume_settings")
-    if not isinstance(saved_settings, dict) or dict(saved_settings) != current_settings:
+    if not isinstance(saved_settings, dict):
+        raise ValueError("Persona state generation settings mismatch")
+    if dict(saved_settings) != current_settings:
         raise ValueError("Persona state generation settings mismatch")
 
 
@@ -220,6 +238,7 @@ def _persona_artifact_row(artifact: PersonaArtifact, *, artifact_path_str: str |
         "created_at": artifact.created_at,
         "validator_metadata": data["validator_metadata"],
         "artifact_path": artifact_path_str,
+        "generation_settings": data.get("generation_settings", {}),
     }
     if artifact.slot_layout is not None:
         row["slot_layout"] = list(artifact.slot_layout)
@@ -298,7 +317,7 @@ def _print_persona_artifact_summary(
     for card in artifact.cards:
         print(f"[persona] {card.persona_id}: {card.title}", file=output_file)
         if dump_cards:
-            print(card.system_prompt, file=output_file)
+            print(card.initial_system_prompt, file=output_file)
     if artifact.judge_card is not None:
         print(f"[persona] judge={artifact.judge_card.judge_family}", file=output_file)
 
@@ -803,14 +822,14 @@ def _persona_config_for_item(
     raw_task: dict[str, Any],
     n_personas: int,
     persona_seed: int,
-    axis_mode: str,
+    axis_mode: AxisSelectionMode,
     fixed_axis_count: int,
     task_axis_count: int,
-    sampling_method: str,
+    sampling_method: Literal["maximin", "halton"],
     generator_model: str | None,
     judge_generator_model: str | None,
-    judge_persona_mode: str,
-    backend: str,
+    judge_persona_mode: JudgePersonaMode,
+    backend: Literal["llm"],
     axes_file: Path | None,
     n_plain_agents: int = 0,
 ) -> PersonaGenerationConfig:
@@ -823,14 +842,14 @@ def _persona_config_for_item(
         dataset_revision=item.dataset_revision,
         n_personas=n_personas,
         persona_seed=persona_seed,
-        axis_mode=cast(Any, axis_mode),
+        axis_mode=axis_mode,
         fixed_axis_count=fixed_axis_count,
         task_axis_count=task_axis_count,
-        sampling_method=cast(Any, sampling_method),
+        sampling_method=sampling_method,
         generator_model=generator_model,
         judge_generator_model=judge_generator_model,
-        judge_persona_mode=cast(Any, judge_persona_mode),
-        backend=cast(Any, backend),
+        judge_persona_mode=judge_persona_mode,
+        backend=backend,
         axes_file=axes_file,
         n_plain_agents=n_plain_agents,
     )
@@ -842,9 +861,21 @@ def _descriptor_stage_metadata_from_artifact(artifact: PersonaArtifact) -> dict[
         for key in (
             "descriptor_validations",
             "descriptor_duplicates",
+            "descriptor_semantic_redundancy",
+            "descriptor_coverage_audit",
             "descriptor_prompt_version",
+            "descriptor_semantic_redundancy_version",
+            "descriptor_coverage_audit_version",
             "descriptor_backend",
             "descriptor_call_metadata",
+            "generation_settings_version",
+            "semantic_redundancy_version",
+            "coverage_audit_version",
+            "slot_sampling_version",
+            "slot_role_scheme",
+            "population_design_version",
+            "axis_bank_version",
+            "generic_axis_bank_version",
         )
         if key in artifact.validator_metadata
     }
@@ -856,9 +887,22 @@ def _card_stage_metadata_from_artifact(artifact: PersonaArtifact) -> dict[str, A
         for key in (
             "card_validations",
             "card_duplicates",
+            "card_semantic_redundancy",
+            "card_coverage_audit",
             "card_prompt_version",
+            "card_semantic_redundancy_version",
+            "card_coverage_audit_version",
             "card_backend",
             "card_call_metadata",
+            "generation_settings_version",
+            "semantic_redundancy_version",
+            "coverage_audit_version",
+            "slot_sampling_version",
+            "slot_role_scheme",
+            "population_design_version",
+            "axis_bank_version",
+            "generic_axis_bank_version",
+            "card_schema_version",
         )
         if key in artifact.validator_metadata
     }

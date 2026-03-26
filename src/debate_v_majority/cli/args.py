@@ -204,7 +204,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--persona_axes_mode",
         type=str,
-        default="hybrid",
+        default="fixed",
         choices=["fixed", "task", "hybrid", "file", "replay"],
         help="Axis selection mode for persona generation.",
     )
@@ -215,8 +215,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=["maximin", "halton"],
         help="Sampling method for persona axis points.",
     )
-    ap.add_argument("--persona_fixed_axis_count", type=int, default=3, help="Number of fixed axes to use in hybrid/fixed persona generation.")
-    ap.add_argument("--persona_task_axis_count", type=int, default=3, help="Number of task axes to use in hybrid/task persona generation.")
+    ap.add_argument("--persona_fixed_axis_count", type=int, default=6, help="Number of fixed axes to use in hybrid/fixed persona generation.")
+    ap.add_argument("--persona_task_axis_count", type=int, default=0, help="Number of task axes to use in hybrid/task persona generation.")
     ap.add_argument("--persona_axes_file", type=str, default=None, help="JSON file containing axes when --persona_axes_mode file is used.")
     ap.add_argument(
         "--persona_backend",

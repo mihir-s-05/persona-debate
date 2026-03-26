@@ -216,6 +216,15 @@ def test_halton_sampling_is_deterministic():
     assert points1 == points2
 
 
+def test_generic_slot_sampling_respects_commitment_coverage_cap():
+    points = sample_axis_points(axes=FIXED_AXIS_BANK, num_personas=5, seed=2116952987, method="maximin")
+    commitment_values = [float(point["commitment_style"]) for point in points]
+    low_count = sum(1 for value in commitment_values if value <= 0.33)
+    high_count = sum(1 for value in commitment_values if value >= 0.67)
+    assert low_count <= 2
+    assert high_count >= 1
+
+
 def test_effective_persona_seed_varies_by_item_uid():
     config_a = PersonaGenerationConfig(
         dataset="aime25",
@@ -756,24 +765,31 @@ def test_hle_llm_persona_and_judge_generation_attach_question_images():
     assert artifact.cards
     assert len(engine.calls) >= 4
     for call in engine.calls:
-        user_message = call["contexts"][0][-1]
-        prompt_text = user_message["content"] if isinstance(user_message["content"], str) else ""
-        if isinstance(user_message["content"], list):
-            prompt_text = "\n".join(
-                str(part.get("text") or "") for part in user_message["content"]
+        user_messages = [message for message in call["contexts"][0] if message.get("role") == "user"]
+        prompt_message = None
+        prompt_text = ""
+        for user_message in user_messages:
+            content = user_message["content"]
+            text = content if isinstance(content, str) else "\n".join(
+                str(part.get("text") or "") for part in content
                 if isinstance(part, dict) and str(part.get("type") or "text") == "text"
             )
-        is_axis_call = "Propose reasoning-relevant axes" in prompt_text
-        is_descriptor_call = "Generate the full persona population jointly" in prompt_text
-        is_card_call = "Expand each descriptor into a compact" in prompt_text
-        is_judge_call = "Generate a constrained judge card" in prompt_text
-        if is_axis_call or is_judge_call:
-            assert isinstance(user_message["content"], list)
-            assert user_message["content"][0]["type"] == "text"
-            assert any(part.get("type") == "image" for part in user_message["content"][1:])
-        else:
-            assert is_descriptor_call or is_card_call
-            assert isinstance(user_message["content"], str)
+            if any(
+                marker in text
+                for marker in (
+                    "Propose reasoning-relevant axes",
+                    "Generate the full persona population jointly",
+                    "Expand each descriptor into a compact",
+                    "Generate a constrained judge card",
+                )
+            ):
+                prompt_message = user_message
+                prompt_text = text
+                break
+        assert prompt_message is not None, "Expected a prompt-bearing user message"
+        assert isinstance(prompt_message["content"], list)
+        assert prompt_message["content"][0]["type"] == "text"
+        assert any(part.get("type") == "image" for part in prompt_message["content"][1:]), prompt_text[:200]
 
 
 def test_make_dataset_subset_populates_stable_identity(tmp_path: Path):
@@ -810,7 +826,8 @@ def test_make_item_uid_falls_back_to_content_hash_for_aime():
 
 def test_fixed_axis_bank_has_expected_shape():
     assert len(FIXED_AXIS_BANK) == 6
-    assert FIXED_AXIS_BANK[0].axis_id == "revision_resistance_vs_revision_readiness"
+    assert FIXED_AXIS_BANK[0].axis_id == "commitment_style"
+    assert FIXED_AXIS_BANK[0].source["bank"] == "generic_persona_coverage"
 
 
 def test_get_fixed_axes_returns_requested_prefix():
@@ -921,8 +938,12 @@ def test_generate_descriptors_retries_after_validator_retry(monkeypatch: pytest.
 
     descriptors, meta = generate_descriptors(config=config, engine=_FakeEngine())
     assert len(descriptors) == 2
-    assert call_count["n"] == 4
+    assert call_count["n"] == 3
     assert meta["validator_metadata"]["descriptor_validations"][-1]["attempt"] == 1
+    assert meta["validator_metadata"]["attempt_audits"][-1]["accepted_descriptor_ids"] == [
+        "persona_1",
+        "persona_2",
+    ]
 
 
 def test_generate_descriptors_retry_keeps_axes_and_sampled_points_stable(monkeypatch: pytest.MonkeyPatch):
@@ -971,11 +992,24 @@ def test_generate_descriptors_retry_keeps_axes_and_sampled_points_stable(monkeyp
     monkeypatch.setattr("debate_v_majority.personas.generator.validate_descriptor", _fake_validate_descriptor)
 
     descriptors, meta = generate_descriptors(config=config, engine=_FakeEngine())
+    axis_selection = build_axis_selection(
+        mode=config.axis_mode,
+        question=config.question,
+        dataset=config.dataset,
+        raw_task=config.raw_task,
+        fixed_count=config.fixed_axis_count,
+        task_count=config.task_axis_count,
+        generator_model=config.generator_model,
+        engine=_FakeEngine(),
+        backend=config.backend,
+        axes_file=config.axes_file,
+    )
     expected_points = sample_axis_points(
-        axes=get_fixed_axes(1),
+        axes=axis_selection.axes,
         num_personas=2,
         seed=_effective_persona_seed(config=config),
         method=config.sampling_method,
+        benchmark_family=axis_selection.benchmark_family,
     )
     assert len(descriptors) == 2
     assert axis_calls["n"] == 1
@@ -1169,7 +1203,8 @@ def test_expand_cards_retries_after_parse_error():
     assert attempt_audits[0]["parse_error"] is not None
     assert "Could not parse JSON object" in attempt_audits[0]["parse_error"]
     retry_messages = engine.contexts[2][0]
-    assert [message["role"] for message in retry_messages] == ["system", "user", "user"]
+    assert [message["role"] for message in retry_messages] == ["system", "user", "user", "user"]
+    assert attempt_audits[-1]["accepted_card_ids"] == ["persona_1", "persona_2"]
 
 
 def test_ensure_judge_bank_card_retries_after_parse_error(tmp_path: Path):
@@ -1434,6 +1469,8 @@ def test_persona_generation_emits_benchmark_bank_judge_card(tmp_path: Path):
     assert row["judge_card"]["judge_family"] == "math"
     assert row["validator_metadata"]["judge_bank"]["judge_family_assignment"]["judge_family"] == "math"
     assert row["validator_metadata"]["judge_bank"]["judge_bank_path"].endswith("math.json")
+    assert row["generation_settings"]["n_personas"] == 2
+    assert row["generation_settings"]["effective_persona_seed"] is not None
 
 
 def test_arg_parser_defaults_persona_backend_to_llm():

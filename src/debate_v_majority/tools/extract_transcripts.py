@@ -143,6 +143,18 @@ def extract_from_trace_file(trace_path: str, artifact_path: str | None, output_d
     return outfile
 
 
+def _thought_from_round_output(output: dict) -> str:
+    ts = str(output.get("thought_summary") or "").strip()
+    if ts:
+        return ts
+    meta = output.get("call_metadata")
+    if isinstance(meta, dict):
+        ts2 = str(meta.get("thought_summary") or "").strip()
+        if ts2:
+            return ts2
+    return ""
+
+
 def extract_from_jsonl_row(row: dict, artifact: dict, label: str, output_dir: str) -> str | None:
     """Extract a readable transcript from a JSONL result row + artifact."""
     out = []
@@ -215,6 +227,50 @@ def extract_from_jsonl_row(row: dict, artifact: dict, label: str, output_dir: st
                 else:
                     out.append(f"  {name}: {answers[0] if answers else '?'} (never changed)")
 
+    agent_round_outputs = row.get("agent_round_outputs") or []
+    thought_lines: list[str] = []
+    if isinstance(agent_round_outputs, list):
+        for agent_idx, per_agent in enumerate(agent_round_outputs):
+            if not isinstance(per_agent, list):
+                continue
+            pname = (
+                descriptors[agent_idx].get('name', f'Agent {agent_idx + 1}')
+                if agent_idx < len(descriptors)
+                else f'Agent {agent_idx + 1}'
+            )
+            for round_idx, rout in enumerate(per_agent):
+                if not isinstance(rout, dict):
+                    continue
+                ttxt = _thought_from_round_output(rout)
+                if ttxt:
+                    thought_lines.append(
+                        f"Round {round_idx + 1} — {pname} — thought summary (model thinking):\n{ttxt}"
+                    )
+    if thought_lines:
+        out.append("")
+        out.append("=" * 80)
+        out.append("THOUGHT SUMMARIES (DEBATERS)")
+        out.append("=" * 80)
+        out.append("")
+        out.append("\n\n".join(thought_lines))
+
+    jt_pre = row.get("judge_trace")
+    if isinstance(jt_pre, dict):
+        for meta_key, title in (
+            ("judge_raw_call_metadata", "Judge (raw call)"),
+            ("judge_retry_call_metadata", "Judge (retry call)"),
+        ):
+            meta = jt_pre.get(meta_key)
+            if isinstance(meta, dict):
+                jt = str(meta.get("thought_summary") or "").strip()
+                if jt:
+                    out.append("")
+                    out.append("=" * 80)
+                    out.append(f"THOUGHT SUMMARY — {title}")
+                    out.append("=" * 80)
+                    out.append("")
+                    out.append(jt)
+
     out.append("")
     out.append("=" * 80)
     out.append("JUDGE OUTPUT")
@@ -231,8 +287,13 @@ def extract_from_jsonl_row(row: dict, artifact: dict, label: str, output_dir: st
         jr = jt.get('judge_raw_response', '')
         if jr:
             out.append("")
-            out.append("Judge Full Response:")
+            out.append("Judge Full Response (visible output):")
             out.append(break_sentences(str(jr)))
+        jretry = jt.get('judge_retry_raw_response', '')
+        if jretry:
+            out.append("")
+            out.append("Judge Retry Response (visible output):")
+            out.append(break_sentences(str(jretry)))
 
     out.append("")
     out.append(f"Final Answer: {row.get('final_answer', '')}")
